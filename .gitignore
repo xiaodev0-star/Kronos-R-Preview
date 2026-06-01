@@ -1,0 +1,8 @@
+checkpoint/
+dataset/
+TEMP/
+*.json
+*.pyc
+*.pt
+*.npz
+*.png
