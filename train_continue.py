@@ -82,7 +82,7 @@ def main():
         epoch = start_epoch + ep
         model.train()
         losses = []
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         t0 = time.time()
 
         for step, (input_ids, targets, time_ids, position_ids, attn_mask) in enumerate(
@@ -105,7 +105,7 @@ def main():
             if (step + 1) % TrainingConfig.accumulation_steps == 0 or (step + 1) == len(train_loader):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), TrainingConfig.grad_clip)
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
                 global_step += 1
 

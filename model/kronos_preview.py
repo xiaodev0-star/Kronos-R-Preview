@@ -173,3 +173,101 @@ class KronosPreview(nn.Module):
             logits_fine = logits_fine.squeeze(0)
 
         return logits_coarse, logits_fine, loss
+
+
+class CausalReasoningBlock(nn.Module):
+    """Lightweight causal reasoning: cross-attention to learned memory tokens."""
+    def __init__(self, dim, heads=4, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 2, bias=False), nn.SiLU(),
+            nn.Linear(dim * 2, dim, bias=False))
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x, memory):
+        h = self.norm1(x)
+        h, _ = self.cross_attn(h, memory, memory)
+        x = x + self.gate.tanh() * h
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class KronosPreviewWithReasoning(nn.Module):
+    """KronosPreview + CausalReasoningBlock after transformer blocks."""
+    def __init__(self, base_model_state=None, n_reason_tokens=8, n_reason_layers=1):
+        super().__init__()
+        cfg = ModelConfig
+        vocab_full = cfg.vocab_size + 2
+        self.token_emb = nn.Embedding(vocab_full, cfg.dim)
+        self.time_emb_day = nn.Embedding(32, cfg.dim)
+        self.time_emb_month = nn.Embedding(13, cfg.dim)
+        self.time_emb_year = nn.Embedding(100, cfg.dim)
+        self.blocks = nn.ModuleList([
+            TransformerBlock(cfg.dim, cfg.heads, cfg.num_kv_heads,
+                             cfg.ffn_multiplier, cfg.dropout)
+            for _ in range(cfg.depth)
+        ])
+        self.norm = RMSNorm(cfg.dim)
+        self.head_coarse = nn.Linear(cfg.dim, vocab_full, bias=True)
+        self.head_fine = nn.Linear(cfg.dim, vocab_full, bias=True)
+        self.rotary = RotaryEmbedding(cfg.dim // cfg.heads, base=cfg.rope_base)
+        self.reason_tokens = nn.Parameter(torch.randn(1, n_reason_tokens, cfg.dim) * 0.02)
+        self.reason_blocks = nn.ModuleList([
+            CausalReasoningBlock(cfg.dim, heads=cfg.heads) for _ in range(n_reason_layers)
+        ])
+        self._gradient_checkpointing = False
+        if base_model_state is not None:
+            self.load_state_dict(base_model_state, strict=False)
+
+    def enable_gradient_checkpointing(self):
+        self._gradient_checkpointing = True
+
+    def forward(self, input_ids, time_ids, position_ids, attn_mask=None, targets=None):
+        no_batch = input_ids.dim() == 1
+        if no_batch:
+            input_ids = input_ids.unsqueeze(0)
+            time_ids = time_ids.unsqueeze(0)
+            position_ids = position_ids.unsqueeze(0)
+            if attn_mask is not None:
+                attn_mask = attn_mask.unsqueeze(0)
+            if targets is not None:
+                targets = targets.unsqueeze(0)
+
+        x = self.token_emb(input_ids)
+        x = x + self.time_emb_day(time_ids[..., 0])
+        x = x + self.time_emb_month(time_ids[..., 1])
+        x = x + self.time_emb_year(time_ids[..., 2])
+        sin, cos = self.rotary(position_ids)
+
+        for block in self.blocks:
+            if self._gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    block, x, sin, cos, attn_mask, use_reentrant=False)
+            else:
+                x = block(x, sin, cos, attn_mask)
+
+        B = x.size(0)
+        memory = self.reason_tokens.expand(B, -1, -1)
+        for rblock in self.reason_blocks:
+            x = rblock(x, memory)
+
+        x = self.norm(x)
+        logits_coarse = self.head_coarse(x)
+        logits_fine = self.head_fine(x)
+
+        loss = None
+        if targets is not None:
+            shift_logits = logits_coarse[:, :-1, :].contiguous()
+            shift_targets = targets.contiguous()
+            if (shift_targets != -100).any():
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_targets.view(-1), ignore_index=-100)
+
+        if no_batch:
+            logits_coarse = logits_coarse.squeeze(0)
+            logits_fine = logits_fine.squeeze(0)
+        return logits_coarse, logits_fine, loss
