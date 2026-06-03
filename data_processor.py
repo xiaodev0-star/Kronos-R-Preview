@@ -139,7 +139,16 @@ def _token_cache_path(symbol, cache_dir):
     return os.path.join(cache_dir, f"{symbol}.npz")
 
 
-def _encode_and_cache(stock, tokenizer, mode, cutoff_date, cache_dir):
+def _tokenizer_hash(tokenizer):
+    """Compute a short hash of tokenizer weights for cache validation."""
+    import hashlib
+    buf = b""
+    for k, v in sorted(tokenizer.state_dict().items()):
+        buf += k.encode() + v.cpu().numpy().tobytes()
+    return hashlib.md5(buf).hexdigest()[:16]
+
+
+def _encode_and_cache(stock, tokenizer, mode, cutoff_date, cache_dir, tok_hash=None):
     """Tokenize one stock and save to cache. Returns encoded dict."""
     feat = stock["features_raw"]
     day, month, year = stock["day"], stock["month"], stock["year"]
@@ -152,23 +161,29 @@ def _encode_and_cache(stock, tokenizer, mode, cutoff_date, cache_dir):
         token_ids, _ = tokenizer.encode(
             torch.from_numpy(normed).float().unsqueeze(0).to(device))
     token_ids = token_ids[0].cpu().numpy()
-    out = {"token_ids": token_ids, "day": day[:ci], "month": month[:ci], "year": year[:ci]}
-    np.savez_compressed(_token_cache_path(stock["symbol"], cache_dir), **out)
-    return out
+    save_dict = {"token_ids": token_ids, "day": day[:ci], "month": month[:ci], "year": year[:ci]}
+    if tok_hash:
+        save_dict["_tok_hash"] = tok_hash
+    np.savez_compressed(_token_cache_path(stock["symbol"], cache_dir), **save_dict)
+    return {"token_ids": token_ids, "day": day[:ci], "month": month[:ci], "year": year[:ci]}
 
 
-def _load_cached_or_encode(stock, tokenizer, mode, cutoff_date, cache_dir):
+def _load_cached_or_encode(stock, tokenizer, mode, cutoff_date, cache_dir, tok_hash=None):
     """Load tokenized sequence from cache, or encode and cache if missing."""
     path = _token_cache_path(stock["symbol"], cache_dir)
     if os.path.exists(path):
         data = np.load(path, allow_pickle=True)
+        # Validate tokenizer hash to detect stale cache
+        cached_hash = str(data["_tok_hash"]) if "_tok_hash" in data else None
+        if tok_hash and cached_hash != tok_hash:
+            return _encode_and_cache(stock, tokenizer, mode, cutoff_date, cache_dir, tok_hash)
         return {
             "token_ids": data["token_ids"],
             "day": data["day"],
             "month": data["month"],
             "year": data["year"],
         }
-    return _encode_and_cache(stock, tokenizer, mode, cutoff_date, cache_dir)
+    return _encode_and_cache(stock, tokenizer, mode, cutoff_date, cache_dir, tok_hash)
 
 
 def pack_stocks(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutoff_date,
@@ -178,11 +193,14 @@ def pack_stocks(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutoff_d
     bos_id, eos_id = vocab, vocab + 1
     device = next(tokenizer.parameters()).device
 
+    # Compute tokenizer hash for cache validation
+    tok_hash = _tokenizer_hash(tokenizer) if cache_dir else None
+
     # Pre-tokenize with cache if provided
     encoded = []
     for s in tqdm(stocks, desc="Encoding (" + mode + ")"):
         if cache_dir:
-            enc = _load_cached_or_encode(s, tokenizer, mode, cutoff_date, cache_dir)
+            enc = _load_cached_or_encode(s, tokenizer, mode, cutoff_date, cache_dir, tok_hash)
         else:
             feat = s["features_raw"]
             day, month, year = s["day"], s["month"], s["year"]
@@ -273,6 +291,24 @@ def pack_stocks(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutoff_d
     return sequences
 
 
+def _build_segment_mask(S, boundaries):
+    """Build causal attention mask with cross-stock isolation.
+
+    Each stock segment can attend to:
+      - BOS token (position 0)
+      - All earlier positions within the same segment (causal)
+    Cross-stock attention is blocked.
+    """
+    mask = torch.zeros(S, S, dtype=torch.bool)
+    # BOS is visible to everyone
+    mask[:, 0] = True
+    for start, end in boundaries:
+        # Within segment: causal (each pos attends to [start..pos])
+        for pos in range(start, end):
+            mask[pos, start:pos + 1] = True
+    return mask
+
+
 class PackedDataset(Dataset):
     def __init__(self, sequences):
         self.sequences = sequences
@@ -283,12 +319,7 @@ class PackedDataset(Dataset):
     def __getitem__(self, idx):
         seq = self.sequences[idx]
         S = seq["input_ids"].shape[0]
-        # Build causal attention mask with segment isolation
-        mask = torch.tril(torch.ones(S, S, dtype=torch.bool))
-        # Block-diagonal: mask out cross-stock attention
-        for start, end in seq["boundaries"]:
-            # Allow attention within segment, block cross-segment
-            pass
+        mask = _build_segment_mask(S, seq["boundaries"])
         return (
             seq["input_ids"],
             seq["targets"],

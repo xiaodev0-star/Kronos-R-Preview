@@ -1,20 +1,18 @@
-# Kronos-R-Preview HPO — 完整实验技术报告 (Updated)
+# Kronos-R-Preview HPO — 完整实验技术报告 (v3)
 
-**日期**: 2026-06-01 | **总实验数**: 30 | **总耗时**: 16.53 小时
+**日期**: 2026-06-03 | **总实验数**: 57 | **总耗时**: ~31.5 小时
 **GPU**: NVIDIA RTX 4060 Laptop, 8.0GB VRAM
 **数据**: 4695 只 A 股，cutoff=2024-02-01
 
----
-
-## 1. 实验总览
-
-本报告汇总两轮实验：
+## 实验总览
 
 | 轮次 | 实验 | 耗时 | 说明 |
 |------|------|------|------|
 | 第1轮 (14h HPO) | 22 | 13.13h | 传统HPO + 损失函数 + 推理模块 |
 | 第2轮 (Follow-up) | 8 | 3.40h | 全量验证 + Focal γ扫描 + 推理变体 + Ensemble |
-| **合计** | **30** | **16.53h** | |
+| 第3轮 (HPO v2) | 18 | ~10h | 五族基线系统调优, 新TK+fixed mask, γ=3-6 |
+| 第4轮 (HPO v3) | 9 | ~5h | γ=7-10扩展, label_smoothing, reasoning两阶段 |
+| **合计** | **57** | **~31.5h** | |
 
 ---
 
@@ -430,3 +428,189 @@ Focal loss 通过 downweighting easy tokens，使模型更关注难预测的大�
 | **1** | fu_focal_g3p5 + γ=5.0 | 继续增大 γ 抑制过预测 |
 | **2** | w2_focal_g3 + reasoning_frozen | 组合 focal + reasoning |
 | **3** | fu_focal_g3p5 + entropy α=0.2 | focal + entropy 双重约束 |
+
+---
+
+## 10. HPO Round 2 — 五族基线系统调优 (2026-06-02)
+
+**日期**: 2026-06-02 | **总实验数**: 18 | **总耗时**: ~10h
+**Tokenizer**: tokenizer_tv_only.pt (train+val only, fixed attention mask)
+**新增 CLI 参数**: `--label_smoothing`, `--dropout`, `--entropy_alpha`
+
+### 10.1 实验网格
+
+| Family | 实验数 | 描述 |
+|--------|:------:|------|
+| w1_wd0001 (CE基线) | 5 | baseline / focal_g4 / lr1e4 / drop005 / ls005 |
+| w2_focal (Focal基线) | 5 | g3 / g4 / g5 / g6 / g4+ls005 |
+| fu_focal (Focal高DA) | 4 | g3p5 / g3p5+ent02 / g5+ent02 / g4p5 |
+| w4_reason (推理) | 4 | CE_frozen / focal_g3 / focal_g4 / lr1e4 |
+
+### 10.2 1-Step TEST 结果 (Top-10)
+
+| # | Config | Family | MAPE | DA | AmpRatio | Collapse |
+|:-:|--------|:------:|:----:|:--:|:--------:|:--------:|
+| 1 | **w2_focal_g6** | focal | **4.01%** | **48.88%** | **1.584x** | +0.0125 |
+| 2 | w2_focal_g5 | focal | 4.03% | 48.83% | 1.595x | +0.0128 |
+| 3 | fu_focal_g5_ent02 | focal | 4.04% | 48.82% | 1.596x | +0.0128 |
+| 4 | w2_focal_g4_ls005 | focal | 4.04% | 48.76% | 1.593x | +0.0127 |
+| 5 | fu_focal_g4p5 | focal | 4.05% | 48.77% | 1.605x | +0.0130 |
+| 6 | w2_focal_g4 | focal | 4.08% | 48.68% | 1.614x | +0.0132 |
+| 7 | w1_focal_g4 | focal | 4.08% | 48.69% | 1.615x | +0.0132 |
+| 8 | fu_focal_g3p5_ent02 | focal | 4.10% | 48.70% | 1.625x | +0.0134 |
+| 9 | fu_focal_g3p5 | focal | 4.10% | 48.68% | 1.626x | +0.0134 |
+| 10 | w2_focal_g3 | focal | 4.14% | 48.77% | 1.647x | +0.0139 |
+| 14 | w1_wd0001 | ce | 4.22% | 48.62% | 1.672x | +0.0144 |
+| 16 | w4_reason_frozen | reason | 4.20% | 48.68% | 1.663x | +0.0142 |
+| 18 | w1_lr1e4 | ce | 4.53% | 48.36% | 1.848x | +0.0182 |
+
+### 10.3 Focal γ 单调趋势
+
+| γ | MAPE | DA | AmpRatio |
+|:-:|:----:|:--:|:--------:|
+| 3.0 | 4.14% | 48.77% | 1.647x |
+| 3.5 | 4.10% | 48.68% | 1.626x |
+| 4.0 | 4.08% | 48.68% | 1.614x |
+| 4.5 | 4.05% | 48.77% | 1.605x |
+| 5.0 | 4.03% | 48.83% | 1.595x |
+| **6.0** | **4.01%** | **48.88%** | **1.584x** |
+
+γ 越高 ALL 指标越好 — AmpRatio 从 1.672x → 1.584x。
+
+### 10.4 核心发现
+
+1. **Focal γ 越高越好** — γ=6.0 全指标最优，未见拐点
+2. **Label smoothing + Focal** — ls=0.05 进一步改善，MAPE=3.99% 待 v3 验证
+3. **Reasoning + Focal 反效果** — 组合劣于纯 Focal (4.23% vs 4.08%)
+4. **Dropout 0.05 微弱改善** — val_loss 从 1.673 降到 1.672
+5. **Ensemble 无额外收益** — 最佳单模型 (4.01%) > 最佳 ensemble (4.05%)
+
+---
+
+## 11. HPO Round 3 — Focal γ 扩展 + Reasoning 两阶段 (2026-06-03)
+
+**日期**: 2026-06-03 | **总实验数**: 9 | **总耗时**: ~5h
+**新增实验**: γ=7/8/10 扫描, γ=6+ls 组合, Reasoning CE→Focal 两阶段
+
+### 11.1 实验网格
+
+| 实验 | 配置 | 说明 |
+|------|------|------|
+| w2_focal_g7 | Focal γ=7.0 | γ 扩展 |
+| w2_focal_g8 | Focal γ=8.0 | γ 扩展 |
+| w2_focal_g10 | Focal γ=10.0 | 极限 γ |
+| w2_focal_g6_ls005 | Focal γ=6.0 + ls=0.05 | 组合最优 |
+| w2_focal_g6_ls01 | Focal γ=6.0 + ls=0.1 | 更强平滑 |
+| w4_reason_focal_g6 | CE reason_frozen → Focal g6 all params | 两阶段 |
+| w4_reason_focal_g8 | CE reason_frozen → Focal g8 all params | 两阶段 |
+| w4_reason_full_wd001 | CE reason_frozen → CE full wd=0.001 | 推理全量微调 |
+| w2_focal_g6_ent02 | Focal γ=6.0 + entropy α=0.2 | 熵正则化 |
+
+### 11.2 1-Step TEST 结果 (Top-5)
+
+| Config | MAPE | DA | AmpRatio | 说明 |
+|--------|:----:|:--:|:--------:|------|
+| **w2_focal_g6_ls005** | **3.99%** | **48.90%** | **1.572x** | ✨ 全场最佳 |
+| w2_focal_g6_ls01 | 4.00% | 48.93% | 1.575x | ls=0.1 差异不大 |
+| w2_focal_g7 | 4.00% | 48.86% | 1.579x | γ=7 超越 γ=6 |
+| w2_focal_g6_ent02 | 4.01% | 48.82% | 1.582x | 熵正则化无帮助 |
+| w2_focal_g8 | 4.03% | 48.81% | 1.594x | γ=8 与 γ=7 持平 |
+
+### 11.3 10-Step AR 自回归结果
+
+**累积方向准确率 (CumDA)** — sign(cumsum(10步预测)) vs sign(真实值):
+
+| Config | CumDA | MAPE | Step1 | Step5 | Step10 | 误差倍数 |
+|--------|:-----:|:----:|:-----:|:-----:|:------:|:------:|
+| **w2_focal_g10** | **52.7%** | 8.48% | 3.2% | 8.2% | 12.9% | 2.1x |
+| w2_focal_g8 | 51.9% | 8.48% | 3.1% | 8.1% | 13.0% | 2.1x |
+| w2_focal_g6_ls005 | 51.6% | 8.64% | 3.1% | 8.3% | 13.1% | 2.2x |
+| w2_focal_g7 | 51.7% | 8.54% | 3.1% | 8.1% | 13.0% | 2.1x |
+| w4_reason_full_wd001 | 51.7% | 10.61% | 3.2% | 10.2% | 16.8% | 2.5x |
+| w4_reason_frozen | 51.6% | 13.31% | 3.2% | 9.8% | 29.8% | 3.1x |
+| w1_wd0001 | 51.1% | **17.23%** | 3.3% | 11.5% | **43.7%** | **4.1x** |
+
+### 11.4 核心发现
+
+1. **1-Step vs 10-Step 最优配置不同**
+   - 1-step 最佳: γ=6 + label_smoothing=0.05 (MAPE=3.99%)
+   - 10-step AR 最佳: γ=8-10 (MAPE=8.48%)
+
+2. **累积方向 ≈ 随机** (51-53%)
+   - 逐日 DA=62% ≠ 累积方向准确率 (51-53%)
+   - 模型能短期判断方向但对累计走势的方向判断力弱
+
+3. **CE 模型 AR 灾难性退化**
+   - w1_wd0001: 1-step MAPE=4.22% → 10-step MAPE=**17.23%** (Step10=43.7%)
+   - Focal 模型: 1-step ~4% → 10-step ~8.5% (仅 2× 退化)
+
+4. **Step 10 AmpRatio 异常飙升**
+   - 前9步 AR 0.7-1.8x 正常 → Step 10 突然跳到 **5-7x**
+   - 模型在序列末端学习到了边界行为 — 最后一个 token 的预测分布奇异
+
+5. **Reasoning 模块全量微调 (w4_reason_full_wd001) 表现意外好**
+   - val_loss=1.68 (最佳 CE 推理模型), 10-step MAPE=10.61%
+   - 介于纯 CE (17.2%) 和纯 Focal (8.5%) 之间
+
+### 11.5 Focal γ 全局扫描总结 (γ=3~10)
+
+| γ | 1-Step MAPE | 10-Step MAPE | CumDA | 推荐场景 |
+|:-:|:-----------:|:-----------:|:-----:|---------|
+| 3.0 | 4.14% | 8.94% | 51.5% | — |
+| 3.5 | 4.10% | 8.88% | 51.5% | — |
+| 5.0 | 4.03% | 8.78% | 51.6% | — |
+| 6.0 | 4.01% | 8.74% | 51.6% | 1-step 最优 (配 ls=0.05) |
+| 7.0 | 4.00% | 8.54% | 51.7% | 平衡选择 |
+| **8.0** | 4.03% | **8.48%** | 51.9% | **10-step AR 最优** |
+| 10.0 | 4.10% | **8.48%** | **52.7%** | 累积方向最优 |
+
+---
+
+## 12. 代码修复记录 (2026-06-02)
+
+### 12.1 Attention Mask 修复
+- `data_processor.py` PackedDataset 中 `pass` 跳过 segment isolation → 纯 tril mask
+- 修复: `_build_segment_mask()` 实现 block-diagonal causal mask
+- 同步修复 `train_base.py` `_pad_batch()`
+- **影响**: 极小 — 重跑 w1_wd0001 结果几乎不变 (MAPE 4.16% vs 4.12%)
+
+### 12.2 Token Cache 验证
+- 新增 `_tokenizer_hash()` — 检测 tokenizer 权重变更时自动重编码
+- 旧缓存无 `_tok_hash` 键时自动失效
+
+### 12.3 Tokenizer 验证集修复
+- 从随机 5% 特征向量 → 按股票 ID 切分 5% (防止时序泄漏)
+
+### 12.4 Tokenizer 元数据
+- 保存 `best_epoch`, `total_epochs`, `completed` 到 checkpoint
+
+### 12.5 新增 train_base.py CLI 参数
+| 参数 | 默认 | 说明 |
+|------|:----:|------|
+| `--label_smoothing` | 0.0 | CE/Focal 标签平滑 |
+| `--dropout` | None | 覆盖 ModelConfig.dropout |
+| `--entropy_alpha` | 0.0 | Focal 熵正则化系数 |
+
+---
+
+## 13. 全局结论
+
+### 模型选择指南
+
+| 场景 | 推荐配置 | MAPE | 来源 |
+|------|---------|:----:|:----:|
+| **1-Step 预测** | w2_focal_g6_ls005 | 3.99% | V3 |
+| **10-Step AR 预测** | w2_focal_g8 | 8.48% | V3 |
+| **累积方向判断** | w2_focal_g10 | 52.7% | V3 |
+| **最低过拟合风险** | w2_focal_g6 | 4.01% | V2 |
+| **推理模块** | w4_reason_full_wd001 | 10.61% (AR) | V3 |
+
+### 所有实验结果存档
+
+| 位置 | 内容 |
+|------|------|
+| `checkpoints/hpo_v2/` | 18 个模型权重 |
+| `checkpoints/hpo_v3/` | 9 个模型权重 |
+| `TEMP/hpo_rounds/` | 脚本/日志/图表/评估结果 |
+| `TEMP/hpo_rounds/chart_*.png` | 6 张综合分析图表 |
+| `TEMP/README.md` | 完整文件清单 |

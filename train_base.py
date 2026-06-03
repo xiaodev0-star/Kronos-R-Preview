@@ -16,14 +16,21 @@ from model.kronos_preview import KronosPreview, KronosPreviewWithReasoning
 from reproducibility import set_global_seed
 
 
-def focal_loss(logits, targets, gamma=2.0, ignore_index=-100):
-    ce = F.cross_entropy(logits, targets, reduction='none', ignore_index=ignore_index)
+def focal_loss(logits, targets, gamma=2.0, label_smoothing=0.0, entropy_alpha=0.0, ignore_index=-100):
+    ce = F.cross_entropy(logits, targets, reduction='none', ignore_index=ignore_index,
+                         label_smoothing=label_smoothing)
     with torch.no_grad():
         probs = F.softmax(logits, dim=-1)
         pt = probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1).clamp(1e-8, 1.0)
     mask = (targets != ignore_index).float()
     focal_weight = (1 - pt) ** gamma
     loss = (focal_weight * ce * mask).sum() / mask.sum().clamp(min=1)
+    # Optional entropy regularization on prediction distribution
+    if entropy_alpha > 0:
+        log_probs = F.log_softmax(logits, dim=-1)
+        entropy = -(probs * log_probs).sum(dim=-1)  # [B*N]
+        ent_loss = (entropy * mask).sum() / mask.sum().clamp(min=1)
+        loss = loss - entropy_alpha * ent_loss
     return loss
 
 
@@ -56,7 +63,14 @@ def _pad_batch(sequences, batch_size):
             p_tgt[j, :Lt] = s["targets"]
             p_time[j, :L] = s["time_ids"]
             p_pos[j, :L] = s["position_ids"]
-            p_mask[j, :L, :L] = torch.tril(torch.ones(L, L, dtype=torch.bool))
+            # Segment-isolated causal mask: BOS visible to all,
+            # each stock attends only within its own segment + BOS
+            mask = torch.zeros(L, L, dtype=torch.bool)
+            mask[:, 0] = True
+            for start, end in s.get("boundaries", [(1, L)]):
+                for pos in range(start, min(end, L)):
+                    mask[pos, start:pos + 1] = True
+            p_mask[j, :L, :L] = mask
 
         batches.append((p_ids, p_tgt, p_time, p_pos, p_mask))
     return batches
@@ -100,10 +114,23 @@ def main(args=None):
     use_reasoning = args.reasoning if args else False
     reasoning_frozen = args.reasoning_frozen if args else False
     base_ckpt_path = args.base_checkpoint if args else None
+    label_smoothing = args.label_smoothing if args else 0.0
+    entropy_alpha = args.entropy_alpha if args else 0.0
+    dropout_override = args.dropout if args else None
+
+    # Apply dropout override before model construction
+    if dropout_override is not None:
+        ModelConfig.dropout = dropout_override
 
     print(f"Device: {device}, tag={tag}")
     print(f"  save={save_path}, tok={tok_path}, ep={epochs}")
     print(f"  loss={loss_type}, gamma={gamma}, wd={weight_decay}")
+    if label_smoothing > 0:
+        print(f"  label_smoothing={label_smoothing}")
+    if entropy_alpha > 0:
+        print(f"  entropy_alpha={entropy_alpha}")
+    if dropout_override is not None:
+        print(f"  dropout={dropout_override}")
     if use_reasoning:
         print(f"  reasoning=True, frozen={reasoning_frozen}")
         if base_ckpt_path:
@@ -230,10 +257,13 @@ def main(args=None):
                     continue
                 if loss_type == "focal":
                     loss = focal_loss(shift_logits.view(-1, shift_logits.size(-1)),
-                                      shift_targets.view(-1), gamma=gamma)
+                                      shift_targets.view(-1), gamma=gamma,
+                                      label_smoothing=label_smoothing,
+                                      entropy_alpha=entropy_alpha)
                 else:
                     loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
-                                           shift_targets.view(-1), ignore_index=-100)
+                                           shift_targets.view(-1), ignore_index=-100,
+                                           label_smoothing=label_smoothing)
 
             if loss is None:
                 continue
@@ -299,6 +329,9 @@ def main(args=None):
                 "weight_decay": weight_decay,
                 "use_reasoning": use_reasoning,
                 "reasoning_frozen": reasoning_frozen,
+                "label_smoothing": label_smoothing,
+                "entropy_alpha": entropy_alpha,
+                "dropout": ModelConfig.dropout,
             }, save_path)
             tag_s = "  -> Saved best"
 
@@ -348,4 +381,10 @@ if __name__ == "__main__":
     parser.add_argument("--reasoning_frozen", action="store_true")
     parser.add_argument("--base_checkpoint", type=str, default=None,
                         help="Pre-trained base model checkpoint for reasoning model")
+    parser.add_argument("--label_smoothing", type=float, default=0.0,
+                        help="Label smoothing for CE/focal loss (0.0 = disabled)")
+    parser.add_argument("--dropout", type=float, default=None,
+                        help="Override ModelConfig.dropout (default: use config value 0.1)")
+    parser.add_argument("--entropy_alpha", type=float, default=0.0,
+                        help="Entropy regularization weight for focal loss (0.0 = disabled)")
     main(parser.parse_args())

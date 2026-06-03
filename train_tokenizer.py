@@ -39,14 +39,17 @@ def main(args=None):
     tv_stocks = train_s + val_s
     print(f"Train: {len(train_s)}, Val: {len(val_s)}, TV: {len(tv_stocks)}")
 
-    features = get_tokenizer_features(tv_stocks)
-    print(f"Feature vectors: {features.shape}")
+    # Split by stock ID (not random feature vectors) to prevent temporal leakage
+    n_tv = len(tv_stocks)
+    n_val_stocks = max(1, int(n_tv * 0.05))
+    rng = np.random.RandomState(DataConfig.random_seed)
+    perm = rng.permutation(n_tv)
+    tok_train_stocks = [tv_stocks[i] for i in sorted(perm[n_val_stocks:])]
+    tok_val_stocks = [tv_stocks[i] for i in sorted(perm[:n_val_stocks])]
 
-    n = len(features)
-    n_val = max(1, int(n * 0.05))
-    idx = np.random.permutation(n)
-    train_feat = features[idx[n_val:]]
-    val_feat = features[idx[:n_val]]
+    train_feat = get_tokenizer_features(tok_train_stocks)
+    val_feat = get_tokenizer_features(tok_val_stocks)
+    print(f"Feature vectors: train={train_feat.shape}, val={val_feat.shape}")
 
     train_loader = DataLoader(TensorDataset(torch.from_numpy(train_feat)),
                               batch_size=bs, shuffle=True, pin_memory=True, drop_last=True)
@@ -113,12 +116,22 @@ def main(args=None):
             torch.save({"model_state_dict": tok.state_dict(),
                         "config": export_tokenizer_config(),
                         "best_val_loss": best_val,
+                        "best_epoch": epoch,
+                        "total_epochs": epochs,
                         "completed": epoch == epochs - 1}, save_path)
 
         log_iv = max(1, epochs // 6)
         if (epoch + 1) % log_iv == 0 or epoch == start_epoch or (epoch + 1) == epochs:
             print(f"  Epoch {epoch+1}: train={avg_tr:.4f} val={avg_va:.4f} best={best_val:.4f} "
                   f"{time.time()-t0:.0f}s")
+
+    # Mark completed if not already
+    if os.path.exists(save_path):
+        ckpt = torch.load(save_path, map_location="cpu", weights_only=False)
+        if not ckpt.get("completed", False):
+            ckpt["completed"] = True
+            ckpt["total_epochs"] = epochs
+            torch.save(ckpt, save_path)
 
     print(f"\nSaved tokenizer to {save_path} (best val={best_val:.4f})")
 
