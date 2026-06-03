@@ -36,7 +36,7 @@ class TokenizerConfig:
     learning_rate: float = 1e-4
     batch_size: int = 512
     grad_clip: float = 1.0
-    save_path: str = "checkpoints/tokenizer.pt"
+    save_path: str = "checkpoints/tokenizer_tv_only.pt"
 
 
 class ModelConfig:
@@ -64,7 +64,7 @@ class TrainingConfig:
     random_seed: int = 42
     max_train_updates: int = 0
     save_dir: str = "checkpoints"
-    tokenizer_path: str = "checkpoints/tokenizer.pt"
+    tokenizer_path: str = "checkpoints/tokenizer_tv_only.pt"
     base_model_path: str = "checkpoints/base_model.pt"
     token_cache_dir: str = "checkpoints/token_cache"  # NEW: pre-tokenize cache
 

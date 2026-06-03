@@ -22,7 +22,7 @@ Kronos-R 原项目采用固定 1024 滑动窗口训练 BaseModel，经过 12 轮
 Preview: [整个股票历史] → predict 每个位置的 next token（LLM 范式）
 ```
 
-每只股票从第一个交易日读到 cutoff 日期（2024-02-01），模型在每个位置都预测下一个 token。多只股票打包到同一序列（context_len=8192），用 block-diagonal attention mask 隔离。
+每只股票从第一个交易日读到 cutoff 日期（2024-02-01），模型在每个位置都预测下一个 token。多只股票打包到同一序列（context_len=8192），用 segment-isolated causal mask 隔离。
 
 ### 2.2 信息泄漏防控
 
@@ -30,7 +30,7 @@ Preview: [整个股票历史] → predict 每个位置的 next token（LLM 范�
 |------|--------|---------|
 | 归一化 | 每 1024 窗口全局 Z-score | 滚动窗口 W=252，只用过去数据 |
 | 位置编码 | 全局递增（跨股票混合） | per-stock 重置（每只股票从 0 开始） |
-| 注意力 | 全连接 | causal × segment（股票间完全隔离） |
+| 注意力 | 全连接 | causal × segment（block-diagonal mask） |
 | 数据切分 | 按日期 | 按 CSV 文件 + 时间 cutoff |
 
 ### 2.3 模型架构
@@ -45,6 +45,8 @@ Kronos-Preview (2.7M 参数):
       RMSNorm → F.scaled_dot_product_attention (Flash Attention)
       RMSNorm → SiLU-gated FFN
       ↓
+  [可选: CausalReasoningBlock — N 个 learnable memory tokens, cross-attn + gate + FFN]
+      ↓
   RMSNorm → Linear → logits
 ```
 
@@ -52,46 +54,74 @@ Kronos-Preview (2.7M 参数):
 - `F.scaled_dot_product_attention`：自动使用 Flash Attention，内存 O(N)
 - RoPE：position_ids 外部传入，每只股票重置
 - RMSNorm + SiLU-gated FFN：LLaMA 风格
+- **CausalReasoningBlock** (可选)：跨注意力到可学习 memory tokens，learnable gating
 - Gradient Checkpointing：进一步降低显存
 
-### 2.4 数据切分
+### 2.4 训练特性
+
+**支持 Loss 函数**:
+| Loss | 说明 | CLI |
+|------|------|-----|
+| CE (Cross Entropy) | 标准 next-token prediction | `--loss ce` |
+| Focal Loss | 通过 (1-p)ᵞ downweight easy tokens → 抑制零坍塌 | `--loss focal --gamma 6.0` |
+| + Label Smoothing | 平滑 target → 降低过度自信 | `--label_smoothing 0.05` |
+| + Entropy Reg | 鼓励预测分布保持适度熵 | `--entropy_alpha 0.2` |
+
+**支持模块**:
+| 模块 | 说明 | CLI |
+|------|------|-----|
+| CausalReasoningBlock | N memory tokens + gate + cross-attn + FFN | `--reasoning` |
+| Frozen reasoning | 仅训练 reasoning block，transformer 冻结 | `--reasoning_frozen` |
+| Base checkpoint | 从预训练权重初始化 | `--base_checkpoint path/to/model.pt` |
+
+### 2.5 数据切分
 
 ```
-Train: 87.5% 的股票（随机选择，≤ cutoff_date 的数据）
-Val:   12.5% 的股票（完全不同的股票，≤ cutoff_date 的数据）
-Test:  所有股票在 (cutoff_date, 最新日期] 的数据
-```
+时间线:  2010 ────────── 2024-02-01 ──── 2026.2
+              ├─ Train/Val ─┤  ├── Test ──┤
 
-空间泛化（未见过的股票）+ 时间泛化（未来数据），零信息泄漏。
+CSV 隔离（空间泛化）:
+  Train: 87.5% 的股票（所有 ≤ cutoff 的数据）
+  Val:   12.5% 的股票（所有 ≤ cutoff 的数据）
+
+时间隔离（时间泛化）:
+  Test:  所有股票在 (cutoff, 2026.2] 的数据
+```
 
 ---
 
-## 3. 初步验证结果
+## 3. HPO 结果摘要 (57 实验, ~31.5h)
 
-### 3.1 硬件验证
+详见 `REPORT_SUM.md` 和 `REPORT_HPO.md`。
 
-| 配置 | 峰值 GPU 显存 | 8GB 可行性 |
-|------|-------------|-----------|
-| dim=128, depth=1, ctx=2048 | 0.08 GB | 轻松 |
-| dim=256, depth=2, ctx=8192 | **0.48 GB** | **轻松** |
+### 1-Step 预测 (价格空间 MAPE)
 
-Flash Attention + gradient checkpointing 使 8GB GPU 可以轻松处理 context=8192。
+| Rank | Config | MAPE | DA | AmpRatio |
+|:----:|--------|:----:|:--:|:--------:|
+| 1 | w2_focal_g6_ls005 | **3.99%** | 48.90% | **1.572x** |
+| 2 | w2_focal_g6_ls01 | 4.00% | 48.93% | 1.575x |
+| 3 | w2_focal_g7 | 4.00% | 48.86% | 1.579x |
+| 4 | w2_focal_g6 | 4.01% | 48.88% | 1.584x |
+| 5 | w4_reason_focal_g8 | 4.05% | 48.18% | 1.602x |
 
-### 3.2 训练收敛
+### 10-Step AR (自回归预测, 500 stocks × 3 splits)
 
-200 只股票 × 5 epochs：
-- Train Loss: 11.53 → 8.87（-23%）
-- Val Loss: 10.38 → 8.79（-15%）
-- 单 epoch 耗时: ~6 秒
-- 无 NaN，无振荡
+| Config | CumDA | MAPE | Step10 MAPE | 退化倍数 |
+|--------|:-----:|:----:|:-----------:|:------:|
+| w2_focal_g10 | **52.7%** | 8.48% | 12.9% | 2.1x |
+| w2_focal_g8 | 51.9% | 8.48% | 13.0% | 2.1x |
+| w2_focal_g6_ls005 | 51.6% | 8.64% | 13.1% | 2.2x |
+| w4_reason_frozen | 51.6% | 13.31% | 29.8% | 3.1x |
+| w1_wd0001 (CE) | 51.1% | **17.23%** | **43.7%** | **4.1x** |
 
-### 3.3 打包效率
+### 核心发现
 
-| 指标 | 数值 |
-|------|------|
-| 平均每序列股票数 | 2.9 |
-| 序列利用率 | 100% |
-| 总训练 token | ~392K（200 只股票） |
+1. **Focal Loss 是 anti-collapse 最优工具**：γ=6-8 将 AmpRatio 从 1.67x 降至 **1.57x**
+2. **Label Smoothing + Focal 协同**：w2_focal_g6_ls005 达全场最优 MAPE=3.99%
+3. **CE 模型 AR 灾难退化**：1-step MAPE=4.2% → 10-step=**17.2%** (4.1x)
+4. **Focal 模型 AR 稳定**：1-step=4.0% → 10-step=**8.5%** (2.1x)
+5. **累积方向 ≈ 随机**：CumDA 51-53%，单步DA=62%不转化
+6. **CausalReasoningBlock 最佳用途**：CE预训练→全量微调，val_loss=1.68
 
 ---
 
@@ -105,7 +135,10 @@ Flash Attention + gradient checkpointing 使 8GB GPU 可以轻松处理 context=
 | 注意力 | 手写 softmax | Flash Attention |
 | 显存需求 | ~2 GB | ~0.5 GB |
 | 信息泄漏 | 有（归一化） | 无 |
-| 辅助模块 | LatentReasoner 等 | 无（纯 LLM） |
+| Loss 函数 | CE only | CE / Focal / +Label Smoothing / +Entropy |
+| 推理模块 | LatentReasoner (跨股票) | CausalReasoningBlock (per-stock memory) |
+| 1-Step MAPE | — | **3.99%** |
+| 10-Step AR MAPE | — | **8.48%** |
 
 ---
 
@@ -117,55 +150,48 @@ cd Kronos-R-Preview
 # 1. 训练 Tokenizer
 python train_tokenizer.py
 
-# 2. 训练 Base Model
-python train_base.py
-```
+# 2. 训练标准 Base Model (CE)
+python train_base.py --loss ce --weight_decay 0.001
 
-### 调整配置
+# 3. 训练 Focal Base Model (推荐)
+python train_base.py --loss focal --gamma 6.0 --label_smoothing 0.05
 
-```python
-# config.py 中修改
-DataConfig.max_stocks = 200      # 限制股票数（调试用）
-DataConfig.cutoff_date = "2024-02-01"
-ModelConfig.dim = 256
-ModelConfig.depth = 2
-TrainingConfig.epochs = 10
-TrainingConfig.learning_rate = 3e-4
-```
-
-或通过环境变量覆盖：
-
-```bash
-export KRONOS_PREVIEW_OVERRIDE_JSON=overrides.json
-python train_base.py
+# 4. 训练 Reasoning Model (两阶段)
+# Stage 1: CE + reasoning_frozen
+python train_base.py --loss ce --reasoning --reasoning_frozen \
+  --base_checkpoint checkpoints/hpo_v2/w1_wd0001.pt
+# Stage 2: 全量微调
+python train_base.py --loss ce --reasoning --weight_decay 0.001
 ```
 
 ---
 
-## 6. 后续计划
-
-1. **全量训练**：4695 只股票 × 10+ epochs，验证大规模收敛
-2. **Rollout 评估**：在 test 期（2024-02-01 之后）做 10-step AR 预测
-3. **与原项目对比**：同一 test 集上比较 path_mape / DA
-4. **模型缩放**：测试 dim=128/dim=384 的效果差异
-5. **后训练**：ExPO / GRPO 方向优化
-
----
-
-## 7. 项目结构
+## 6. 项目结构
 
 ```
 Kronos-R-Preview/
+├── REPORT_HPO.md                  # 完整实验技术报告 (57实验)
+├── REPORT_SUM.md                  # 配置说明 + 结果汇总 (速查表)
+├── README.md                      # 快速入门
+├── main.md                        # 本文件
+├── CODE_WIKI.md                   # 代码文档
 ├── config.py                      # 全局配置
 ├── reproducibility.py             # 随机种子
-├── data_processor.py              # 数据管道
+├── data_processor.py              # 数据管道 (segment mask + token cache)
+├── train_tokenizer.py             # Stage A: Tokenizer训练
+├── train_base.py                  # Stage B: 模型训练 (Focal/Reasoning/...)
 ├── model/
-│   ├── tokenizer.py               # BSQ Tokenizer
-│   ├── tokenizer_config.py        # Tokenizer 工具
-│   └── kronos_preview.py          # 新模型
-├── train_tokenizer.py             # Stage A
-├── train_base.py                  # Stage B
-├── dataset/                       # CSV 数据（symlink）
-├── CODE_WIKI.md                   # 代码文档
-└── main.md                        # 本文件
+│   ├── kronos_preview.py          # KronosPreview + CausalReasoningBlock
+│   ├── tokenizer.py               # BSQ Hierarchical Tokenizer
+│   └── tokenizer_config.py        # Tokenizer配置工具
+├── checkpoints/
+│   ├── tokenizer_tv_only.pt       # 主力 Tokenizer (train+val only)
+│   └── token_cache_tokenizer_tv_only/
+├── dataset/                       # CSV 数据
+└── TEMP/                          # 历史实验归档
+    ├── README.md                   # 完整文件清单
+    ├── hpo_rounds/                 # HPO v2/v3 脚本/日志/图表/结果
+    ├── hpo_v2_ckpts/               # 18个模型权重
+    ├── hpo_v3_ckpts/               # 9个模型权重
+    └── tok_iso_exp/                # Tokenizer隔离实验
 ```

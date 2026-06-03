@@ -125,11 +125,18 @@ def split_stocks(stocks, cutoff_date=DataConfig.cutoff_date, train_ratio=DataCon
     return train, val, test
 
 
-def get_tokenizer_features(stocks, window=lookback_window):
-    """对每只股票做滚动归一化，拼接为 [N_total, 6]。"""
+def get_tokenizer_features(stocks, window=lookback_window, cutoff_date=None):
+    """对每只股票做滚动归一化，拼接为 [N_total, 6]。
+    若 cutoff_date 提供，仅使用 ≤ cutoff 的数据（防止 tokenizer 数据泄漏）。"""
     parts = []
     for s in tqdm(stocks, desc="Rolling normalize"):
-        parts.append(rolling_normalize(s["features_raw"], window))
+        feat = s["features_raw"]
+        if cutoff_date is not None:
+            ci = _stock_cutoff_idx(s, cutoff_date)
+            feat = feat[:ci]
+        if len(feat) < min_lookback + 5:
+            continue
+        parts.append(rolling_normalize(feat, window))
     return np.concatenate(parts, axis=0)
 
 

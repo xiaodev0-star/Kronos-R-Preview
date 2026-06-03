@@ -47,8 +47,8 @@ def main(args=None):
     tok_train_stocks = [tv_stocks[i] for i in sorted(perm[n_val_stocks:])]
     tok_val_stocks = [tv_stocks[i] for i in sorted(perm[:n_val_stocks])]
 
-    train_feat = get_tokenizer_features(tok_train_stocks)
-    val_feat = get_tokenizer_features(tok_val_stocks)
+    train_feat = get_tokenizer_features(tok_train_stocks, cutoff_date=DataConfig.cutoff_date)
+    val_feat = get_tokenizer_features(tok_val_stocks, cutoff_date=DataConfig.cutoff_date)
     print(f"Feature vectors: train={train_feat.shape}, val={val_feat.shape}")
 
     train_loader = DataLoader(TensorDataset(torch.from_numpy(train_feat)),

@@ -369,13 +369,30 @@ def main(args=None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Kronos-Preview training. Default: focal γ=6 + label_smoothing=0.05 (HPO best 1-Step).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # 1-Step best (HPO v3 winner: MAPE=3.99%%)
+  python train_base.py --loss focal --gamma 6.0 --label_smoothing 0.05
+
+  # 10-Step AR best (HPO v3: MAPE=8.48%%)
+  python train_base.py --loss focal --gamma 8.0
+
+  # Standard CE baseline
+  python train_base.py --loss ce --weight_decay 0.001
+
+  # Reasoning model (two-stage)
+  python train_base.py --loss ce --reasoning --reasoning_frozen --base_checkpoint model.pt
+  python train_base.py --loss focal --gamma 6.0 --reasoning
+        """)
     parser.add_argument("--save_path", type=str, default=TrainingConfig.base_model_path)
     parser.add_argument("--tokenizer_path", type=str, default=TrainingConfig.tokenizer_path)
     parser.add_argument("--epochs", type=int, default=TrainingConfig.epochs)
     parser.add_argument("--tag", type=str, default="default")
-    parser.add_argument("--loss", type=str, default="ce", choices=["ce", "focal"])
-    parser.add_argument("--gamma", type=float, default=2.0)
+    parser.add_argument("--loss", type=str, default="focal", choices=["ce", "focal"])
+    parser.add_argument("--gamma", type=float, default=6.0)
     parser.add_argument("--weight_decay", type=float, default=TrainingConfig.weight_decay)
     parser.add_argument("--reasoning", action="store_true")
     parser.add_argument("--reasoning_frozen", action="store_true")
