@@ -4,8 +4,21 @@ import json
 
 
 class NormConfig:
+    # --- v1: rolling window normalize (deprecated, kept for backward compat) ---
     lookback_window: int = 252
     min_lookback: int = 20
+
+    # --- v2: per-stock historical normalize ---
+    # Price features (OHLC): historical Z-Score (stats from full train history)
+    # Volume/Amount: log1p → first-day baseline → Z-Score
+    price_features: list = None   # set below after class
+    va_features: list = None      # set below after class
+    # Minimum days of history required for a stock to be included
+    min_doc_length: int = 30
+
+
+NormConfig.price_features = ["log_ret", "log_high", "log_low", "log_open"]
+NormConfig.va_features = ["log_vol", "log_amt"]
 
 
 class DataConfig:
@@ -14,17 +27,18 @@ class DataConfig:
     context_len: int = 8192
     train_ratio: float = 0.875
     max_stocks: int = 0          # 0 = all
-    feature_cols: list = None    # set below after class
+    feature_cols: list = None    # set below after class (backward compat)
     random_seed: int = 42
 
 
+# v1: 6D features (deprecated, kept for backward compat)
 DataConfig.feature_cols = [
     "log_ret", "log_high", "log_low", "log_open", "log_vol", "log_amt",
 ]
 
 
 class TokenizerConfig:
-    input_dim: int = 6
+    input_dim: int = 4           # v2: OHLC only (was 6 with VA)
     hidden_dim: int = 192
     embedding_dim: int = 48
     num_quantizers: int = 2
@@ -34,9 +48,10 @@ class TokenizerConfig:
     epochs: int = 100
     random_seed: int = 42
     learning_rate: float = 1e-4
-    batch_size: int = 512
+    batch_size: int = 8192       # v2: was 512, now 8x larger for GPU saturation
+    num_workers: int = 2
     grad_clip: float = 1.0
-    save_path: str = "checkpoints/tokenizer_tv_only.pt"
+    save_path: str = "checkpoints/tokenizer_v2_ohlc.pt"
 
 
 class ModelConfig:
@@ -49,11 +64,12 @@ class ModelConfig:
     dropout: float = 0.1
     vocab_size: int = 1024
     ffn_multiplier: int = 4
+    va_hidden_dim: int = 64     # v2: Volume/Amount MLP hidden dim
 
 
 class TrainingConfig:
     epochs: int = 10
-    batch_size: int = 1             # batch_size=1 (stable; batching needs more VRAM)
+    batch_size: int = 4             # batch_size=1 (stable; batching needs more VRAM)
     accumulation_steps: int = 8     # was 16 — halved for faster updates
     num_workers: int = 2            # was 0 — parallel data loading
     learning_rate: float = 3e-4
@@ -64,8 +80,8 @@ class TrainingConfig:
     random_seed: int = 42
     max_train_updates: int = 0
     save_dir: str = "checkpoints"
-    tokenizer_path: str = "checkpoints/tokenizer_tv_only.pt"
-    base_model_path: str = "checkpoints/base_model.pt"
+    tokenizer_path: str = "checkpoints/tokenizer_v2_ohlc.pt"
+    base_model_path: str = "checkpoints/v2_model.pt"
     token_cache_dir: str = "checkpoints/token_cache"  # NEW: pre-tokenize cache
 
 

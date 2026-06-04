@@ -1,4 +1,5 @@
 ﻿"""Stage A: Train BSQ Tokenizer on train+val data.
+v2: 4D OHLC input with per-stock document normalization.
 Supports epoch-level checkpoint/resume."""
 import argparse
 import os
@@ -15,7 +16,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from config import DataConfig, TokenizerConfig
-from data_processor import load_stocks, split_stocks, get_tokenizer_features
+from data_processor import load_stocks, split_stocks, get_tokenizer_features_v2
 from model.tokenizer import HierarchicalQuantizer
 from model.tokenizer_config import build_tokenizer_kwargs, export_tokenizer_config
 from reproducibility import set_global_seed
@@ -32,6 +33,7 @@ def main(args=None):
 
     print(f"Device: {device}")
     print(f"  batch_size={bs}, epochs={epochs}, save={save_path}")
+    print(f"  num_workers={TokenizerConfig.num_workers}, persistent_workers={TokenizerConfig.num_workers > 0}")
 
     # Data
     stocks = load_stocks(max_stocks=DataConfig.max_stocks)
@@ -47,14 +49,18 @@ def main(args=None):
     tok_train_stocks = [tv_stocks[i] for i in sorted(perm[n_val_stocks:])]
     tok_val_stocks = [tv_stocks[i] for i in sorted(perm[:n_val_stocks])]
 
-    train_feat = get_tokenizer_features(tok_train_stocks, cutoff_date=DataConfig.cutoff_date)
-    val_feat = get_tokenizer_features(tok_val_stocks, cutoff_date=DataConfig.cutoff_date)
+    train_feat = get_tokenizer_features_v2(tok_train_stocks, cutoff_date=DataConfig.cutoff_date)
+    val_feat = get_tokenizer_features_v2(tok_val_stocks, cutoff_date=DataConfig.cutoff_date)
     print(f"Feature vectors: train={train_feat.shape}, val={val_feat.shape}")
 
     train_loader = DataLoader(TensorDataset(torch.from_numpy(train_feat)),
-                              batch_size=bs, shuffle=True, pin_memory=True, drop_last=True)
+                              batch_size=bs, shuffle=True, pin_memory=True,
+                              drop_last=True, num_workers=TokenizerConfig.num_workers,
+                              persistent_workers=TokenizerConfig.num_workers > 0)
     val_loader = DataLoader(TensorDataset(torch.from_numpy(val_feat)),
-                            batch_size=bs, shuffle=False, pin_memory=True)
+                            batch_size=bs, shuffle=False, pin_memory=True,
+                            num_workers=TokenizerConfig.num_workers,
+                            persistent_workers=TokenizerConfig.num_workers > 0)
 
     tok = HierarchicalQuantizer(**build_tokenizer_kwargs()).to(device)
     optimizer = torch.optim.Adam(tok.parameters(), lr=TokenizerConfig.learning_rate)
@@ -140,5 +146,5 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--batch_size", type=int, default=TokenizerConfig.batch_size)
     p.add_argument("--epochs", type=int, default=TokenizerConfig.epochs)
-    p.add_argument("--save_path", type=str, default=TokenizerConfig.save_path)
+    p.add_argument("--save_path", type=str, default="checkpoints/tokenizer_v2_ohlc.pt")
     main(p.parse_args())

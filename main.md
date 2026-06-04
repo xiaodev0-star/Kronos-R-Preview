@@ -22,16 +22,22 @@ Kronos-R 原项目采用固定 1024 滑动窗口训练 BaseModel，经过 12 轮
 Preview: [整个股票历史] → predict 每个位置的 next token（LLM 范式）
 ```
 
-每只股票从第一个交易日读到 cutoff 日期（2024-02-01），模型在每个位置都预测下一个 token。多只股票打包到同一序列（context_len=8192），用 segment-isolated causal mask 隔离。
+每只股票从第一个交易日读到 cutoff 日期（2024-02-01），模型在每个位置都预测下一个 token。每只股票作为独立序列，用纯因果 mask 训练。归一化采用 per-stock historical Z-Score（统计量仅来自该股票截止日前的训练数据）。
 
 ### 2.2 信息泄漏防控
 
 | 环节 | 原项目 | Preview |
 |------|--------|---------|
-| 归一化 | 每 1024 窗口全局 Z-score | 滚动窗口 W=252，只用过去数据 |
+| 归一化 | 每 1024 窗口全局 Z-score | per-stock historical Z-Score (统计量仅来自 train); 首日基线 + Z-Score (VA) |
 | 位置编码 | 全局递增（跨股票混合） | per-stock 重置（每只股票从 0 开始） |
-| 注意力 | 全连接 | causal × segment（block-diagonal mask） |
+| 注意力 | 全连接 | causal（严格屏蔽未来位置） |
 | 数据切分 | 按日期 | 按 CSV 文件 + 时间 cutoff |
+
+**归一化安全性说明**：
+
+Historical Z-Score 的统计量 (mean/std) 仅从每支股票截止日前的训练数据计算。模型直接接收的是 BSQ 量化后的离散 token IDs，而非归一化值本身——量化是有损压缩，模型无法从 token 反推出原始统计量。
+
+Causal attention mask 保证 position t 只能 attend 到 [0..t]。position 0 的 hidden state 在训练和推理时的计算**完全相同**（相同的输入、相同的 mask、相同的参数）。梯度虽然从整个序列回传，但只影响参数更新，不改变 forward 计算——参数固定后训推一致。
 
 ### 2.3 模型架构
 
@@ -39,16 +45,25 @@ Preview: [整个股票历史] → predict 每个位置的 next token（LLM 范�
 Kronos-Preview (2.7M 参数):
   dim=256, depth=2, heads=4, num_kv_heads=1
 
-  Token Embedding + Time Embedding (day/month/year)
+  Token Embedding (BSQ 10-bit, vocab=1024)
+  + Time Embedding (day/month/year, learned)
+  + VA Embedding (Volume/Amount, continuous MLP: Linear(2→64)→GELU→Linear(64→256))
       ↓
   Transformer Block × 2:
-      RMSNorm → F.scaled_dot_product_attention (Flash Attention)
+      RMSNorm → F.scaled_dot_product_attention (GQA + RoPE)
       RMSNorm → SiLU-gated FFN
       ↓
   [可选: CausalReasoningBlock — N 个 learnable memory tokens, cross-attn + gate + FFN]
       ↓
-  RMSNorm → Linear → logits
+  RMSNorm → Linear → logits (next-token prediction)
 ```
+
+**Tokenizer**: BSQ (Binary Spherical Quantization), 2-level hierarchical.
+输入 4D OHLC 价格特征 → Encoder MLP → 2×BSQ (10-bit each) → vocab=1024.
+
+**VA Embedding**: Volume/Amount 作为连续值直接注入 Transformer，而非量化进 token。
+训练时归一化: `log1p(vol) - log1p(vol_day0)` 再 Z-Score。
+推理时使用 cutoff 前最后已知 VA 值。
 
 **关键特性**：
 - `F.scaled_dot_product_attention`：自动使用 Flash Attention，内存 O(N)
@@ -147,21 +162,14 @@ CSV 隔离（空间泛化）:
 ```bash
 cd Kronos-R-Preview
 
-# 1. 训练 Tokenizer
+# 1. 训练 Tokenizer (4D OHLC)
 python train_tokenizer.py
 
-# 2. 训练标准 Base Model (CE)
-python train_base.py --loss ce --weight_decay 0.001
-
-# 3. 训练 Focal Base Model (推荐)
+# 2. 训练模型 (推荐 Focal)
 python train_base.py --loss focal --gamma 6.0 --label_smoothing 0.05
 
-# 4. 训练 Reasoning Model (两阶段)
-# Stage 1: CE + reasoning_frozen
-python train_base.py --loss ce --reasoning --reasoning_frozen \
-  --base_checkpoint checkpoints/hpo_v2/w1_wd0001.pt
-# Stage 2: 全量微调
-python train_base.py --loss ce --reasoning --weight_decay 0.001
+# 3. 评估
+python TEMP/eval_v2.py --n_stocks 30 --max_steps 10
 ```
 
 ---
@@ -170,28 +178,26 @@ python train_base.py --loss ce --reasoning --weight_decay 0.001
 
 ```
 Kronos-R-Preview/
-├── REPORT_HPO.md                  # 完整实验技术报告 (57实验)
-├── REPORT_SUM.md                  # 配置说明 + 结果汇总 (速查表)
 ├── README.md                      # 快速入门
 ├── main.md                        # 本文件
 ├── CODE_WIKI.md                   # 代码文档
 ├── config.py                      # 全局配置
 ├── reproducibility.py             # 随机种子
-├── data_processor.py              # 数据管道 (segment mask + token cache)
-├── train_tokenizer.py             # Stage A: Tokenizer训练
+├── data_processor.py              # 数据管道 (document_normalize + pack_stocks_v2)
+├── train_tokenizer.py             # Stage A: Tokenizer训练 (4D OHLC)
 ├── train_base.py                  # Stage B: 模型训练 (Focal/Reasoning/...)
 ├── model/
-│   ├── kronos_preview.py          # KronosPreview + CausalReasoningBlock
+│   ├── kronos_preview.py          # KronosPreview + VA embedding + CausalReasoningBlock
 │   ├── tokenizer.py               # BSQ Hierarchical Tokenizer
 │   └── tokenizer_config.py        # Tokenizer配置工具
 ├── checkpoints/
-│   ├── tokenizer_tv_only.pt       # 主力 Tokenizer (train+val only)
-│   └── token_cache_tokenizer_tv_only/
+│   ├── tokenizer_v2_ohlc.pt       # Tokenizer (4D OHLC)
+│   └── v2_model.pt                # 训练好的模型
 ├── dataset/                       # CSV 数据
-└── TEMP/                          # 历史实验归档
-    ├── README.md                   # 完整文件清单
-    ├── hpo_rounds/                 # HPO v2/v3 脚本/日志/图表/结果
-    ├── hpo_v2_ckpts/               # 18个模型权重
-    ├── hpo_v3_ckpts/               # 9个模型权重
-    └── tok_iso_exp/                # Tokenizer隔离实验
+└── TEMP/                          # 历史实验归档 + 评估脚本
+    ├── README.md                   # 完整实验记录
+    ├── eval_v2.py                  # 评估脚本
+    ├── eval_v2_results.json        # 评估结果
+    ├── REPORT_HPO.md               # HPO 技术报告
+    └── ...
 ```

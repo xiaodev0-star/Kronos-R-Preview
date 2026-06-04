@@ -9,7 +9,7 @@ import torch, torch.nn.functional as F
 from tqdm import tqdm
 
 from config import DataConfig, ModelConfig, TrainingConfig
-from data_processor import load_stocks, split_stocks, pack_stocks, make_dataloader
+from data_processor import load_stocks, split_stocks, pack_stocks_v2, make_dataloader_v2
 from model.tokenizer import HierarchicalQuantizer
 from model.tokenizer_config import build_tokenizer_kwargs
 from model.kronos_preview import KronosPreview, KronosPreviewWithReasoning
@@ -19,16 +19,17 @@ from reproducibility import set_global_seed
 def focal_loss(logits, targets, gamma=2.0, label_smoothing=0.0, entropy_alpha=0.0, ignore_index=-100):
     ce = F.cross_entropy(logits, targets, reduction='none', ignore_index=ignore_index,
                          label_smoothing=label_smoothing)
+    mask = (targets != ignore_index).float()
+    # Clamp targets for gather (avoid index -100)
+    safe_targets = targets.clamp(min=0)
     with torch.no_grad():
         probs = F.softmax(logits, dim=-1)
-        pt = probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1).clamp(1e-8, 1.0)
-    mask = (targets != ignore_index).float()
+        pt = probs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1).clamp(1e-8, 1.0)
     focal_weight = (1 - pt) ** gamma
     loss = (focal_weight * ce * mask).sum() / mask.sum().clamp(min=1)
-    # Optional entropy regularization on prediction distribution
     if entropy_alpha > 0:
         log_probs = F.log_softmax(logits, dim=-1)
-        entropy = -(probs * log_probs).sum(dim=-1)  # [B*N]
+        entropy = -(probs * log_probs).sum(dim=-1)
         ent_loss = (entropy * mask).sum() / mask.sum().clamp(min=1)
         loss = loss - entropy_alpha * ent_loss
     return loss
@@ -55,6 +56,9 @@ def _pad_batch(sequences, batch_size):
         p_time = torch.zeros(B, max_len, 3, dtype=torch.long)
         p_pos = torch.zeros(B, max_len, dtype=torch.long)
         p_mask = torch.zeros(B, max_len, max_len, dtype=torch.bool)
+        # v2: va_values [B, max_len, 2]
+        has_va = "va_values" in group[0]
+        p_va = torch.zeros(B, max_len, 2, dtype=torch.float32) if has_va else None
 
         for j, s in enumerate(group):
             L = s["input_ids"].shape[0]
@@ -63,16 +67,22 @@ def _pad_batch(sequences, batch_size):
             p_tgt[j, :Lt] = s["targets"]
             p_time[j, :L] = s["time_ids"]
             p_pos[j, :L] = s["position_ids"]
-            # Segment-isolated causal mask: BOS visible to all,
-            # each stock attends only within its own segment + BOS
+            if has_va:
+                p_va[j, :L] = s["va_values"]
+            # Causal mask: BOS visible to all, causal within each segment
             mask = torch.zeros(L, L, dtype=torch.bool)
             mask[:, 0] = True
             for start, end in s.get("boundaries", [(1, L)]):
                 for pos in range(start, min(end, L)):
                     mask[pos, start:pos + 1] = True
             p_mask[j, :L, :L] = mask
+            # Padded positions must attend to BOS to avoid NaN in SDPA
+            p_mask[j, L:, 0] = True
 
-        batches.append((p_ids, p_tgt, p_time, p_pos, p_mask))
+        if has_va:
+            batches.append((p_ids, p_tgt, p_time, p_pos, p_mask, p_va))
+        else:
+            batches.append((p_ids, p_tgt, p_time, p_pos, p_mask))
     return batches
 
 
@@ -145,9 +155,9 @@ def main(args=None):
 
     cache_tag = os.path.basename(tok_path).replace(".pt", "")
     cache_dir = os.path.join(TrainingConfig.save_dir, f"token_cache_{cache_tag}")
-    print(f"Encoding (cache: {cache_dir}) ...")
-    train_seqs = pack_stocks(train_s, tokenizer, mode="train", cache_dir=cache_dir)
-    val_seqs = pack_stocks(val_s, tokenizer, mode="train", cache_dir=cache_dir)
+    print(f"Encoding v2 (cache: {cache_dir}) ...")
+    train_seqs = pack_stocks_v2(train_s, tokenizer, mode="train", cache_dir=cache_dir)
+    val_seqs = pack_stocks_v2(val_s, tokenizer, mode="train", cache_dir=cache_dir)
     print(f"Train seqs: {len(train_seqs)}, Val seqs: {len(val_seqs)}")
 
     bs = TrainingConfig.batch_size
@@ -156,8 +166,8 @@ def main(args=None):
         val_loader = BatchedDataLoader(val_seqs, bs, shuffle=False)
         print(f"Loader: batched, bs={bs}, accum={TrainingConfig.accumulation_steps}")
     else:
-        train_loader = make_dataloader(train_seqs, batch_size=1, shuffle=True)
-        val_loader = make_dataloader(val_seqs, batch_size=1, shuffle=False)
+        train_loader = make_dataloader_v2(train_seqs, batch_size=1, shuffle=True)
+        val_loader = make_dataloader_v2(val_seqs, batch_size=1, shuffle=False)
         print(f"Loader: single-seq, accum={TrainingConfig.accumulation_steps}")
 
     # Model
@@ -237,20 +247,24 @@ def main(args=None):
         optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(train_loader, desc=f"[{tag}] Epoch {epoch+1}/{epochs}")
-        for bi, (inp, tgt, tid, pos, mask) in enumerate(pbar):
+        for bi, batch in enumerate(pbar):
+            # v2 dataloader returns 6-tuple: (inp, tgt, tid, pos, mask, va_values)
+            inp, tgt, tid, pos, mask, va = batch
             inp = inp.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
             tid = tid.to(device, non_blocking=True)
             pos = pos.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
+            va = va.to(device, non_blocking=True)
 
             # Ensure batch dimension (make_dataloader bs=1 strips it)
             if inp.dim() == 1:
                 inp, tgt, tid, pos = inp.unsqueeze(0), tgt.unsqueeze(0), tid.unsqueeze(0), pos.unsqueeze(0)
                 mask = mask.unsqueeze(0)
+                va = va.unsqueeze(0)
 
             with torch.amp.autocast("cuda", dtype=amp_dtype):
-                logits_coarse, _, _ = model(inp, tid, pos, mask)
+                logits_coarse, _, _ = model(inp, tid, pos, mask, va_values=va)
                 shift_logits = logits_coarse[:, :-1, :].contiguous()
                 shift_targets = tgt.contiguous()
                 if (shift_targets == -100).all():
@@ -289,14 +303,17 @@ def main(args=None):
         model.eval()
         vlosses = []
         with torch.inference_mode():
-            for inp, tgt, tid, pos, mask in val_loader:
+            for batch in val_loader:
+                inp, tgt, tid, pos, mask, va = batch
                 inp = inp.to(device); tgt = tgt.to(device)
                 tid = tid.to(device); pos = pos.to(device); mask = mask.to(device)
+                va = va.to(device)
                 if inp.dim() == 1:
                     inp, tgt, tid, pos = inp.unsqueeze(0), tgt.unsqueeze(0), tid.unsqueeze(0), pos.unsqueeze(0)
                     mask = mask.unsqueeze(0)
+                    va = va.unsqueeze(0)
                 with torch.amp.autocast("cuda", dtype=amp_dtype):
-                    logits_coarse, _, _ = model(inp, tid, pos, mask)
+                    logits_coarse, _, _ = model(inp, tid, pos, mask, va_values=va)
                     shift_logits = logits_coarse[:, :-1, :].contiguous()
                     shift_targets = tgt.contiguous()
                     if (shift_targets != -100).any():
@@ -388,7 +405,7 @@ Examples:
   python train_base.py --loss focal --gamma 6.0 --reasoning
         """)
     parser.add_argument("--save_path", type=str, default=TrainingConfig.base_model_path)
-    parser.add_argument("--tokenizer_path", type=str, default=TrainingConfig.tokenizer_path)
+    parser.add_argument("--tokenizer_path", type=str, default="checkpoints/tokenizer_v2_ohlc.pt")
     parser.add_argument("--epochs", type=int, default=TrainingConfig.epochs)
     parser.add_argument("--tag", type=str, default="default")
     parser.add_argument("--loss", type=str, default="focal", choices=["ce", "focal"])

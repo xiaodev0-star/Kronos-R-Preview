@@ -1,4 +1,8 @@
-"""数据处理：CSV 加载、滚动归一化、多股票打包。"""
+"""数据处理：CSV 加载、归一化、股票打包。
+
+v1 (legacy): rolling_normalize + 多股票打包 (6D OHLCVA)
+v2 (current): historical_normalize + 单股票独立文档 (4D OHLC token + 2D VA continuous)
+"""
 from glob import glob
 import os
 
@@ -10,8 +14,15 @@ from tqdm import tqdm
 
 from config import DataConfig, NormConfig
 
+# --- v1 globals (backward compat) ---
 lookback_window = NormConfig.lookback_window
 min_lookback = NormConfig.min_lookback
+
+# --- v2 globals ---
+_price_cols = NormConfig.price_features   # ["log_ret", "log_high", "log_low", "log_open"]
+_va_cols = NormConfig.va_features         # ["log_vol", "log_amt"]
+_n_price = len(_price_cols)               # 4
+_n_va = len(_va_cols)                     # 2
 
 
 def rolling_normalize(features, window=lookback_window, min_lookback=min_lookback):
@@ -43,6 +54,52 @@ def rolling_normalize(features, window=lookback_window, min_lookback=min_lookbac
         0.0,
     )
     return normed.astype(np.float32)
+
+
+# ============================================================================
+# v2: Per-stock document-level normalization
+# ============================================================================
+
+def document_normalize(features_raw, cutoff_idx=None):
+    """Per-stock historical Z-Score normalization.
+
+    Statistics (mean/std) are computed from the stock's train-period data only
+    (features_raw[:cutoff_idx]), then applied to the full sequence.  Each position
+    sees the same normalization — no rolling window, no future data.
+
+    Price features (OHLC): Z-Score using train-period stats.
+    Volume/Amount: first-day baseline then Z-Score.
+
+    Args:
+        features_raw: [T, 6] raw features (log_ret, log_high, log_low, log_open, log_vol, log_amt)
+        cutoff_idx: if provided, stats are computed ONLY from features_raw[:cutoff_idx]
+                    (train data).  If None, stats come from the whole array (tokenizer training).
+    Returns:
+        price_normed: [T, 4] Z-Score normalized OHLC features
+        va_normed:    [T, 2] Z-Score normalized Volume/Amount (first-day baseline)
+    """
+    # Split into price (OHLC) and VA
+    price = features_raw[:, :_n_price]   # [T, 4]
+    va = features_raw[:, _n_price:]      # [T, 2] (log_vol, log_amt)
+
+    # --- Price: historical Z-Score ---
+    stats_slice = price[:cutoff_idx] if cutoff_idx else price
+    p_mean = stats_slice.mean(axis=0)
+    p_std = stats_slice.std(axis=0)
+    p_std = np.maximum(p_std, 1e-8)
+    price_normed = (price - p_mean) / p_std
+
+    # --- VA: first-day baseline + Z-Score ---
+    va_base = va[0:1, :]               # [1, 2] first day's (log_vol, log_amt)
+    va_rel = va - va_base               # log-ratio relative to day 0
+
+    stats_slice_va = va_rel[:cutoff_idx] if cutoff_idx else va_rel
+    va_mean = stats_slice_va.mean(axis=0)
+    va_std = stats_slice_va.std(axis=0)
+    va_std = np.maximum(va_std, 1e-8)
+    va_normed = (va_rel - va_mean) / va_std
+
+    return price_normed.astype(np.float32), va_normed.astype(np.float32)
 
 
 def _stock_cutoff_idx(stock, cutoff_date):
@@ -137,6 +194,23 @@ def get_tokenizer_features(stocks, window=lookback_window, cutoff_date=None):
         if len(feat) < min_lookback + 5:
             continue
         parts.append(rolling_normalize(feat, window))
+    return np.concatenate(parts, axis=0)
+
+
+def get_tokenizer_features_v2(stocks, cutoff_date=None):
+    """v2: Per-stock historical normalize (4D OHLC only). Returns [N_total, 4]."""
+    parts = []
+    for s in tqdm(stocks, desc="Document normalize (4D)"):
+        feat = s["features_raw"]
+        if cutoff_date is not None:
+            ci = _stock_cutoff_idx(s, cutoff_date)
+            feat = feat[:ci]
+        if len(feat) < NormConfig.min_doc_length:
+            continue
+        price_normed, _ = document_normalize(feat)
+        parts.append(price_normed)
+    if not parts:
+        return np.zeros((0, _n_price), dtype=np.float32)
     return np.concatenate(parts, axis=0)
 
 
@@ -342,6 +416,151 @@ def make_dataloader(sequences, batch_size=1, shuffle=True):
         return batch[0]
     return DataLoader(
         PackedDataset(sequences),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate,
+        pin_memory=True,
+    )
+
+
+# ============================================================================
+# v2: Single-stock document packing (OHLC token + VA continuous)
+# ============================================================================
+
+def _build_causal_mask(S, device="cpu"):
+    """Simple causal mask for a single-stock sequence.
+
+    Returns [S, S] bool: True = attend, False = block.
+    Position 0 (BOS) is visible to all; causal within [1..S).
+    """
+    mask = torch.zeros(S, S, dtype=torch.bool, device=device)
+    mask[:, 0] = True  # BOS visible to all
+    for pos in range(1, S):
+        mask[pos, 1:pos + 1] = True
+    return mask
+
+
+def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutoff_date,
+                   context_len=DataConfig.context_len, cache_dir=None):
+    """v2: One stock per sequence.  Returns list[dict] with va_values.
+
+    Each dict:
+      input_ids:   [S] long   (BOS + tokens + EOS)
+      targets:     [S-1] long (shifted input_ids)
+      time_ids:    [S, 3] long (day, month, year)
+      position_ids:[S] long
+      va_values:   [S, 2] float32 (vol_normed, amt_normed; BOS/EOS = 0)
+    """
+    vocab = tokenizer.bsq_coarse.vocab_size
+    bos_id, eos_id = vocab, vocab + 1
+    device = next(tokenizer.parameters()).device
+    tok_hash = _tokenizer_hash(tokenizer) if cache_dir else None
+
+    # Phase 1: tokenize each stock with historical_normalize
+    encoded = []
+    for s in tqdm(stocks, desc="Encoding v2 (" + mode + ")"):
+        feat = s["features_raw"]
+        day, month, year = s["day"], s["month"], s["year"]
+        ci = _stock_cutoff_idx(s, cutoff_date) if mode == "train" else len(feat)
+        if ci < NormConfig.min_doc_length:
+            continue
+
+        price_normed, va_normed = document_normalize(feat[:ci], cutoff_idx=ci if mode == "train" else None)
+
+        # Token cache
+        if cache_dir:
+            cache_path = _token_cache_path(s["symbol"] + "_v2", cache_dir)
+            if os.path.exists(cache_path):
+                data = np.load(cache_path, allow_pickle=True)
+                cached_hash = str(data["_tok_hash"]) if "_tok_hash" in data else None
+                if tok_hash and cached_hash != tok_hash:
+                    os.remove(cache_path)
+                else:
+                    enc = {
+                        "token_ids": data["token_ids"],
+                        "day": data["day"], "month": data["month"], "year": data["year"],
+                        "va_values": data["va_values"],
+                    }
+                    if len(enc["token_ids"]) >= NormConfig.min_doc_length:
+                        encoded.append(enc)
+                    continue
+
+        with torch.no_grad():
+            token_ids, _ = tokenizer.encode(
+                torch.from_numpy(price_normed).float().unsqueeze(0).to(device))
+        token_ids = token_ids[0].cpu().numpy()
+
+        enc = {
+            "token_ids": token_ids,
+            "day": day[:ci], "month": month[:ci], "year": year[:ci],
+            "va_values": va_normed,
+        }
+
+        if cache_dir:
+            np.savez_compressed(
+                _token_cache_path(s["symbol"] + "_v2", cache_dir),
+                token_ids=token_ids, day=day[:ci], month=month[:ci], year=year[:ci],
+                va_values=va_normed, _tok_hash=tok_hash or "",
+            )
+
+        if len(token_ids) < NormConfig.min_doc_length:
+            continue
+        encoded.append(enc)
+
+    # Phase 2: pack each stock as one sequence
+    zero_va = np.zeros((_n_va,), dtype=np.float32)
+    sequences = []
+    for enc in encoded:
+        ids_list = enc["token_ids"].tolist()
+        va_list = enc["va_values"].tolist()
+        d_list, m_list, y_list = enc["day"].tolist(), enc["month"].tolist(), enc["year"].tolist()
+
+        ids = torch.tensor([bos_id] + ids_list + [eos_id], dtype=torch.long)
+        d = torch.tensor([d_list[0]] + d_list + [d_list[-1]], dtype=torch.long)
+        m = torch.tensor([m_list[0]] + m_list + [m_list[-1]], dtype=torch.long)
+        y = torch.tensor([y_list[0]] + y_list + [y_list[-1]], dtype=torch.long)
+        va = torch.tensor(
+            [zero_va.tolist()] + va_list + [zero_va.tolist()], dtype=torch.float32)
+
+        sequences.append({
+            "input_ids": ids,
+            "targets": ids[1:].clone(),
+            "time_ids": torch.stack([d, m, y], dim=-1),
+            "position_ids": torch.arange(len(ids), dtype=torch.long),
+            "va_values": va,
+        })
+
+    return sequences
+
+
+class PackedDatasetV2(Dataset):
+    """v2 Dataset: returns (input_ids, targets, time_ids, position_ids, mask, va_values)."""
+
+    def __init__(self, sequences):
+        self.sequences = sequences
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        seq = self.sequences[idx]
+        S = seq["input_ids"].shape[0]
+        mask = _build_causal_mask(S)
+        return (
+            seq["input_ids"],
+            seq["targets"],
+            seq["time_ids"],
+            seq["position_ids"],
+            mask,
+            seq["va_values"],
+        )
+
+
+def make_dataloader_v2(sequences, batch_size=1, shuffle=True):
+    def collate(batch):
+        return batch[0]
+    return DataLoader(
+        PackedDatasetV2(sequences),
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate,

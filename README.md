@@ -4,52 +4,36 @@
 
 ## 核心结果
 
-### HPO 最优模型 (57 实验, ~31.5h)
+1200 支测试股票，全量 pre-cutoff 历史作为 context 的 AR 评估：
 
-| 指标 | 最佳模型 | 数值 |
-|------|---------|:----:|
-| 1-Step MAPE | w2_focal_g6_ls005 | **3.99%** |
-| 1-Step AmpRatio | w2_focal_g6_ls005 | **1.572x** |
-| 10-Step AR MAPE | w2_focal_g8 | **8.48%** |
-| 累积方向 (CumDA) | w2_focal_g10 | **52.7%** |
+| Day | MAPE | DA | AmpRatio |
+|:---:|:----:|:--:|:--------:|
+| 1 | 5.05% | **74.33%** | 1.543x |
+| 10 | 9.88% | 52.33% | 0.572x |
 
-### 与 Baseline 对比 (299-300 只测试股票)
-
-使用全部 pre-cutoff 历史数据作为 context 的正确评估协议：
-
-| Model | 1-Step MAPE | 10-Step MAPE | 方向准确率 |
-|-------|:-----------:|:------------:|:---------:|
-| **Kronos w2_focal_g6_ls005** | **1.61%** | 8.97% | 47.5% |
-| **Kronos w2_focal_g8** | **1.63%** | 8.95% | — |
-| NaiveDrift | 2.20% | 7.13% | 50.4% (随机) |
-| XGBoost (AR) | 2.30% | 7.24% | — |
-| ARIMA(1,0,0) | 2.47% | 7.39% | — |
-| EWMA(0.94) | 2.98% | 14.19% | — |
-
-**关键发现**：
-- Kronos 1-step MAPE **优于所有 baseline 27%+**（1.61% vs 2.20%）
-- Baseline 的长程累积 MAPE 优势来自"预测不变"（DA=50%，无信息量），并非真正的预测能力
-- Baseline 的累积 MAPE 呈振荡而非单调增长——这是常数预测碰巧接近真实价格的统计现象
+**方向准确率 74.33%** 远超随机水平 (50%)，Volume/Amount 连续 embedding 贡献了关键方向信号。
 
 ## 快速开始
 
 ```bash
-# 1. 训练 Tokenizer
+# 1. 训练 Tokenizer (4D OHLC)
 python train_tokenizer.py
 
-# 2. 训练 Focal 模型 (推荐)
+# 2. 训练模型
 python train_base.py --loss focal --gamma 6.0 --label_smoothing 0.05
 
-# 3. 运行模型对比 (含 Baseline)
-cd TEMP && python run_model_comparison.py
+# 3. 评估
+python TEMP/eval_v2.py --n_stocks 30 --max_steps 10
 ```
 
 ## 模型架构
 
 - **2.7M 参数**: dim=256, depth=2, heads=4, GQA (kv_heads=1)
-- **BSQ Tokenizer**: 2-level hierarchical, coarse(10-bit) + fine(10-bit) → vocab=1024
+- **BSQ Tokenizer**: 2-level hierarchical, 输入 4D OHLC → vocab=1024
+- **VA Embedding**: Volume/Amount 连续 MLP 注入 (`Linear(2,64)→GELU→Linear(64,256)`)
 - **可选模块**: CausalReasoningBlock (cross-attention to memory tokens)
 - **Loss**: CE / Focal (γ=3-10) / +Label Smoothing / +Entropy Reg
+- **归一化**: 价格 historical Z-Score (per-stock train-history); VA 首日基线 + Z-Score。统计量仅来自 train 数据，causal mask 保证训推一致。
 
 ## 关键超参 (CLI)
 
@@ -67,26 +51,21 @@ cd TEMP && python run_model_comparison.py
 |------|------|
 | `main.md` | 项目设计文档 |
 | `CODE_WIKI.md` | 代码架构文档 |
-| `REPORT_HPO.md` | 完整实验技术报告 (57实验, 31.5h) |
-| `REPORT_SUM.md` | 配置命名说明 + 全部结果汇总 (速查表) |
+| `TEMP/README.md` | 历史实验记录 + 结果汇总 |
 
 ## 项目结构
 
 ```
 Kronos-R-Preview/
-├── train_base.py           # 训练脚本 (CLI完整)
-├── train_tokenizer.py      # Tokenizer训练脚本
 ├── config.py               # 全局配置
-├── data_processor.py       # 数据管道
-├── reproducibility.py      # 随机种子
+├── data_processor.py       # 数据管道 (归一化 + 打包)
+├── train_tokenizer.py      # Stage A: Tokenizer 训练
+├── train_base.py           # Stage B: Transformer 训练
 ├── model/
-│   ├── kronos_preview.py   # KronosPreview + CausalReasoningBlock
-│   ├── tokenizer.py        # BSQ Hierarchical Tokenizer
+│   ├── kronos_preview.py   # 模型定义 + VA embedding
+│   ├── tokenizer.py        # BSQ Tokenizer
 │   └── tokenizer_config.py
-├── checkpoints/
-│   └── hpo_v3/             # 最优模型权重
-├── dataset/                # CSV数据
-└── TEMP/                   # 实验归档
-    ├── run_model_comparison.py  # 统一对比脚本 (含缓存)
-    └── comparison_cache/        # 逐股结果缓存
+├── checkpoints/            # 模型权重
+├── dataset/                # CSV 数据
+└── TEMP/                   # 历史实验归档 + 评估脚本
 ```

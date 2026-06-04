@@ -112,6 +112,12 @@ class KronosPreview(nn.Module):
         self.time_emb_day = nn.Embedding(32, cfg.dim)
         self.time_emb_month = nn.Embedding(13, cfg.dim)
         self.time_emb_year = nn.Embedding(100, cfg.dim)
+        # v2: Volume/Amount continuous embedding
+        self.va_proj = nn.Sequential(
+            nn.Linear(2, cfg.va_hidden_dim, bias=True),
+            nn.GELU(),
+            nn.Linear(cfg.va_hidden_dim, cfg.dim, bias=True),
+        )
 
         self.blocks = nn.ModuleList([
             TransformerBlock(cfg.dim, cfg.heads, cfg.num_kv_heads,
@@ -127,7 +133,8 @@ class KronosPreview(nn.Module):
     def enable_gradient_checkpointing(self):
         self._gradient_checkpointing = True
 
-    def forward(self, input_ids, time_ids, position_ids, attn_mask=None, targets=None):
+    def forward(self, input_ids, time_ids, position_ids, attn_mask=None, targets=None,
+                va_values=None):
         # Normalize: ensure [B, N] format
         no_batch = input_ids.dim() == 1
         if no_batch:
@@ -138,11 +145,19 @@ class KronosPreview(nn.Module):
                 attn_mask = attn_mask.unsqueeze(0)
             if targets is not None:
                 targets = targets.unsqueeze(0)
+            if va_values is not None:
+                va_values = va_values.unsqueeze(0)
+
+        # SDPA requires 4D mask [B, 1, N, N] when B > 1
+        if attn_mask is not None and attn_mask.dim() == 3:
+            attn_mask = attn_mask.unsqueeze(1)
 
         x = self.token_emb(input_ids)
         x = x + self.time_emb_day(time_ids[..., 0])
         x = x + self.time_emb_month(time_ids[..., 1])
         x = x + self.time_emb_year(time_ids[..., 2])
+        if va_values is not None:
+            x = x + self.va_proj(va_values)
 
         sin, cos = self.rotary(position_ids)
 
@@ -205,6 +220,12 @@ class KronosPreviewWithReasoning(nn.Module):
         self.time_emb_day = nn.Embedding(32, cfg.dim)
         self.time_emb_month = nn.Embedding(13, cfg.dim)
         self.time_emb_year = nn.Embedding(100, cfg.dim)
+        # v2: Volume/Amount continuous embedding
+        self.va_proj = nn.Sequential(
+            nn.Linear(2, cfg.va_hidden_dim, bias=True),
+            nn.GELU(),
+            nn.Linear(cfg.va_hidden_dim, cfg.dim, bias=True),
+        )
         self.blocks = nn.ModuleList([
             TransformerBlock(cfg.dim, cfg.heads, cfg.num_kv_heads,
                              cfg.ffn_multiplier, cfg.dropout)
@@ -225,7 +246,8 @@ class KronosPreviewWithReasoning(nn.Module):
     def enable_gradient_checkpointing(self):
         self._gradient_checkpointing = True
 
-    def forward(self, input_ids, time_ids, position_ids, attn_mask=None, targets=None):
+    def forward(self, input_ids, time_ids, position_ids, attn_mask=None, targets=None,
+                va_values=None):
         no_batch = input_ids.dim() == 1
         if no_batch:
             input_ids = input_ids.unsqueeze(0)
@@ -235,11 +257,19 @@ class KronosPreviewWithReasoning(nn.Module):
                 attn_mask = attn_mask.unsqueeze(0)
             if targets is not None:
                 targets = targets.unsqueeze(0)
+            if va_values is not None:
+                va_values = va_values.unsqueeze(0)
+
+        # SDPA requires 4D mask [B, 1, N, N] when B > 1
+        if attn_mask is not None and attn_mask.dim() == 3:
+            attn_mask = attn_mask.unsqueeze(1)
 
         x = self.token_emb(input_ids)
         x = x + self.time_emb_day(time_ids[..., 0])
         x = x + self.time_emb_month(time_ids[..., 1])
         x = x + self.time_emb_year(time_ids[..., 2])
+        if va_values is not None:
+            x = x + self.va_proj(va_values)
         sin, cos = self.rotary(position_ids)
 
         for block in self.blocks:
