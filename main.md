@@ -181,6 +181,7 @@ Kronos-R-Preview/
 ├── README.md                      # 快速入门
 ├── main.md                        # 本文件
 ├── CODE_WIKI.md                   # 代码文档
+├── IMPROVE.md                     # 改进路线图 (选择性预测 + RL弃权策略)
 ├── config.py                      # 全局配置
 ├── reproducibility.py             # 随机种子
 ├── data_processor.py              # 数据管道 (document_normalize + pack_stocks_v2)

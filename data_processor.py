@@ -83,7 +83,7 @@ def document_normalize(features_raw, cutoff_idx=None):
     va = features_raw[:, _n_price:]      # [T, 2] (log_vol, log_amt)
 
     # --- Price: historical Z-Score ---
-    stats_slice = price[:cutoff_idx] if cutoff_idx else price
+    stats_slice = price[:cutoff_idx] if cutoff_idx is not None else price
     p_mean = stats_slice.mean(axis=0)
     p_std = stats_slice.std(axis=0)
     p_std = np.maximum(p_std, 1e-8)
@@ -93,7 +93,7 @@ def document_normalize(features_raw, cutoff_idx=None):
     va_base = va[0:1, :]               # [1, 2] first day's (log_vol, log_amt)
     va_rel = va - va_base               # log-ratio relative to day 0
 
-    stats_slice_va = va_rel[:cutoff_idx] if cutoff_idx else va_rel
+    stats_slice_va = va_rel[:cutoff_idx] if cutoff_idx is not None else va_rel
     va_mean = stats_slice_va.mean(axis=0)
     va_std = stats_slice_va.std(axis=0)
     va_std = np.maximum(va_std, 1e-8)
@@ -433,10 +433,8 @@ def _build_causal_mask(S, device="cpu"):
     Returns [S, S] bool: True = attend, False = block.
     Position 0 (BOS) is visible to all; causal within [1..S).
     """
-    mask = torch.zeros(S, S, dtype=torch.bool, device=device)
+    mask = torch.ones(S, S, dtype=torch.bool, device=device).tril()
     mask[:, 0] = True  # BOS visible to all
-    for pos in range(1, S):
-        mask[pos, 1:pos + 1] = True
     return mask
 
 
@@ -466,6 +464,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
             continue
 
         price_normed, va_normed = document_normalize(feat[:ci], cutoff_idx=ci if mode == "train" else None)
+        reg_target = price_normed[:, 0].copy()  # [T] normalized log_ret for regression target
 
         # Token cache
         if cache_dir:
@@ -480,6 +479,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
                         "token_ids": data["token_ids"],
                         "day": data["day"], "month": data["month"], "year": data["year"],
                         "va_values": data["va_values"],
+                        "reg_target": data["reg_target"],
                     }
                     if len(enc["token_ids"]) >= NormConfig.min_doc_length:
                         encoded.append(enc)
@@ -494,13 +494,14 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
             "token_ids": token_ids,
             "day": day[:ci], "month": month[:ci], "year": year[:ci],
             "va_values": va_normed,
+            "reg_target": reg_target,
         }
 
         if cache_dir:
             np.savez_compressed(
                 _token_cache_path(s["symbol"] + "_v2", cache_dir),
                 token_ids=token_ids, day=day[:ci], month=month[:ci], year=year[:ci],
-                va_values=va_normed, _tok_hash=tok_hash or "",
+                va_values=va_normed, reg_target=reg_target, _tok_hash=tok_hash or "",
             )
 
         if len(token_ids) < NormConfig.min_doc_length:
@@ -513,6 +514,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
     for enc in encoded:
         ids_list = enc["token_ids"].tolist()
         va_list = enc["va_values"].tolist()
+        rt_list = enc["reg_target"].tolist()
         d_list, m_list, y_list = enc["day"].tolist(), enc["month"].tolist(), enc["year"].tolist()
 
         ids = torch.tensor([bos_id] + ids_list + [eos_id], dtype=torch.long)
@@ -521,6 +523,8 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
         y = torch.tensor([y_list[0]] + y_list + [y_list[-1]], dtype=torch.long)
         va = torch.tensor(
             [zero_va.tolist()] + va_list + [zero_va.tolist()], dtype=torch.float32)
+        # Regression targets: log_ret aligned with input_ids; BOS/EOS = -999 sentinel
+        reg_targets = torch.tensor([-999.0] + rt_list + [-999.0], dtype=torch.float32)
 
         sequences.append({
             "input_ids": ids,
@@ -528,6 +532,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
             "time_ids": torch.stack([d, m, y], dim=-1),
             "position_ids": torch.arange(len(ids), dtype=torch.long),
             "va_values": va,
+            "reg_targets": reg_targets,
         })
 
     return sequences
@@ -546,6 +551,16 @@ class PackedDatasetV2(Dataset):
         seq = self.sequences[idx]
         S = seq["input_ids"].shape[0]
         mask = _build_causal_mask(S)
+        if "reg_targets" in seq:
+            return (
+                seq["input_ids"],
+                seq["targets"],
+                seq["time_ids"],
+                seq["position_ids"],
+                mask,
+                seq["va_values"],
+                seq["reg_targets"],
+            )
         return (
             seq["input_ids"],
             seq["targets"],

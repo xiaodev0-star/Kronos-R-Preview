@@ -59,6 +59,9 @@ def _pad_batch(sequences, batch_size):
         # v2: va_values [B, max_len, 2]
         has_va = "va_values" in group[0]
         p_va = torch.zeros(B, max_len, 2, dtype=torch.float32) if has_va else None
+        # v2: regression targets [B, max_len] (heteroscedastic head)
+        has_rt = "reg_targets" in group[0]
+        p_rt = torch.full((B, max_len), -999.0, dtype=torch.float32) if has_rt else None
 
         for j, s in enumerate(group):
             L = s["input_ids"].shape[0]
@@ -69,6 +72,8 @@ def _pad_batch(sequences, batch_size):
             p_pos[j, :L] = s["position_ids"]
             if has_va:
                 p_va[j, :L] = s["va_values"]
+            if has_rt:
+                p_rt[j, :L] = s["reg_targets"]
             # Causal mask: BOS visible to all, causal within each segment
             mask = torch.zeros(L, L, dtype=torch.bool)
             mask[:, 0] = True
@@ -79,7 +84,9 @@ def _pad_batch(sequences, batch_size):
             # Padded positions must attend to BOS to avoid NaN in SDPA
             p_mask[j, L:, 0] = True
 
-        if has_va:
+        if has_va and has_rt:
+            batches.append((p_ids, p_tgt, p_time, p_pos, p_mask, p_va, p_rt))
+        elif has_va:
             batches.append((p_ids, p_tgt, p_time, p_pos, p_mask, p_va))
         else:
             batches.append((p_ids, p_tgt, p_time, p_pos, p_mask))
@@ -127,6 +134,9 @@ def main(args=None):
     label_smoothing = args.label_smoothing if args else 0.0
     entropy_alpha = args.entropy_alpha if args else 0.0
     dropout_override = args.dropout if args else None
+    use_heteroscedastic = args.heteroscedastic if args else False
+    het_weight = args.het_weight if args else 0.1
+    history_per_epoch = args.history_per_epoch if args else False
 
     # Apply dropout override before model construction
     if dropout_override is not None:
@@ -145,6 +155,8 @@ def main(args=None):
         print(f"  reasoning=True, frozen={reasoning_frozen}")
         if base_ckpt_path:
             print(f"  base_checkpoint={base_ckpt_path}")
+    if use_heteroscedastic:
+        print(f"  heteroscedastic=True, het_weight={het_weight}")
 
     tokenizer = load_tokenizer(tok_path, device)
     print("Tokenizer loaded.")
@@ -154,7 +166,8 @@ def main(args=None):
     print(f"Train: {len(train_s)}, Val: {len(val_s)}")
 
     cache_tag = os.path.basename(tok_path).replace(".pt", "")
-    cache_dir = os.path.join(TrainingConfig.save_dir, f"token_cache_{cache_tag}")
+    cache_suffix = "_het" if use_heteroscedastic else ""
+    cache_dir = os.path.join(TrainingConfig.save_dir, f"token_cache_{cache_tag}{cache_suffix}")
     print(f"Encoding v2 (cache: {cache_dir}) ...")
     train_seqs = pack_stocks_v2(train_s, tokenizer, mode="train", cache_dir=cache_dir)
     val_seqs = pack_stocks_v2(val_s, tokenizer, mode="train", cache_dir=cache_dir)
@@ -226,19 +239,15 @@ def main(args=None):
             start_epoch = ckpt["epoch"] + 1
             best_val = ckpt.get("best_val", float("inf"))
             global_step = ckpt.get("global_step", 0)
-            for _ in range(global_step):
-                scheduler.step()
             print(f"  Resumed from epoch {start_epoch}, best_val={best_val:.4f}, step={global_step}")
         except (RuntimeError, KeyError) as e:
             print(f"  Cannot resume from checkpoint (incompatible): {e}")
             print(f"  Starting fresh training.")
-            # Clean up incompatible checkpoint files
+            # Only delete resume checkpoint; preserve best model
             os.remove(ckpt_path)
-            if os.path.exists(save_path):
-                os.remove(save_path)
 
     os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
-    history = {"train_loss": [], "val_loss": [], "lr": []}
+    history = {"train_loss": [], "val_loss": [], "val_het_loss": [], "lr": []}
     t0 = time.time()
 
     for epoch in range(start_epoch, epochs):
@@ -248,23 +257,36 @@ def main(args=None):
 
         pbar = tqdm(train_loader, desc=f"[{tag}] Epoch {epoch+1}/{epochs}")
         for bi, batch in enumerate(pbar):
-            # v2 dataloader returns 6-tuple: (inp, tgt, tid, pos, mask, va_values)
-            inp, tgt, tid, pos, mask, va = batch
+            # v2 dataloader returns 6-tuple or 7-tuple (with reg_targets)
+            reg_tgt = None
+            if len(batch) == 7:
+                inp, tgt, tid, pos, mask, va, reg_tgt = batch
+            else:
+                inp, tgt, tid, pos, mask, va = batch
             inp = inp.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
             tid = tid.to(device, non_blocking=True)
             pos = pos.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
             va = va.to(device, non_blocking=True)
+            if reg_tgt is not None:
+                reg_tgt = reg_tgt.to(device, non_blocking=True)
 
             # Ensure batch dimension (make_dataloader bs=1 strips it)
             if inp.dim() == 1:
                 inp, tgt, tid, pos = inp.unsqueeze(0), tgt.unsqueeze(0), tid.unsqueeze(0), pos.unsqueeze(0)
                 mask = mask.unsqueeze(0)
                 va = va.unsqueeze(0)
+                if reg_tgt is not None:
+                    reg_tgt = reg_tgt.unsqueeze(0)
 
             with torch.amp.autocast("cuda", dtype=amp_dtype):
-                logits_coarse, _, _ = model(inp, tid, pos, mask, va_values=va)
+                if use_heteroscedastic and reg_tgt is not None:
+                    logits_coarse, _, _, _, het_loss = model(
+                        inp, tid, pos, mask, va_values=va, reg_targets=reg_tgt)
+                else:
+                    logits_coarse, _, _ = model(inp, tid, pos, mask, va_values=va)
+                    het_loss = None
                 shift_logits = logits_coarse[:, :-1, :].contiguous()
                 shift_targets = tgt.contiguous()
                 if (shift_targets == -100).all():
@@ -278,6 +300,9 @@ def main(args=None):
                     loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
                                            shift_targets.view(-1), ignore_index=-100,
                                            label_smoothing=label_smoothing)
+                # Add heteroscedastic regression loss
+                if het_loss is not None and use_heteroscedastic:
+                    loss = loss + het_weight * het_loss
 
             if loss is None:
                 continue
@@ -302,18 +327,33 @@ def main(args=None):
         # Validation (always CE for comparable val_loss)
         model.eval()
         vlosses = []
+        v_het_losses = []
         with torch.inference_mode():
             for batch in val_loader:
-                inp, tgt, tid, pos, mask, va = batch
+                reg_tgt = None
+                if len(batch) == 7:
+                    inp, tgt, tid, pos, mask, va, reg_tgt = batch
+                else:
+                    inp, tgt, tid, pos, mask, va = batch
                 inp = inp.to(device); tgt = tgt.to(device)
                 tid = tid.to(device); pos = pos.to(device); mask = mask.to(device)
                 va = va.to(device)
+                if reg_tgt is not None:
+                    reg_tgt = reg_tgt.to(device)
                 if inp.dim() == 1:
                     inp, tgt, tid, pos = inp.unsqueeze(0), tgt.unsqueeze(0), tid.unsqueeze(0), pos.unsqueeze(0)
                     mask = mask.unsqueeze(0)
                     va = va.unsqueeze(0)
+                    if reg_tgt is not None:
+                        reg_tgt = reg_tgt.unsqueeze(0)
                 with torch.amp.autocast("cuda", dtype=amp_dtype):
-                    logits_coarse, _, _ = model(inp, tid, pos, mask, va_values=va)
+                    if use_heteroscedastic and reg_tgt is not None:
+                        logits_coarse, _, _, _, val_het = model(
+                            inp, tid, pos, mask, va_values=va, reg_targets=reg_tgt)
+                        if val_het is not None:
+                            v_het_losses.append(val_het.item())
+                    else:
+                        logits_coarse, _, _ = model(inp, tid, pos, mask, va_values=va)
                     shift_logits = logits_coarse[:, :-1, :].contiguous()
                     shift_targets = tgt.contiguous()
                     if (shift_targets != -100).any():
@@ -323,12 +363,20 @@ def main(args=None):
                         vlosses.append(vloss.item())
 
         avg_val = sum(vlosses) / max(len(vlosses), 1)
+        avg_val_het = sum(v_het_losses) / max(len(v_het_losses), 1) if v_het_losses else 0.0
         cur_lr = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - t0
 
         history["train_loss"].append(avg_train)
         history["val_loss"].append(avg_val)
+        history["val_het_loss"].append(avg_val_het)
         history["lr"].append(cur_lr)
+
+        # Write per-epoch history for Optuna pruning
+        if history_per_epoch:
+            hp_path = os.path.join(os.path.dirname(save_path) or ".", f"history_{tag}.json")
+            with open(hp_path, "w") as f:
+                json.dump(history, f, indent=2)
 
         tag_s = ""
         if avg_val < best_val:
@@ -349,6 +397,8 @@ def main(args=None):
                 "label_smoothing": label_smoothing,
                 "entropy_alpha": entropy_alpha,
                 "dropout": ModelConfig.dropout,
+                "heteroscedastic": use_heteroscedastic,
+                "het_weight": het_weight,
             }, save_path)
             tag_s = "  -> Saved best"
 
@@ -421,4 +471,10 @@ Examples:
                         help="Override ModelConfig.dropout (default: use config value 0.1)")
     parser.add_argument("--entropy_alpha", type=float, default=0.0,
                         help="Entropy regularization weight for focal loss (0.0 = disabled)")
+    parser.add_argument("--heteroscedastic", action="store_true",
+                        help="Enable heteroscedastic regression head (auxiliary NLL loss)")
+    parser.add_argument("--het_weight", type=float, default=0.1,
+                        help="Weight for heteroscedastic NLL loss (default: 0.1)")
+    parser.add_argument("--history_per_epoch", action="store_true",
+                        help="Write per-epoch val_loss to JSON (for Optuna pruning)")
     main(parser.parse_args())

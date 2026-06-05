@@ -1,9 +1,30 @@
-"""Kronos-Preview: SDPA + RMSNorm + SiLU-gated FFN + RoPE。"""
+"""Kronos-Preview: SDPA + RMSNorm + SiLU-gated FFN + RoPE + Heteroscedastic regression head."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from config import ModelConfig
+
+
+def heteroscedastic_nll_loss(pred, target, ignore_val=-999.0):
+    """Heteroscedastic Gaussian NLL loss for regression.
+
+    Args:
+        pred: [N, 2] tensor (mean, log_var)
+        target: [N] tensor of regression targets
+        ignore_val: sentinel for masked positions (BOS/EOS / padding)
+    Returns:
+        scalar loss, averaged over valid positions
+    """
+    mask = (target != ignore_val)
+    if mask.sum() == 0:
+        return torch.tensor(0.0, device=pred.device)
+    mean = pred[mask, 0]
+    log_var = pred[mask, 1]
+    tgt = target[mask]
+    # Gaussian NLL: 0.5 * (log_var + (target - mean)^2 / exp(log_var))
+    nll = 0.5 * (log_var + (tgt - mean).pow(2) / log_var.exp().clamp(min=1e-6))
+    return nll.mean()
 
 
 class RMSNorm(nn.Module):
@@ -126,7 +147,13 @@ class KronosPreview(nn.Module):
         ])
         self.norm = RMSNorm(cfg.dim)
         self.head_coarse = nn.Linear(cfg.dim, vocab_full, bias=True)
-        self.head_fine = nn.Linear(cfg.dim, vocab_full, bias=True)
+        self.head_fine = nn.Linear(cfg.dim, vocab_full, bias=True)  # Reserved: 2-level residual (unused in current training)
+        # Heteroscedastic regression head: MLP -> (mean, log_var)
+        self.head_reg = nn.Sequential(
+            nn.Linear(cfg.dim, cfg.dim, bias=True),
+            nn.SiLU(),
+            nn.Linear(cfg.dim, 2, bias=True),
+        )
         self.rotary = RotaryEmbedding(cfg.dim // cfg.heads, base=cfg.rope_base)
         self._gradient_checkpointing = False
 
@@ -134,7 +161,7 @@ class KronosPreview(nn.Module):
         self._gradient_checkpointing = True
 
     def forward(self, input_ids, time_ids, position_ids, attn_mask=None, targets=None,
-                va_values=None):
+                va_values=None, reg_targets=None):
         # Normalize: ensure [B, N] format
         no_batch = input_ids.dim() == 1
         if no_batch:
@@ -147,6 +174,8 @@ class KronosPreview(nn.Module):
                 targets = targets.unsqueeze(0)
             if va_values is not None:
                 va_values = va_values.unsqueeze(0)
+            if reg_targets is not None:
+                reg_targets = reg_targets.unsqueeze(0)
 
         # SDPA requires 4D mask [B, 1, N, N] when B > 1
         if attn_mask is not None and attn_mask.dim() == 3:
@@ -183,10 +212,26 @@ class KronosPreview(nn.Module):
                     ignore_index=-100,
                 )
 
+        # Heteroscedastic regression (float32 for numerical stability)
+        reg_pred = None
+        het_loss = None
+        if reg_targets is not None:
+            with torch.amp.autocast("cuda", enabled=False):
+                shift_hidden = x[:, :-1, :].float().contiguous()  # [B, S-1, dim]
+                reg_pred = self.head_reg(shift_hidden)              # [B, S-1, 2]
+                shift_reg_targets = reg_targets[:, 1:].float().contiguous()  # [B, S-1]
+                het_loss = heteroscedastic_nll_loss(
+                    reg_pred.reshape(-1, 2),
+                    shift_reg_targets.reshape(-1),
+                    ignore_val=-999.0,
+                )
+
         if no_batch:
             logits_coarse = logits_coarse.squeeze(0)
             logits_fine = logits_fine.squeeze(0)
 
+        if reg_targets is not None:
+            return logits_coarse, logits_fine, loss, reg_pred, het_loss
         return logits_coarse, logits_fine, loss
 
 
@@ -233,7 +278,13 @@ class KronosPreviewWithReasoning(nn.Module):
         ])
         self.norm = RMSNorm(cfg.dim)
         self.head_coarse = nn.Linear(cfg.dim, vocab_full, bias=True)
-        self.head_fine = nn.Linear(cfg.dim, vocab_full, bias=True)
+        self.head_fine = nn.Linear(cfg.dim, vocab_full, bias=True)  # Reserved: 2-level residual (unused in current training)
+        # Heteroscedastic regression head: MLP -> (mean, log_var)
+        self.head_reg = nn.Sequential(
+            nn.Linear(cfg.dim, cfg.dim, bias=True),
+            nn.SiLU(),
+            nn.Linear(cfg.dim, 2, bias=True),
+        )
         self.rotary = RotaryEmbedding(cfg.dim // cfg.heads, base=cfg.rope_base)
         self.reason_tokens = nn.Parameter(torch.randn(1, n_reason_tokens, cfg.dim) * 0.02)
         self.reason_blocks = nn.ModuleList([
@@ -247,7 +298,7 @@ class KronosPreviewWithReasoning(nn.Module):
         self._gradient_checkpointing = True
 
     def forward(self, input_ids, time_ids, position_ids, attn_mask=None, targets=None,
-                va_values=None):
+                va_values=None, reg_targets=None):
         no_batch = input_ids.dim() == 1
         if no_batch:
             input_ids = input_ids.unsqueeze(0)
@@ -259,6 +310,8 @@ class KronosPreviewWithReasoning(nn.Module):
                 targets = targets.unsqueeze(0)
             if va_values is not None:
                 va_values = va_values.unsqueeze(0)
+            if reg_targets is not None:
+                reg_targets = reg_targets.unsqueeze(0)
 
         # SDPA requires 4D mask [B, 1, N, N] when B > 1
         if attn_mask is not None and attn_mask.dim() == 3:
@@ -297,7 +350,24 @@ class KronosPreviewWithReasoning(nn.Module):
                     shift_logits.view(-1, shift_logits.size(-1)),
                     shift_targets.view(-1), ignore_index=-100)
 
+        # Heteroscedastic regression (float32 for numerical stability)
+        reg_pred = None
+        het_loss = None
+        if reg_targets is not None:
+            with torch.amp.autocast("cuda", enabled=False):
+                shift_hidden = x[:, :-1, :].float().contiguous()
+                reg_pred = self.head_reg(shift_hidden)
+                shift_reg_targets = reg_targets[:, 1:].float().contiguous()
+                het_loss = heteroscedastic_nll_loss(
+                    reg_pred.reshape(-1, 2),
+                    shift_reg_targets.reshape(-1),
+                    ignore_val=-999.0,
+                )
+
         if no_batch:
             logits_coarse = logits_coarse.squeeze(0)
             logits_fine = logits_fine.squeeze(0)
+
+        if reg_targets is not None:
+            return logits_coarse, logits_fine, loss, reg_pred, het_loss
         return logits_coarse, logits_fine, loss
