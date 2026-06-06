@@ -22,6 +22,8 @@ def heteroscedastic_nll_loss(pred, target, ignore_val=-999.0):
     mean = pred[mask, 0]
     log_var = pred[mask, 1]
     tgt = target[mask]
+    # Clamp log_var for numerical stability (equivalent to σ ∈ [e^{-5}, e^{2}])
+    log_var = log_var.clamp(-5.0, 2.0)
     # Gaussian NLL: 0.5 * (log_var + (target - mean)^2 / exp(log_var))
     nll = 0.5 * (log_var + (tgt - mean).pow(2) / log_var.exp().clamp(min=1e-6))
     return nll.mean()

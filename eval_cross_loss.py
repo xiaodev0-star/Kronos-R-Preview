@@ -1,0 +1,396 @@
+"""Cross-Loss Fair Evaluation: Compare models across different loss functions.
+
+Different losses (CE, Focal, Het) produce different val_loss scales, so val_loss
+is NOT a fair comparison metric. This script uses downstream metrics instead:
+  - 1-Step DA (Directional Accuracy)
+  - 1-Step MAPE
+  - Collapse Rate (token distribution concentration)
+  - Token Diversity (unique tokens predicted)
+
+Usage:
+    python eval_cross_loss.py                           # Evaluate all checkpoints
+    python eval_cross_loss.py --dirs checkpoints/hpo_fast_phase2
+    python eval_cross_loss.py --checkpoints path1.pt path2.pt
+    python eval_cross_loss.py --top_n 3                 # Top 3 per loss family
+"""
+import argparse
+import json
+import os
+import sys
+import warnings
+warnings.filterwarnings("ignore")
+
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.getcwd())
+
+import torch
+import numpy as np
+import pandas as pd
+from glob import glob
+
+from config import DataConfig, NormConfig, TrainingConfig
+from data_processor import load_stocks, split_stocks, rolling_normalize
+from model.tokenizer import HierarchicalQuantizer
+from model.tokenizer_config import build_tokenizer_kwargs
+from model.kronos_preview import KronosPreview
+from reproducibility import set_global_seed
+
+N_TEST_STOCKS = 30
+SEED = 42
+AMP_DTYPE = torch.bfloat16
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+def load_tokenizer(path, device):
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    tok = HierarchicalQuantizer(**build_tokenizer_kwargs(ckpt.get("config", {})))
+    tok.load_state_dict(ckpt["model_state_dict"])
+    tok.to(device).eval()
+    for p in tok.parameters():
+        p.requires_grad_(False)
+    return tok
+
+
+def load_model(path, device):
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    model = KronosPreview().to(device)
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    model.eval()
+    return model
+
+
+def _cutoff_idx(stock):
+    return int(np.searchsorted(stock["dates_dt"],
+                               np.datetime64(pd.Timestamp(DataConfig.cutoff_date)), side="left"))
+
+
+def _rolling_stats(features, window=NormConfig.lookback_window):
+    T, D = features.shape
+    cs = np.cumsum(features, axis=0)
+    cs2 = np.cumsum(features ** 2, axis=0)
+    idx = np.arange(T)
+    starts = np.maximum(idx - window + 1, 0)
+    counts = (idx - starts + 1).astype(np.float32)
+    shifted = np.zeros_like(cs); shifted[1:] = cs[:-1]
+    shifted2 = np.zeros_like(cs2); shifted2[1:] = cs2[:-1]
+    mask_arr = (starts > 0).astype(np.float32)[:, None]
+    win_sum = cs - shifted * mask_arr
+    win_sum2 = cs2 - shifted2 * mask_arr
+    means = win_sum / counts[:, None]
+    var = win_sum2 / counts[:, None] - means ** 2
+    stds = np.sqrt(np.maximum(var, 1e-08))
+    return means.astype(np.float32), stds.astype(np.float32)
+
+
+@torch.no_grad()
+def eval_1step(model, tokenizer, test_stocks, device):
+    """1-step prediction evaluation — returns DA, MAPE, collapse_rate, etc."""
+    vocab = tokenizer.bsq_coarse.vocab_size
+    bos_id = vocab
+    m = NormConfig.min_lookback
+
+    stock_mape, stock_da, stock_baseline = [], [], []
+    all_pred_toks = []
+
+    for si, stock in enumerate(test_stocks):
+        feat = stock["features_raw"]
+        day, month, year = stock["day"], stock["month"], stock["year"]
+        close = stock["close_prices"]
+        ci = _cutoff_idx(stock)
+
+        T_total = len(feat)
+        if T_total < m + 10 or ci < m:
+            continue
+        n_test = T_total - ci
+        if n_test < 5:
+            continue
+
+        price_feat = feat[:, :4]
+        normed = rolling_normalize(price_feat)
+        idx_c, _ = tokenizer.encode(torch.from_numpy(normed).float().unsqueeze(0).to(device))
+        token_ids = idx_c[0].cpu().numpy()
+        rmean, rstd = _rolling_stats(price_feat)
+
+        N = T_total
+        ids = [bos_id] + token_ids[:N].tolist()
+        d_l = [day[0]] + day[:N].tolist()
+        m_l = [month[0]] + month[:N].tolist()
+        y_l = [year[0]] + year[:N].tolist()
+        S = len(ids)
+
+        inp = torch.tensor([ids[:-1]], dtype=torch.long, device=device)
+        tids = torch.stack([
+            torch.tensor([d_l[:-1]], dtype=torch.long),
+            torch.tensor([m_l[:-1]], dtype=torch.long),
+            torch.tensor([y_l[:-1]], dtype=torch.long),
+        ], dim=-1).to(device)
+        pos = torch.arange(S - 1, device=device).unsqueeze(0)
+        mask = torch.tril(torch.ones(S - 1, S - 1, dtype=torch.bool, device=device))
+
+        with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
+            lc, _, _ = model(inp, tids, pos, mask)
+
+        test_start = ci
+        test_end = T_total - 2
+        if test_end <= test_start:
+            continue
+        n_pred = test_end - test_start + 1
+
+        pred_toks = lc[0, test_start:test_end + 1].argmax(dim=-1).cpu().numpy()
+        all_pred_toks.append(pred_toks)
+
+        pt = torch.tensor([pred_toks.tolist()], dtype=torch.long, device=device)
+        pred_feat = tokenizer.decode_all(
+            pt.unsqueeze(-1).expand(-1, -1, 2).contiguous())[0].cpu().numpy()
+
+        pred_lr = pred_feat[:, 0] * rstd[test_start + 1:test_end + 2, 0] + \
+                  rmean[test_start + 1:test_end + 2, 0]
+        true_lr = feat[test_start + 1:test_end + 2, 0]
+
+        base_close = close[test_start:test_end + 1]
+        pred_close = base_close * np.exp(pred_lr.astype(np.float64))
+        true_close = close[test_start + 1:test_end + 2]
+
+        eps = 1e-8
+        mape_pt = np.abs(pred_close - true_close) / (np.abs(true_close) + eps) * 100
+        da_pt = (np.sign(pred_lr) == np.sign(true_lr)).astype(float)
+
+        bl = float(np.mean(np.abs(base_close - true_close) / (np.abs(true_close) + eps)) * 100)
+
+        stock_mape.append(float(np.mean(mape_pt)))
+        stock_da.append(float(np.mean(da_pt)))
+        stock_baseline.append(bl)
+
+    # Compute collapse metrics
+    all_toks = np.concatenate(all_pred_toks) if all_pred_toks else np.array([])
+    total = len(all_toks)
+    if total > 0:
+        unique, counts = np.unique(all_toks, return_counts=True)
+        collapse_rate = counts.max() / total
+        n_unique = len(unique)
+        # Top-3 concentration
+        top3_count = np.sort(counts)[-3:].sum() if len(counts) >= 3 else counts.sum()
+        top3_rate = top3_count / total
+    else:
+        collapse_rate, n_unique, top3_rate = 0.0, 0, 0.0
+
+    return {
+        "mape": float(np.mean(stock_mape)) if stock_mape else 0,
+        "da": float(np.mean(stock_da)) if stock_da else 0,
+        "baseline_mape": float(np.mean(stock_baseline)) if stock_baseline else 0,
+        "collapse_rate": float(collapse_rate),
+        "top3_rate": float(top3_rate),
+        "n_unique_tokens": int(n_unique),
+        "n_stocks": len(stock_mape),
+        "total_predictions": int(total),
+    }
+
+
+def discover_checkpoints(dirs, checkpoint_list):
+    """Discover checkpoints from directories and/or explicit paths."""
+    checkpoints = []
+
+    # Explicit paths
+    for path in checkpoint_list:
+        if os.path.exists(path):
+            try:
+                ckpt = torch.load(path, map_location="cpu", weights_only=False)
+                if ckpt.get("completed", False):
+                    checkpoints.append({
+                        "name": os.path.basename(path).replace(".pt", ""),
+                        "path": os.path.abspath(path),
+                        "val_loss": ckpt.get("val_loss", float("inf")),
+                        "loss_type": ckpt.get("loss_type", "unknown"),
+                        "gamma": ckpt.get("gamma", 0),
+                        "heteroscedastic": ckpt.get("heteroscedastic", False),
+                        "het_weight": ckpt.get("het_weight", 0),
+                        "collapse_rate": ckpt.get("collapse_rate", 0),
+                    })
+            except Exception as e:
+                print(f"  Skip {path}: {e}")
+
+    # Scan directories
+    for d in dirs:
+        for f in sorted(glob(os.path.join(d, "*.pt"))):
+            if f.endswith(".ckpt") or "_override_" in f:
+                continue
+            try:
+                ckpt = torch.load(f, map_location="cpu", weights_only=False)
+                if ckpt.get("completed", False):
+                    checkpoints.append({
+                        "name": ckpt.get("tag", os.path.basename(f).replace(".pt", "")),
+                        "path": os.path.abspath(f),
+                        "val_loss": ckpt.get("val_loss", float("inf")),
+                        "loss_type": ckpt.get("loss_type", "unknown"),
+                        "gamma": ckpt.get("gamma", 0),
+                        "heteroscedastic": ckpt.get("heteroscedastic", False),
+                        "het_weight": ckpt.get("het_weight", 0),
+                        "collapse_rate": ckpt.get("collapse_rate", 0),
+                    })
+            except Exception:
+                pass
+
+    return checkpoints
+
+
+def get_loss_family(info):
+    """Determine loss family from checkpoint metadata."""
+    if info.get("heteroscedastic"):
+        if info.get("loss_type") == "focal":
+            return "focal_het"
+        return "ce_het"
+    if info.get("loss_type") == "focal":
+        return "focal"
+    return "ce"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Cross-Loss Fair Evaluation")
+    parser.add_argument("--dirs", nargs="*", default=[],
+                        help="Directories to scan for checkpoints")
+    parser.add_argument("--checkpoints", nargs="*", default=[],
+                        help="Explicit checkpoint paths")
+    parser.add_argument("--top_n", type=int, default=3,
+                        help="Top N per loss family (by val_loss)")
+    parser.add_argument("--n_stocks", type=int, default=N_TEST_STOCKS)
+    parser.add_argument("--output", type=str, default="eval_cross_loss_results.json")
+    args = parser.parse_args()
+
+    # Default directories
+    if not args.dirs and not args.checkpoints:
+        args.dirs = [
+            "checkpoints/hpo_fast_phase2",
+            "checkpoints/hpo_v4_het_refined",
+            "checkpoints/hpo_v3_het",
+        ]
+        # Also include baseline
+        if os.path.exists("checkpoints/v2_model.pt"):
+            args.checkpoints.append("checkpoints/v2_model.pt")
+
+    set_global_seed(SEED, deterministic=False)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # Load tokenizer and test stocks
+    print("Loading tokenizer ...")
+    tokenizer = load_tokenizer(TrainingConfig.tokenizer_path, device)
+
+    print("Loading test stocks ...")
+    stocks = load_stocks(max_stocks=0)
+    _, _, test_stocks_all = split_stocks(stocks)
+
+    # Attach close_prices
+    csv_map = {os.path.basename(f).split(".")[0]: f for f in sorted(glob("dataset/*.csv"))}
+    for s in test_stocks_all:
+        fpath = csv_map.get(s["symbol"])
+        if fpath:
+            df = pd.read_csv(fpath, usecols=["date", "close"])
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date", "close"]).sort_values("date")
+            prev = df["close"].shift(1)
+            df["log_ret"] = np.log(df["close"] / prev).replace([np.inf, -np.inf], np.nan)
+            df = df.dropna().reset_index(drop=True)
+            s["close_prices"] = df["close"].values.astype(np.float64)
+        else:
+            lr = s["features_raw"][:, 0]
+            s["close_prices"] = np.exp(np.cumsum(lr)).astype(np.float64)
+
+    rng = np.random.RandomState(SEED)
+    indices = rng.choice(len(test_stocks_all), min(args.n_stocks, len(test_stocks_all)), replace=False)
+    test_stocks = [test_stocks_all[i] for i in sorted(indices)]
+    print(f"Test stocks: {len(test_stocks)}")
+
+    # Discover checkpoints
+    all_checkpoints = discover_checkpoints(args.dirs, args.checkpoints)
+    print(f"Discovered {len(all_checkpoints)} completed checkpoints")
+
+    if not all_checkpoints:
+        print("No checkpoints found!")
+        return
+
+    # Group by family and select top N
+    families = {}
+    for ckpt in all_checkpoints:
+        family = get_loss_family(ckpt)
+        ckpt["family"] = family
+        families.setdefault(family, []).append(ckpt)
+
+    selected = []
+    for family, ckpts in sorted(families.items()):
+        ckpts.sort(key=lambda x: x["val_loss"])
+        top = ckpts[:args.top_n]
+        selected.extend(top)
+        print(f"  {family}: {len(ckpts)} found, selected top {len(top)}")
+
+    print(f"\nEvaluating {len(selected)} checkpoints ...")
+    print("=" * 100)
+
+    # Evaluate
+    results = []
+    for i, ckpt_info in enumerate(selected):
+        name = ckpt_info["name"]
+        path = ckpt_info["path"]
+        family = ckpt_info["family"]
+        print(f"\n[{i+1}/{len(selected)}] {name} [{family}]")
+
+        try:
+            model = load_model(path, device)
+            res = eval_1step(model, tokenizer, test_stocks, device)
+            res["name"] = name
+            res["path"] = path
+            res["family"] = family
+            res["val_loss"] = ckpt_info["val_loss"]
+            res["loss_type"] = ckpt_info.get("loss_type", "unknown")
+            res["gamma"] = ckpt_info.get("gamma", 0)
+            res["het_weight"] = ckpt_info.get("het_weight", 0)
+            results.append(res)
+
+            print(f"  DA={res['da']*100:.2f}%  MAPE={res['mape']:.2f}%  "
+                  f"Collapse={res['collapse_rate']*100:.1f}%  Unique={res['n_unique_tokens']}")
+
+            del model
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # === CROSS-LOSS COMPARISON TABLE ===
+    print("\n" + "=" * 120)
+    print("  CROSS-LOSS FAIR COMPARISON (Downstream Metrics)")
+    print("=" * 120)
+    print(f"  {'Name':<30} {'Family':<10} {'DA':>8} {'MAPE':>8} {'Baseline':>9} "
+          f"{'Collapse':>9} {'Unique':>7} {'ValLoss':>8}")
+    print("  " + "-" * 110)
+
+    results.sort(key=lambda x: x["da"], reverse=True)
+    for r in results:
+        print(f"  {r['name']:<30} {r['family']:<10} {r['da']*100:>7.2f}% {r['mape']:>7.2f}% "
+              f"{r['baseline_mape']:>8.2f}% {r['collapse_rate']*100:>8.1f}% "
+              f"{r['n_unique_tokens']:>6} {r['val_loss']:>8.4f}")
+
+    # Best per family
+    print(f"\n  Best per family (by DA):")
+    for family in sorted(set(r["family"] for r in results)):
+        best = max([r for r in results if r["family"] == family], key=lambda x: x["da"])
+        print(f"    {family:<12}: {best['name']} DA={best['da']*100:.2f}% MAPE={best['mape']:.2f}% "
+              f"Collapse={best['collapse_rate']*100:.1f}%")
+
+    # Overall best
+    if results:
+        best_da = max(results, key=lambda x: x["da"])
+        best_mape = min(results, key=lambda x: x["mape"])
+        lowest_collapse = min(results, key=lambda x: x["collapse_rate"])
+        print(f"\n  Overall best DA:       {best_da['name']} [{best_da['family']}] ({best_da['da']*100:.2f}%)")
+        print(f"  Overall best MAPE:     {best_mape['name']} [{best_mape['family']}] ({best_mape['mape']:.2f}%)")
+        print(f"  Lowest collapse:       {lowest_collapse['name']} [{lowest_collapse['family']}] "
+              f"({lowest_collapse['collapse_rate']*100:.1f}%)")
+
+    # Save
+    with open(args.output, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"\n  Results saved: {args.output}")
+
+
+if __name__ == "__main__":
+    main()

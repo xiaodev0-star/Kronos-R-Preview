@@ -7,3 +7,6 @@ TEMP/
 *.npz
 *.png
 *.ckpt
+*.db
+*.log
+*.txt

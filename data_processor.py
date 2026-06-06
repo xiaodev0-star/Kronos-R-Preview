@@ -439,7 +439,7 @@ def _build_causal_mask(S, device="cpu"):
 
 
 def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutoff_date,
-                   context_len=DataConfig.context_len, cache_dir=None):
+                   context_len=DataConfig.context_len, cache_dir=None, max_seq_len=0):
     """v2: One stock per sequence.  Returns list[dict] with va_values.
 
     Each dict:
@@ -464,7 +464,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
             continue
 
         price_normed, va_normed = document_normalize(feat[:ci], cutoff_idx=ci if mode == "train" else None)
-        reg_target = price_normed[:, 0].copy()  # [T] normalized log_ret for regression target
+        reg_target = np.abs(price_normed[:, 0]).copy()  # [T] volatility: |normalized log_ret|
 
         # Token cache
         if cache_dir:
@@ -472,7 +472,13 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
             if os.path.exists(cache_path):
                 data = np.load(cache_path, allow_pickle=True)
                 cached_hash = str(data["_tok_hash"]) if "_tok_hash" in data else None
+                has_required = "reg_target" in data and "va_values" in data
                 if tok_hash and cached_hash != tok_hash:
+                    data.close()
+                    os.remove(cache_path)
+                elif not has_required:
+                    # Stale cache missing required fields → re-encode
+                    data.close()
                     os.remove(cache_path)
                 else:
                     enc = {
@@ -481,6 +487,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
                         "va_values": data["va_values"],
                         "reg_target": data["reg_target"],
                     }
+                    data.close()
                     if len(enc["token_ids"]) >= NormConfig.min_doc_length:
                         encoded.append(enc)
                     continue
@@ -525,6 +532,15 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
             [zero_va.tolist()] + va_list + [zero_va.tolist()], dtype=torch.float32)
         # Regression targets: log_ret aligned with input_ids; BOS/EOS = -999 sentinel
         reg_targets = torch.tensor([-999.0] + rt_list + [-999.0], dtype=torch.float32)
+
+        # Truncate long sequences from the beginning (keep most recent data)
+        if max_seq_len > 0 and len(ids) > max_seq_len:
+            ids = torch.cat([ids[:1], ids[-(max_seq_len-1):]])  # BOS + last max_seq_len-1
+            d = torch.cat([d[:1], d[-(max_seq_len-1):]])
+            m = torch.cat([m[:1], m[-(max_seq_len-1):]])
+            y = torch.cat([y[:1], y[-(max_seq_len-1):]])
+            va = torch.cat([va[:1], va[-(max_seq_len-1):]], dim=0)
+            reg_targets = torch.cat([reg_targets[:1], reg_targets[-(max_seq_len-1):]])
 
         sequences.append({
             "input_ids": ids,

@@ -137,10 +137,17 @@ def main(args=None):
     use_heteroscedastic = args.heteroscedastic if args else False
     het_weight = args.het_weight if args else 0.1
     history_per_epoch = args.history_per_epoch if args else False
+    light_eval = args.light_eval if args else False
+    max_stocks_override = args.max_stocks if args else 0
+    force_repack = args.force_repack if args else False
+    max_seq_len = args.max_seq_len if args else 0
 
     # Apply dropout override before model construction
     if dropout_override is not None:
         ModelConfig.dropout = dropout_override
+    # Apply max_stocks override for fast HPO screening
+    if max_stocks_override > 0:
+        DataConfig.max_stocks = max_stocks_override
 
     print(f"Device: {device}, tag={tag}")
     print(f"  save={save_path}, tok={tok_path}, ep={epochs}")
@@ -157,6 +164,10 @@ def main(args=None):
             print(f"  base_checkpoint={base_ckpt_path}")
     if use_heteroscedastic:
         print(f"  heteroscedastic=True, het_weight={het_weight}")
+    if max_stocks_override > 0:
+        print(f"  [FAST] max_stocks={max_stocks_override} (subsampled for HPO screening)")
+    if light_eval:
+        print(f"  [LIGHT_EVAL] computing collapse_rate/token_diversity per epoch")
 
     tokenizer = load_tokenizer(tok_path, device)
     print("Tokenizer loaded.")
@@ -166,11 +177,17 @@ def main(args=None):
     print(f"Train: {len(train_s)}, Val: {len(val_s)}")
 
     cache_tag = os.path.basename(tok_path).replace(".pt", "")
-    cache_suffix = "_het" if use_heteroscedastic else ""
+    cache_suffix = "_het_vol" if use_heteroscedastic else ""  # "vol" = volatility reg_target
     cache_dir = os.path.join(TrainingConfig.save_dir, f"token_cache_{cache_tag}{cache_suffix}")
+    if force_repack and os.path.exists(cache_dir):
+        import shutil
+        shutil.rmtree(cache_dir)
+        print(f"  [FORCE_REPACK] cleared cache: {cache_dir}")
     print(f"Encoding v2 (cache: {cache_dir}) ...")
-    train_seqs = pack_stocks_v2(train_s, tokenizer, mode="train", cache_dir=cache_dir)
-    val_seqs = pack_stocks_v2(val_s, tokenizer, mode="train", cache_dir=cache_dir)
+    train_seqs = pack_stocks_v2(train_s, tokenizer, mode="train", cache_dir=cache_dir,
+                                max_seq_len=max_seq_len)
+    val_seqs = pack_stocks_v2(val_s, tokenizer, mode="train", cache_dir=cache_dir,
+                              max_seq_len=max_seq_len)
     print(f"Train seqs: {len(train_seqs)}, Val seqs: {len(val_seqs)}")
 
     bs = TrainingConfig.batch_size
@@ -328,6 +345,8 @@ def main(args=None):
         model.eval()
         vlosses = []
         v_het_losses = []
+        # Light eval: collect argmax predictions for collapse rate
+        val_pred_tokens = []
         with torch.inference_mode():
             for batch in val_loader:
                 reg_tgt = None
@@ -361,16 +380,36 @@ def main(args=None):
                             shift_logits.view(-1, shift_logits.size(-1)),
                             shift_targets.view(-1), ignore_index=-100)
                         vlosses.append(vloss.item())
+                    # Light eval: collect argmax predictions (free with logits)
+                    if light_eval:
+                        valid_mask = (shift_targets != -100)
+                        if valid_mask.any():
+                            preds = shift_logits.argmax(dim=-1)  # [B, S-1]
+                            val_pred_tokens.append(preds[valid_mask].cpu())
 
         avg_val = sum(vlosses) / max(len(vlosses), 1)
         avg_val_het = sum(v_het_losses) / max(len(v_het_losses), 1) if v_het_losses else 0.0
         cur_lr = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - t0
 
+        # Light eval: compute collapse rate and token diversity
+        collapse_rate = 0.0
+        n_unique_tokens = 0
+        if light_eval and val_pred_tokens:
+            all_preds = torch.cat(val_pred_tokens)
+            total = all_preds.numel()
+            if total > 0:
+                unique, counts = torch.unique(all_preds, return_counts=True)
+                collapse_rate = counts.max().item() / total
+                n_unique_tokens = len(unique)
+
         history["train_loss"].append(avg_train)
         history["val_loss"].append(avg_val)
         history["val_het_loss"].append(avg_val_het)
         history["lr"].append(cur_lr)
+        if light_eval:
+            history.setdefault("collapse_rate", []).append(collapse_rate)
+            history.setdefault("n_unique_tokens", []).append(n_unique_tokens)
 
         # Write per-epoch history for Optuna pruning
         if history_per_epoch:
@@ -399,6 +438,8 @@ def main(args=None):
                 "dropout": ModelConfig.dropout,
                 "heteroscedastic": use_heteroscedastic,
                 "het_weight": het_weight,
+                "collapse_rate": collapse_rate,
+                "n_unique_tokens": n_unique_tokens,
             }, save_path)
             tag_s = "  -> Saved best"
 
@@ -416,9 +457,12 @@ def main(args=None):
         epochs_left = epochs - epoch - 1
         eta = (elapsed / epochs_done) * epochs_left if epochs_done > 0 else 0
         mark = tag_s if tag_s else ""
+        light_str = ""
+        if light_eval and collapse_rate > 0:
+            light_str = f" coll={collapse_rate*100:.1f}% uniq={n_unique_tokens}"
         print(f"  [{epochs_done}/{epochs - start_epoch}] Epoch {epoch+1}: "
               f"train={avg_train:.4f} val={avg_val:.4f} best={best_val:.4f} "
-              f"lr={cur_lr:.2e} elapsed={elapsed:.0f}s ETA={eta:.0f}s step={global_step}{mark}",
+              f"lr={cur_lr:.2e} elapsed={elapsed:.0f}s ETA={eta:.0f}s step={global_step}{light_str}{mark}",
               flush=True)
 
         if TrainingConfig.max_train_updates and global_step >= TrainingConfig.max_train_updates:
@@ -477,4 +521,12 @@ Examples:
                         help="Weight for heteroscedastic NLL loss (default: 0.1)")
     parser.add_argument("--history_per_epoch", action="store_true",
                         help="Write per-epoch val_loss to JSON (for Optuna pruning)")
+    parser.add_argument("--light_eval", action="store_true",
+                        help="Compute collapse_rate/token_diversity during validation (fast HPO proxy)")
+    parser.add_argument("--max_stocks", type=int, default=0,
+                        help="Subsample N stocks for fast HPO screening (0=all)")
+    parser.add_argument("--force_repack", action="store_true",
+                        help="Force re-tokenization (clear cache, e.g. after reg_target change)")
+    parser.add_argument("--max_seq_len", type=int, default=0,
+                        help="Truncate sequences longer than this (0=no limit, recommended 2048 for HPO)")
     main(parser.parse_args())
