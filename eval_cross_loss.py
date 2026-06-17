@@ -29,7 +29,7 @@ import pandas as pd
 from glob import glob
 
 from config import DataConfig, NormConfig, TrainingConfig
-from data_processor import load_stocks, split_stocks, rolling_normalize
+from data_processor import load_stocks, split_stocks, document_normalize, _stock_cutoff_idx, stratified_split_stocks
 from model.tokenizer import HierarchicalQuantizer
 from model.tokenizer_config import build_tokenizer_kwargs
 from model.kronos_preview import KronosPreview
@@ -90,6 +90,7 @@ def eval_1step(model, tokenizer, test_stocks, device):
     m = NormConfig.min_lookback
 
     stock_mape, stock_da, stock_baseline = [], [], []
+    stock_ampratio = []
     all_pred_toks = []
 
     for si, stock in enumerate(test_stocks):
@@ -106,10 +107,16 @@ def eval_1step(model, tokenizer, test_stocks, device):
             continue
 
         price_feat = feat[:, :4]
-        normed = rolling_normalize(price_feat)
+        # Use document_normalize (matching training pipeline)
+        # Stats from train period only (feat[:ci]), applied to full sequence
+        price_normed, _ = document_normalize(feat, cutoff_idx=ci)
+        normed = price_normed
         idx_c, _ = tokenizer.encode(torch.from_numpy(normed).float().unsqueeze(0).to(device))
         token_ids = idx_c[0].cpu().numpy()
-        rmean, rstd = _rolling_stats(price_feat)
+
+        # Document-level stats (fixed, not time-varying) for denormalization
+        p_mean = price_feat[:ci].mean(axis=0)  # [4]
+        p_std = np.maximum(price_feat[:ci].std(axis=0), 1e-8)  # [4]
 
         N = T_total
         ids = [bos_id] + token_ids[:N].tolist()
@@ -128,7 +135,7 @@ def eval_1step(model, tokenizer, test_stocks, device):
         mask = torch.tril(torch.ones(S - 1, S - 1, dtype=torch.bool, device=device))
 
         with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-            lc, _, _ = model(inp, tids, pos, mask)
+            lc, lf, _ = model(inp, tids, pos, mask)
 
         test_start = ci
         test_end = T_total - 2
@@ -136,15 +143,20 @@ def eval_1step(model, tokenizer, test_stocks, device):
             continue
         n_pred = test_end - test_start + 1
 
-        pred_toks = lc[0, test_start:test_end + 1].argmax(dim=-1).cpu().numpy()
-        all_pred_toks.append(pred_toks)
+        pred_c = lc[0, test_start:test_end + 1].argmax(dim=-1)
+        all_pred_toks.append(pred_c.cpu().numpy())
 
-        pt = torch.tensor([pred_toks.tolist()], dtype=torch.long, device=device)
-        pred_feat = tokenizer.decode_all(
-            pt.unsqueeze(-1).expand(-1, -1, 2).contiguous())[0].cpu().numpy()
+        # Experiment A: 2-level joint argmax with lf.std guard for backward-compat
+        lf_std = lf[0, test_start:test_end + 1].float().std().item()
+        if lf_std < 0.1:
+            pred_indices = pred_c.unsqueeze(0).unsqueeze(-1).expand(-1, -1, 2).contiguous()
+        else:
+            pred_f = lf[0, test_start:test_end + 1].argmax(dim=-1)
+            pred_indices = torch.stack([pred_c, pred_f], dim=-1).unsqueeze(0)
 
-        pred_lr = pred_feat[:, 0] * rstd[test_start + 1:test_end + 2, 0] + \
-                  rmean[test_start + 1:test_end + 2, 0]
+        pred_feat = tokenizer.decode_all(pred_indices)[0].cpu().numpy()
+
+        pred_lr = pred_feat[:, 0] * p_std[0] + p_mean[0]
         true_lr = feat[test_start + 1:test_end + 2, 0]
 
         base_close = close[test_start:test_end + 1]
@@ -157,9 +169,15 @@ def eval_1step(model, tokenizer, test_stocks, device):
 
         bl = float(np.mean(np.abs(base_close - true_close) / (np.abs(true_close) + eps)) * 100)
 
+        # AmpRatio: predicted amplitude / true amplitude
+        pred_amp = float(np.mean(np.abs(pred_lr)))
+        true_amp = float(np.mean(np.abs(true_lr)))
+        ampratio = pred_amp / max(true_amp, 1e-8)
+
         stock_mape.append(float(np.mean(mape_pt)))
         stock_da.append(float(np.mean(da_pt)))
         stock_baseline.append(bl)
+        stock_ampratio.append(ampratio)
 
     # Compute collapse metrics
     all_toks = np.concatenate(all_pred_toks) if all_pred_toks else np.array([])
@@ -177,6 +195,7 @@ def eval_1step(model, tokenizer, test_stocks, device):
     return {
         "mape": float(np.mean(stock_mape)) if stock_mape else 0,
         "da": float(np.mean(stock_da)) if stock_da else 0,
+        "ampratio": float(np.mean(stock_ampratio)) if stock_ampratio else 0,
         "baseline_mape": float(np.mean(stock_baseline)) if stock_baseline else 0,
         "collapse_rate": float(collapse_rate),
         "top3_rate": float(top3_rate),
@@ -195,17 +214,19 @@ def discover_checkpoints(dirs, checkpoint_list):
         if os.path.exists(path):
             try:
                 ckpt = torch.load(path, map_location="cpu", weights_only=False)
-                if ckpt.get("completed", False):
-                    checkpoints.append({
-                        "name": os.path.basename(path).replace(".pt", ""),
-                        "path": os.path.abspath(path),
-                        "val_loss": ckpt.get("val_loss", float("inf")),
-                        "loss_type": ckpt.get("loss_type", "unknown"),
-                        "gamma": ckpt.get("gamma", 0),
-                        "heteroscedastic": ckpt.get("heteroscedastic", False),
-                        "het_weight": ckpt.get("het_weight", 0),
-                        "collapse_rate": ckpt.get("collapse_rate", 0),
-                    })
+                # Default: only completed checkpoints. KRONOS_FORCE_EVAL=1 overrides.
+                if not ckpt.get("completed", False) and not os.environ.get("KRONOS_FORCE_EVAL"):
+                    continue
+                checkpoints.append({
+                    "name": os.path.basename(path).replace(".pt", ""),
+                    "path": os.path.abspath(path),
+                    "val_loss": ckpt.get("val_loss", float("inf")),
+                    "loss_type": ckpt.get("loss_type", "unknown"),
+                    "gamma": ckpt.get("gamma", 0),
+                    "heteroscedastic": ckpt.get("heteroscedastic", False),
+                    "het_weight": ckpt.get("het_weight", 0),
+                    "collapse_rate": ckpt.get("collapse_rate", 0),
+                })
             except Exception as e:
                 print(f"  Skip {path}: {e}")
 
@@ -296,9 +317,14 @@ def main():
             s["close_prices"] = np.exp(np.cumsum(lr)).astype(np.float64)
 
     rng = np.random.RandomState(SEED)
-    indices = rng.choice(len(test_stocks_all), min(args.n_stocks, len(test_stocks_all)), replace=False)
-    test_stocks = [test_stocks_all[i] for i in sorted(indices)]
-    print(f"Test stocks: {len(test_stocks)}")
+    stratified_n = int(os.environ.get("KRONOS_STRATIFIED_N", "0") or "0")
+    if stratified_n > 0:
+        test_stocks = stratified_split_stocks(test_stocks_all, n=stratified_n, seed=SEED)
+        print(f"Test stocks (stratified): {len(test_stocks)} (n={stratified_n}, seed={SEED})")
+    else:
+        indices = rng.choice(len(test_stocks_all), min(args.n_stocks, len(test_stocks_all)), replace=False)
+        test_stocks = [test_stocks_all[i] for i in sorted(indices)]
+        print(f"Test stocks: {len(test_stocks)}")
 
     # Discover checkpoints
     all_checkpoints = discover_checkpoints(args.dirs, args.checkpoints)
@@ -346,6 +372,7 @@ def main():
             results.append(res)
 
             print(f"  DA={res['da']*100:.2f}%  MAPE={res['mape']:.2f}%  "
+                  f"AmpRatio={res.get('ampratio',0):.3f}x  "
                   f"Collapse={res['collapse_rate']*100:.1f}%  Unique={res['n_unique_tokens']}")
 
             del model
@@ -356,35 +383,40 @@ def main():
             traceback.print_exc()
 
     # === CROSS-LOSS COMPARISON TABLE ===
-    print("\n" + "=" * 120)
-    print("  CROSS-LOSS FAIR COMPARISON (Downstream Metrics)")
-    print("=" * 120)
-    print(f"  {'Name':<30} {'Family':<10} {'DA':>8} {'MAPE':>8} {'Baseline':>9} "
-          f"{'Collapse':>9} {'Unique':>7} {'ValLoss':>8}")
-    print("  " + "-" * 110)
+    print("\n" + "=" * 130)
+    print("  CROSS-LOSS FAIR COMPARISON (Anti-Collapse Priority)")
+    print("  Sort: |AmpRatio-1| → MAPE → DA")
+    print("=" * 130)
+    print(f"  {'Name':<30} {'Family':<10} {'AmpRatio':>9} {'DA':>8} {'MAPE':>8} {'Baseline':>9} "
+          f"{'Collapse':>9} {'Unique':>7}")
+    print("  " + "-" * 120)
 
-    results.sort(key=lambda x: x["da"], reverse=True)
+    # 3-variable sort: |AmpRatio-1| (ascending) → MAPE (ascending) → DA (descending)
+    results.sort(key=lambda x: (abs(x.get("ampratio", 0) - 1.0),
+                                 x.get("mape", 999),
+                                 -x.get("da", 0)))
     for r in results:
-        print(f"  {r['name']:<30} {r['family']:<10} {r['da']*100:>7.2f}% {r['mape']:>7.2f}% "
+        print(f"  {r['name']:<30} {r['family']:<10} {r.get('ampratio',0):>8.3f}x "
+              f"{r['da']*100:>7.2f}% {r['mape']:>7.2f}% "
               f"{r['baseline_mape']:>8.2f}% {r['collapse_rate']*100:>8.1f}% "
-              f"{r['n_unique_tokens']:>6} {r['val_loss']:>8.4f}")
+              f"{r['n_unique_tokens']:>6}")
 
-    # Best per family
-    print(f"\n  Best per family (by DA):")
+    # Best per family (by |AmpRatio-1|)
+    print(f"\n  Best per family (by |AmpRatio-1| → MAPE → DA):")
     for family in sorted(set(r["family"] for r in results)):
-        best = max([r for r in results if r["family"] == family], key=lambda x: x["da"])
-        print(f"    {family:<12}: {best['name']} DA={best['da']*100:.2f}% MAPE={best['mape']:.2f}% "
-              f"Collapse={best['collapse_rate']*100:.1f}%")
+        fam_results = [r for r in results if r["family"] == family]
+        best = min(fam_results, key=lambda x: (abs(x.get("ampratio", 0) - 1.0),
+                                                x.get("mape", 999)))
+        print(f"    {family:<12}: {best['name']} AR={best.get('ampratio',0):.3f}x "
+              f"DA={best['da']*100:.2f}% MAPE={best['mape']:.2f}%")
 
-    # Overall best
+    # Overall winner by 3-variable sort
     if results:
-        best_da = max(results, key=lambda x: x["da"])
-        best_mape = min(results, key=lambda x: x["mape"])
-        lowest_collapse = min(results, key=lambda x: x["collapse_rate"])
-        print(f"\n  Overall best DA:       {best_da['name']} [{best_da['family']}] ({best_da['da']*100:.2f}%)")
-        print(f"  Overall best MAPE:     {best_mape['name']} [{best_mape['family']}] ({best_mape['mape']:.2f}%)")
-        print(f"  Lowest collapse:       {lowest_collapse['name']} [{lowest_collapse['family']}] "
-              f"({lowest_collapse['collapse_rate']*100:.1f}%)")
+        winner = results[0]  # Already sorted by |AmpRatio-1| → MAPE → DA
+        print(f"\n  >>> WINNER: {winner['name']} [{winner['family']}]")
+        print(f"     AmpRatio={winner.get('ampratio',0):.3f}x  "
+              f"DA={winner['da']*100:.2f}%  MAPE={winner['mape']:.2f}%  "
+              f"Collapse={winner['collapse_rate']*100:.1f}%")
 
     # Save
     with open(args.output, "w") as f:

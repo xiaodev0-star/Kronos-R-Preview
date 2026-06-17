@@ -472,7 +472,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
             if os.path.exists(cache_path):
                 data = np.load(cache_path, allow_pickle=True)
                 cached_hash = str(data["_tok_hash"]) if "_tok_hash" in data else None
-                has_required = "reg_target" in data and "va_values" in data
+                has_required = "reg_target" in data and "va_values" in data and "idx_fine" in data
                 if tok_hash and cached_hash != tok_hash:
                     data.close()
                     os.remove(cache_path)
@@ -483,6 +483,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
                 else:
                     enc = {
                         "token_ids": data["token_ids"],
+                        "idx_fine": data["idx_fine"],
                         "day": data["day"], "month": data["month"], "year": data["year"],
                         "va_values": data["va_values"],
                         "reg_target": data["reg_target"],
@@ -493,12 +494,14 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
                     continue
 
         with torch.no_grad():
-            token_ids, _ = tokenizer.encode(
+            token_ids, idx_fine = tokenizer.encode(
                 torch.from_numpy(price_normed).float().unsqueeze(0).to(device))
         token_ids = token_ids[0].cpu().numpy()
+        idx_fine = idx_fine[0].cpu().numpy()
 
         enc = {
             "token_ids": token_ids,
+            "idx_fine": idx_fine,
             "day": day[:ci], "month": month[:ci], "year": year[:ci],
             "va_values": va_normed,
             "reg_target": reg_target,
@@ -507,7 +510,8 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
         if cache_dir:
             np.savez_compressed(
                 _token_cache_path(s["symbol"] + "_v2", cache_dir),
-                token_ids=token_ids, day=day[:ci], month=month[:ci], year=year[:ci],
+                token_ids=token_ids, idx_fine=idx_fine,
+                day=day[:ci], month=month[:ci], year=year[:ci],
                 va_values=va_normed, reg_target=reg_target, _tok_hash=tok_hash or "",
             )
 
@@ -520,11 +524,14 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
     sequences = []
     for enc in encoded:
         ids_list = enc["token_ids"].tolist()
+        ft_list = enc["idx_fine"].tolist()
         va_list = enc["va_values"].tolist()
         rt_list = enc["reg_target"].tolist()
         d_list, m_list, y_list = enc["day"].tolist(), enc["month"].tolist(), enc["year"].tolist()
 
         ids = torch.tensor([bos_id] + ids_list + [eos_id], dtype=torch.long)
+        # Fine targets: -100 sentinel at BOS/EOS so CE loss can ignore them
+        fine_ids = torch.tensor([-100] + ft_list + [-100], dtype=torch.long)
         d = torch.tensor([d_list[0]] + d_list + [d_list[-1]], dtype=torch.long)
         m = torch.tensor([m_list[0]] + m_list + [m_list[-1]], dtype=torch.long)
         y = torch.tensor([y_list[0]] + y_list + [y_list[-1]], dtype=torch.long)
@@ -536,6 +543,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
         # Truncate long sequences from the beginning (keep most recent data)
         if max_seq_len > 0 and len(ids) > max_seq_len:
             ids = torch.cat([ids[:1], ids[-(max_seq_len-1):]])  # BOS + last max_seq_len-1
+            fine_ids = torch.cat([fine_ids[:1], fine_ids[-(max_seq_len-1):]])
             d = torch.cat([d[:1], d[-(max_seq_len-1):]])
             m = torch.cat([m[:1], m[-(max_seq_len-1):]])
             y = torch.cat([y[:1], y[-(max_seq_len-1):]])
@@ -549,6 +557,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
             "position_ids": torch.arange(len(ids), dtype=torch.long),
             "va_values": va,
             "reg_targets": reg_targets,
+            "fine_targets": fine_ids,
         })
 
     return sequences
@@ -567,6 +576,17 @@ class PackedDatasetV2(Dataset):
         seq = self.sequences[idx]
         S = seq["input_ids"].shape[0]
         mask = _build_causal_mask(S)
+        if "reg_targets" in seq and "fine_targets" in seq:
+            return (
+                seq["input_ids"],
+                seq["targets"],
+                seq["time_ids"],
+                seq["position_ids"],
+                mask,
+                seq["va_values"],
+                seq["reg_targets"],
+                seq["fine_targets"],
+            )
         if "reg_targets" in seq:
             return (
                 seq["input_ids"],
@@ -586,6 +606,103 @@ class PackedDatasetV2(Dataset):
             seq["va_values"],
         )
 
+
+# ============================================================================
+# Experiment A: Stratified 200-stock test set
+# ============================================================================
+
+# A-share market-cap / board proxy from symbol prefix.
+# (prefix, label) — labels are 4 market-cap buckets based on common A-share conventions.
+_MARKET_CAP_BUCKETS = {
+    "000": "shenzhen_main",   # 000xxx 深主板（大盘）
+    "001": "shenzhen_main",
+    "002": "shenzhen_sme",     # 002xxx 中小板
+    "003": "shenzhen_sme",
+    "300": "chinext",          # 300xxx 创业板（小盘/高波动）
+    "600": "shanghai_main",    # 600xxx 沪主板（大盘）
+    "601": "shanghai_main",
+    "603": "shanghai_main",
+    "605": "shanghai_sme",     # 605xxx 沪主板次新
+    "688": "star",             # 688xxx 科创板（小盘/高波动）
+}
+
+# 4 market-cap buckets for stratification (large / mid / small / start-up)
+_MCAP_LABEL = {
+    "shenzhen_main": "large",
+    "shanghai_main": "large",
+    "shenzhen_sme": "mid",
+    "shanghai_sme": "mid",
+    "chinext": "small",
+    "star": "startup",
+}
+
+
+def _symbol_strata(symbol):
+    """Map an A-share symbol to (market_cap_label, industry_label).
+    Industry is approximated by the next 2 digits after the prefix (3-char sector code).
+    Falls back to 'misc' if symbol is too short.
+    """
+    if len(symbol) < 6:
+        return ("misc", "misc")
+    prefix = symbol[:3]
+    mcap = _MCAP_LABEL.get(_MARKET_CAP_BUCKETS.get(prefix, "misc"), "misc")
+    # Sector proxy: 3-digit code after the board prefix (e.g. 000001=banking, 600519=liquor)
+    # Round to nearest 50 for bucket coarseness (10 industry buckets).
+    try:
+        mid3 = int(symbol[3:6])
+        industry = f"s{(mid3 // 50) * 50:03d}"
+    except ValueError:
+        industry = "misc"
+    return (mcap, industry)
+
+
+def stratified_split_stocks(stocks, n=200, seed=42, market_cap_buckets=4, industry_buckets=10):
+    """Stratified sampling of n stocks by (market_cap, industry).
+
+    Falls back to deterministic 30-stock selection if total stock pool is too small
+    or if any stratum has <3 stocks.
+    """
+    if len(stocks) < n:
+        return stocks  # pool too small — return all
+
+    # Assign strata to each stock
+    strata = {}
+    for s in stocks:
+        key = _symbol_strata(s["symbol"])
+        strata.setdefault(key, []).append(s)
+
+    # Target n per stratum: n / (4 mcap × 10 industry) = n / 40 ≈ 5 for n=200
+    # But we only sample from non-empty strata.
+    rng = np.random.RandomState(seed)
+    per_stratum = max(3, n // 40)  # at least 3 per stratum to be meaningful
+    selected = []
+    strata_keys = sorted(strata.keys())
+    rng.shuffle(strata_keys)
+
+    # First pass: target per_stratum from each non-empty stratum (proportional)
+    for key in strata_keys:
+        pool = strata[key]
+        if len(pool) <= per_stratum:
+            selected.extend(pool)  # take all
+        else:
+            indices = rng.choice(len(pool), per_stratum, replace=False)
+            selected.extend([pool[i] for i in sorted(indices)])
+
+    # If we overshot, trim; if we undershot, top up from largest strata
+    if len(selected) > n:
+        rng.shuffle(selected)
+        selected = selected[:n]
+    elif len(selected) < n:
+        # Top up from remaining un-selected stocks
+        selected_set = set(id(s) for s in selected)
+        remaining = [s for s in stocks if id(s) not in selected_set]
+        rng.shuffle(remaining)
+        need = n - len(selected)
+        selected.extend(remaining[:need])
+
+    # Sort by symbol for determinism
+    selected.sort(key=lambda s: s["symbol"])
+    return selected
 
 def make_dataloader_v2(sequences, batch_size=1, shuffle=True):
     def collate(batch):

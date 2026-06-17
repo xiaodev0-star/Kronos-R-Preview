@@ -16,7 +16,7 @@ import pandas as pd
 from glob import glob
 
 from config import DataConfig, NormConfig, TrainingConfig
-from data_processor import load_stocks, split_stocks, rolling_normalize
+from data_processor import load_stocks, split_stocks, document_normalize, _stock_cutoff_idx, stratified_split_stocks
 from model.tokenizer import HierarchicalQuantizer
 from model.tokenizer_config import build_tokenizer_kwargs
 from model.kronos_preview import KronosPreview
@@ -102,14 +102,17 @@ def eval_1step_full(model, tokenizer, test_stocks, device):
 
         # ---- Normalize FULL history (4D OHLC only) ----
         price_feat = feat[:, :4]  # [T_total, 4]
-        normed = rolling_normalize(price_feat)  # [T_total, 4] normalized
+        price_normed, _ = document_normalize(feat, cutoff_idx=ci)
+        normed = price_normed  # [T_total, 4] normalized
 
         # ---- Tokenize FULL history ----
         idx_c, _ = tokenizer.encode(torch.from_numpy(normed).float().unsqueeze(0).to(device))
         token_ids = idx_c[0].cpu().numpy()  # [T_total]
 
         # ---- Rolling stats from FULL history (for denormalization) ----
-        rmean, rstd = _rolling_stats(price_feat)  # [T_total, 4]
+        # Document-level stats (fixed) for denormalization
+        p_mean = price_feat[:ci].mean(axis=0)  # [4]
+        p_std = np.maximum(price_feat[:ci].std(axis=0), 1e-8)  # [4]
 
         # ---- Build full sequence: BOS + all tokens ----
         # We need the model to see everything up to each test position.
@@ -133,7 +136,7 @@ def eval_1step_full(model, tokenizer, test_stocks, device):
 
         # ---- Forward pass on FULL sequence ----
         with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-            lc, _, _ = model(inp, tids, pos, mask)
+            lc, lf, _ = model(inp, tids, pos, mask)
 
         # ---- Extract predictions at TEST positions only ----
         # Test positions: indices ci..T_total-1 in the original sequence
@@ -182,18 +185,23 @@ def eval_1step_full(model, tokenizer, test_stocks, device):
             continue
 
         n_pred = test_end - test_start + 1
-        pred_toks = lc[0, test_start:test_end + 1].argmax(dim=-1).cpu().numpy()
-        all_pred_toks.append(pred_toks)
+        pred_c = lc[0, test_start:test_end + 1].argmax(dim=-1)
+        all_pred_toks.append(pred_c.cpu().numpy())
 
-        # ---- Decode predicted tokens back to feature space ----
-        pt = torch.tensor([pred_toks.tolist()], dtype=torch.long, device=device)
-        pred_feat = tokenizer.decode_all(
-            pt.unsqueeze(-1).expand(-1, -1, 2).contiguous())[0].cpu().numpy()
+        # Experiment A: 2-level joint argmax with lf.std guard for backward-compat
+        lf_std = lf[0, test_start:test_end + 1].float().std().item()
+        if lf_std < 0.1:
+            # Old behavior: replicate coarse to both levels
+            pred_indices = pred_c.unsqueeze(0).unsqueeze(-1).expand(-1, -1, 2).contiguous()
+        else:
+            pred_f = lf[0, test_start:test_end + 1].argmax(dim=-1)
+            pred_indices = torch.stack([pred_c, pred_f], dim=-1).unsqueeze(0)
+
+        pred_feat = tokenizer.decode_all(pred_indices)[0].cpu().numpy()
 
         # Denormalize: pred_lr = pred_feat[:, 0] * rstd + rmean
         # Use rolling stats at position t+1 (the position whose return we predicted)
-        pred_lr = pred_feat[:, 0] * rstd[test_start + 1:test_end + 2, 0] + \
-                  rmean[test_start + 1:test_end + 2, 0]
+        pred_lr = pred_feat[:, 0] * p_std[0] + p_mean[0]
         # True log return at position t+1
         true_lr = feat[test_start + 1:test_end + 2, 0]
 
@@ -273,11 +281,16 @@ def main():
             lr = s["features_raw"][:, 0]
             s["close_prices"] = np.exp(np.cumsum(lr)).astype(np.float64)
 
-    # Select 30 fixed stocks
-    rng = np.random.RandomState(SEED)
-    indices = rng.choice(len(test_stocks_all), min(N_TEST_STOCKS, len(test_stocks_all)), replace=False)
-    test_stocks = [test_stocks_all[i] for i in sorted(indices)]
-    print(f"Selected {len(test_stocks)} stocks for evaluation (seed={SEED})")
+    # Select test stocks (30 fixed OR stratified_n via env var)
+    stratified_n = int(os.environ.get("KRONOS_STRATIFIED_N", "0") or "0")
+    if stratified_n > 0:
+        test_stocks = stratified_split_stocks(test_stocks_all, n=stratified_n, seed=SEED)
+        print(f"Selected {len(test_stocks)} stocks via stratified_split_stocks (n={stratified_n}, seed={SEED})")
+    else:
+        rng = np.random.RandomState(SEED)
+        indices = rng.choice(len(test_stocks_all), min(N_TEST_STOCKS, len(test_stocks_all)), replace=False)
+        test_stocks = [test_stocks_all[i] for i in sorted(indices)]
+        print(f"Selected {len(test_stocks)} stocks for evaluation (seed={SEED})")
 
     # Show context info
     sample = test_stocks[0]

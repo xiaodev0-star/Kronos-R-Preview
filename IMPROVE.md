@@ -1,7 +1,8 @@
 # Kronos-R-Preview 改进路线图
 
 > 基于"LLM 范式 + 选择性预测"的系统性改进方案。
-> 本文档讨论的改进均未实施，为后续实验提供方向参考。
+> **部分改进已实施**——参见 `TEMP/EXP_2026_06_17_BERT_CALIBRATION/`（BERT 校准 session）
+> 本文档讨论的是未来改进方向。
 
 ---
 
@@ -383,3 +384,42 @@ Step 3: 用 3 个不同种子训练 ensemble，统计分歧度与准确率的相
 如果 Step 2 或 Step 3 显示正信号 → 值得投入完整实施
 如果均无信号 → 模型容量或结构可能需要更大的改动
 ```
+
+---
+
+## 10. 已实施的改进（2026-06-17 BERT 校准）
+
+### 10.1 GPT + BERT 双模型协同范式
+
+**根目录标准工具**（已从 TEMP 提升为生产工具）：
+- 模型：`model/kronos_bert.py`（双向 attention + MLM 头）
+- 训练：`train_bert.py`（支持 `--dim --depth --heads` 等模型规模 override）
+- 评估 V2：`eval_bert_calibration_v2.py`（推荐：GPT 提案 + BERT 验证）
+- 评估 V1：`eval_bert_calibration.py`（备选：联合打分）
+- 预训练权重：`checkpoints/kronos_bert_big_v1.pt`（推荐，16M，4695 stocks）
+
+完整实验报告：`TEMP/EXP_2026_06_17_BERT_CALIBRATION/REPORT.md`
+
+| 改进 | 状态 | 效果 |
+|------|------|------|
+| BERT (KronosBert) 实现 | ✅ 已完成 | dim=256~512, depth=2~4, MLM 训练 |
+| V1 联合打分 (`eval_bert_calibration.py`) | ✅ 已完成 | DA +1.02pp vs baseline (49.87%) |
+| V2 提案-审议 (`eval_bert_calibration_v2.py`) | ✅ 已完成 | DA -0.16pp 但 AR +0.16x, Coll -26pp, Unique +48% |
+| 大模型 16M + 全量 4695 stocks | ✅ 已完成 | 容量解锁数据，V2 DA +0.87pp |
+
+### 10.2 关键发现
+
+1. **小 BERT (2.5M) 在 1000 stocks 饱和**——数据增加无收益
+2. **大 BERT (16M) 真正利用全量数据**——V2 DA 提升 0.87pp
+3. **V2 设计哲学**——GPT 提案，bert_only 联合打分（不是 product）
+4. **token 坍塌大幅修复**——V2 14.5% vs baseline 40.7%
+5. **幅度坍塌修复**——V2 AmpRatio 1.02x vs baseline 0.86x
+
+### 10.3 待探索方向
+
+- [ ] **多步 AR 验证** — V2 在 1-step 上 work，10-step AR 是否保持？
+- [ ] **真正的 future context** — eval 时用真实 future（V3）作为上界
+- [ ] **更大 BERT** (32M+) — 是否还有提升空间？
+- [ ] **与 thinking 模型组合** — refine_k2 + BERT 校准能否超越两者单独？
+- [ ] **多 mask 位置聚合** — boundary 只验证 1 个位置，多位置可能更鲁棒
+- [ ] **K sweep** — 系统扫描 K=3,5,10,20 找最优 K

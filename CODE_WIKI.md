@@ -3,6 +3,12 @@
 ## 项目概述
 
 基于 LLM 因果预测范式的 A 股时序模型。每只股票从头读到尾，next-token prediction。
+**当前架构为 GPT + BERT 双模型协同**（GPT 提案 + BERT 验证）：
+
+- **训练脚本**：`train_base.py` (GPT) + `train_bert.py` (BERT 校准器) + `train_tokenizer.py`
+- **评估脚本**：`eval_batch_1step.py` (GPT-only) / `eval_cross_loss.py` / `eval_bert_calibration.py` (V1) / `eval_bert_calibration_v2.py` (V2, 推荐)
+
+完整实验报告见 `TEMP/EXP_2026_06_17_BERT_CALIBRATION/REPORT.md`。
 
 ## 数据流
 
@@ -13,7 +19,15 @@ CSV → load_stocks() → split_stocks(train/val/test, 按股票切分, cutoff�
                          ↓                                     ↘ VA 连续值 (vol/amt)
               PackedDatasetV2 → make_dataloader_v2(bs=1, causal mask)
                          ↓
-                     train_base.py
+                     train_base.py (GPT 训练)
+                         ↓
+                  checkpoints/expA_v2.pt
+                         ↓
+              ─── 评估路径 ───
+                  ├── eval_batch_1step.py / eval_cross_loss.py    (纯 GPT 评估)
+                  └── eval_bert_calibration_v2.py                   (GPT+BERT 推荐)
+                         ↑
+              train_bert.py (BERT MLM 训练) → checkpoints/kronos_bert_big_v1.pt
 ```
 
 关键设计决策：
@@ -66,6 +80,23 @@ token_emb(ids) + time_emb(day/month/year) + va_proj(vol,amt)
 - `va_proj`: Linear(2→64) → GELU → Linear(64→256)，additive
 - GQA: 4 query heads, 1 KV head, head_dim=64
 - RoPE: base=10000, 位置 ID 外部传入
+- **Causal attention** (tril mask)
+
+### KronosBert (2.5M ~ 16M) — 校准器
+
+```
+token_emb(ids) + time_emb(day/month/year) + va_proj(vol,amt)
+    → RoPE → N×TransformerBlock(GQA SDPA, SiLU-gated FFN) → head_coarse
+```
+
+- `token_emb`: Embedding(1027, dim) — 1024 vocab + BOS + EOS + **MASK**
+- 架构与 KronosPreview 类似
+- **Bidirectional attention** (无 causal mask) — 训练时 MLM 目标要求
+- 训练目标：MLM 15% 随机 mask + CE loss
+- 不针对 next-token 预测优化
+- 推理时作为"中间 token 可解释性"的一致性检查器
+
+完整实现见 `TEMP/EXP_2026_06_17_BERT_CALIBRATION/model/kronos_bert.py`
 
 ### KronosPreviewWithReasoning
 
@@ -76,6 +107,19 @@ KronosPreview → CausalReasoningBlock(cross-attn to N learnable memory tokens, 
 - Memory tokens 学习全局模式，gate 控制注入量
 - `frozen`: 仅训练 reasoning block
 - 不加 KV-cache，自回归时全序列重算
+
+### BERT 校准推理 (V2) — 2026-06-17 新增
+
+```
+For each test position p (predicting tok_p):
+    1. GPT 给出 top-K 候选 {y_1, ..., y_K} 及概率
+    2. 对每个 y_k 构造 BERT 输入: [BOS, tok_0, ..., MASK_at_p, y_k]
+       (MASK 在最后一个 history token 位置, y_k 作为"未来")
+    3. BERT 预测 at MASK: score_k = P_BERT(tok_{p-1} | context_with_y_k)
+    4. argmax_k of score_k 选出最终 token
+```
+
+详见 `TEMP/EXP_2026_06_17_BERT_CALIBRATION/REPORT.md`
 
 ## 训练 (`train_base.py`)
 
