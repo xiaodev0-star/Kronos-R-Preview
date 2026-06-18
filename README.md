@@ -9,17 +9,18 @@
 
 | Method | DA | MAPE | AmpRatio | Collapse | Unique |
 |:-------|:---:|:----:|:--------:|:--------:|:------:|
-| **Best baseline** (refine_k2_1000stocks, 14h HPO) | 48.85% | 3.12% | 0.86x | 40.7% | 44 |
-| **GPT + BERT v2** (big BERT 16M, K=5) | **48.69%** | 3.46% | **1.021x** | **14.5%** | **65** |
-| GPT-only (expA_v2 argmax) | 46.97% | 3.42% | 0.999x | 46.0% | 43 |
+| **HPO 2026-06-18 best** (phase3_t000 + big BERT, K=5 bert_only) | **48.12%** | 3.48% | **1.062x** | **19.4%** | **63** |
+| HPO 2026-06-18 trading variant (phase4_t003 + big BERT, K=5 bert_only) | 47.93% | 3.45% | 1.036x | **16.8%** | **69** |
+| GPT-only (expA_v2_hpo argmax, HPO config) | 47.29% | 3.22% | 0.927x | 41.4% | 45 |
+| Pre-HPO baseline (expA_v2 γ=6+ls=0.05 + big BERT, K=5 bert_only) | 48.69% | 3.46% | 1.021x | 14.5% | 65 |
 
-**GPT+BERT 方案**：
-- DA 追平最优 baseline（-0.16pp 在统计噪声内）
-- **AmpRatio 1.02x**（向 1.0 大幅靠近，幅度坍塌修复）
-- **Collapse 14.5%**（vs baseline 40.7%，断崖式下降）
-- **Unique 65 tokens**（vs baseline 44，多样性 +48%）
+**HPO 2026-06-18 关键发现**：
+- **focal γ=4（不是 γ=6）** 是新最优，label_smoothing 应为 0（不是 0.05）
+- **heteroscedastic head 默认开**（het_weight=0.1），相比 CE-only 显著提升 DA
+- 训练默认参数已对齐：直接 `python train_base.py` 即可复现 phase3_t000
+- V2 校准依然贡献最大：DA +0.83pp，坍塌率减半
 
-完整历史结果（含 v1, v2, 小/大 BERT, 1000/4695 stocks）见 `TEMP/EXP_2026_06_17_BERT_CALIBRATION/REPORT.md`。
+完整历史结果见 `TEMP/hpo_final_report_2026_06_18.md` + `TEMP/EXP_2026_06_17_BERT_CALIBRATION/REPORT.md`。
 
 ## 快速开始
 
@@ -27,14 +28,18 @@
 # 1. 训练 Tokenizer (4D OHLC)
 python train_tokenizer.py
 
-# 2. 训练 GPT 模型（提案者）
-python train_base.py --loss focal --gamma 6.0 --label_smoothing 0.05
+# 2. 训练 GPT 模型（提案者）— HPO 2026-06-18 best (phase3_t000)
+#    默认：focal γ=4 + heteroscedastic=ON + dropout=0.1 + 10 epochs
+python train_base.py
+#    → 保存到 checkpoints/expA_v2_hpo.pt
 
-# 3. 训练 BERT 校准器（验证者）— 推荐配置: 16M, 全部 4695 stocks
-python train_bert.py \
-  --dim 512 --depth 4 --heads 8 --num_kv_heads 2 \
-  --epochs 6 --max_stocks 0 --max_seq_len 1024 \
-  --save_path checkpoints/kronos_bert_big_v1.pt
+#    备选（低坍塌 + 高AR）：phase4_t003 配置 — DA 47.93%, Coll 16.8%
+#    python train_base.py --epochs 15 --dropout 0.05
+
+# 3. 训练 BERT 校准器（验证者）— HPO 2026-06-18 best: 16M, 全部 4695 stocks
+#    下面所有参数已是 train_bert.py 的默认，可直接：
+python train_bert.py
+#    → 保存到 checkpoints/kronos_bert_big_v1.pt
 
 # 4a. GPT-only 评估（baseline）
 python eval_batch_1step.py
@@ -79,16 +84,20 @@ For each test position p:
 
 ## 关键超参 (CLI)
 
-### GPT 训练
+### GPT 训练（HPO 2026-06-18 best = phase3_t000）
 
 | 参数 | 推荐值 | 说明 |
 |------|:------:|------|
-| `--loss` | `focal` | Focal loss 抑制零坍塌 |
-| `--gamma` | `6.0` | 1-Step 最优; 8.0 为 10-Step AR 最优 |
-| `--label_smoothing` | `0.05` | 配合 Focal 进一步改善 |
-| `--weight_decay` | `0.001` | CE 模型推荐; Focal 可用默认 0.01 |
+| `--loss` | `focal` | 默认 focal；CE 用 `--loss ce` |
+| `--gamma` | `4.0` | HPO 2026-06-18 best（γ=6 是旧 best，已被 γ=4 超过） |
+| `--label_smoothing` | `0.0` | HPO 2026-06-18 best（γ=4 不需要 LS） |
+| `--weight_decay` | `0.01` | HPO 2026-06-18 best (focal) |
+| `--heteroscedastic` | `ON` | HPO 2026-06-18 best，默认开（用 `--no-heteroscedastic` 关掉） |
+| `--het_weight` | `0.1` | HPO 2026-06-18 best（异方差 NLL 损失权重） |
+| `--dropout` | `0.1` | HPO 2026-06-18 best；trading 变体用 `--dropout 0.05` |
+| `--epochs` | `10` | HPO 2026-06-18 best（phase3）；trading 变体用 `--epochs 15` |
 
-### BERT 训练
+### BERT 训练（HPO 2026-06-18 best = big BERT, 16M）
 
 | 参数 | 推荐值 | 说明 |
 |------|:------:|------|
@@ -96,7 +105,9 @@ For each test position p:
 | `--depth` | `4` | Transformer 层数（small=2, big=4） |
 | `--heads` | `8` | 注意力头数（small=4, big=8） |
 | `--num_kv_heads` | `2` | KV 头数（GQA, small=1, big=2） |
-| `--max_stocks` | `0` | 0=全部 4695 stocks |
+| `--max_stocks` | `0` | 0=全部 4695 stocks（big BERT 解锁全量数据价值） |
+| `--max_seq_len` | `1024` | 推理时序列长度 |
+| `--epochs` | `6` | big BERT 训练轮数 |
 | `--mlm_prob` | `0.15` | MLM mask 概率 |
 | `--lr` | `3e-4` | 学习率 |
 
@@ -116,7 +127,9 @@ For each test position p:
 | `CODE_WIKI.md` | 数据流、模型架构、训练/HPO 关键修复 |
 | `IMPROVE.md` | 历史改进计划 + 待做实验 |
 | `TEST_REPORT.md` | 跨模型测试结果对比 |
-| `TEMP/EXP_2026_06_17_BERT_CALIBRATION/REPORT.md` | **BERT 校准 session 完整报告** ★ |
+| `TEMP/hpo_final_report_2026_06_18.md` | **HPO 2026-06-18 完整报告** ★（推荐先看） |
+| `TEMP/session_report_2026_06_18.md` | 本 session 的 screening + HPO 总结 |
+| `TEMP/EXP_2026_06_17_BERT_CALIBRATION/REPORT.md` | BERT 校准 session 完整报告 |
 | `TEMP/EXP_2026_06_17_BERT_CALIBRATION/docs/KRONOS_R_DESIGN.md` | 设计哲学详细版 |
 | `TEMP/README.md` | 所有历史实验汇总 |
 
@@ -139,8 +152,9 @@ Kronos-R-Preview/
 │   ├── tokenizer.py             # BSQ Tokenizer
 │   └── tokenizer_config.py
 ├── checkpoints/
-│   ├── expA_v2.pt               # 预训练 GPT (生产 baseline)
-│   ├── kronos_bert_big_v1.pt    # 预训练 BERT big (16M, 4695 stocks) ★
+│   ├── expA_v2_hpo.pt           # ★ HPO 2026-06-18 best GPT (focal γ=4 + het, 10ep)
+│   ├── expA_v2.pt               # 旧 baseline (γ=6+ls=0.05) — 保留兼容
+│   ├── kronos_bert_big_v1.pt    # ★ 预训练 BERT big (16M, 4695 stocks)
 │   ├── kronos_bert_v1.pt        # 预训练 BERT small (2.5M, 1000 stocks)
 │   └── tokenizer_v2_ohlc.pt     # 预训练 Tokenizer
 ├── dataset/                     # 4695 只 A 股 CSV

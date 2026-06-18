@@ -53,6 +53,7 @@ from model.tokenizer_config import build_tokenizer_kwargs
 from model.kronos_preview import KronosPreview
 from model.kronos_bert import KronosBert
 from reproducibility import set_global_seed
+from eval_helpers import build_stock_arrays, build_gpt_eval_inputs, build_bert_position_arrays, BOS_ID, MASK_ID, VOCAB_BASE
 
 N_TEST_STOCKS = 30
 SEED = 42
@@ -112,116 +113,70 @@ def get_gpt_full_seq_logits(gpt, tokenizer, stock, device):
     """Run GPT once on the full sequence. Returns logits at every position.
     Logit at position i predicts ids[i+1] = tok_i (where ids = [BOS, tok_0, ..., tok_{T-1}]).
     """
-    feat = stock["features_raw"]
-    day, month, year = stock["day"], stock["month"], stock["year"]
-    close = stock["close_prices"]
-    ci = _cutoff_idx(stock)
-    T_total = len(feat)
-    m = NormConfig.min_lookback
-    if T_total < m + 10 or ci < m:
+    arrays = build_stock_arrays(stock)
+    if arrays is None:
         return None
-
-    price_feat = feat[:, :4]
-    price_normed, _ = document_normalize(feat, cutoff_idx=ci)
-    idx_c, _ = tokenizer.encode(torch.from_numpy(price_normed).float().unsqueeze(0).to(device))
-    token_ids = idx_c[0].cpu().numpy()
-
-    p_mean = price_feat[:ci].mean(axis=0)
-    p_std = np.maximum(price_feat[:ci].std(axis=0), 1e-8)
-
-    vocab = tokenizer.bsq_coarse.vocab_size
-    bos_id = vocab
-    N = T_total
-    ids = [bos_id] + token_ids[:N].tolist()
-    d_l = [day[0]] + day[:N].tolist()
-    m_l = [month[0]] + month[:N].tolist()
-    y_l = [year[0]] + year[:N].tolist()
-    S = len(ids)
-    inp = torch.tensor([ids[:-1]], dtype=torch.long, device=device)
-    tids = torch.stack([
-        torch.tensor([d_l[:-1]], dtype=torch.long),
-        torch.tensor([m_l[:-1]], dtype=torch.long),
-        torch.tensor([y_l[:-1]], dtype=torch.long),
-    ], dim=-1).to(device)
-    pos = torch.arange(S - 1, device=device).unsqueeze(0)
-    mask = torch.tril(torch.ones(S - 1, S - 1, dtype=torch.bool, device=device))
-    va = torch.zeros(1, S - 1, 2, device=device)
-
+    inputs = build_gpt_eval_inputs(arrays, tokenizer, device)
     with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-        lc, lf, _ = gpt(inp, tids, pos, mask, va_values=va)
+        lc, _, _ = gpt(inputs["inp"], inputs["tids"], inputs["pos"],
+                       inputs["mask"], va_values=inputs["va_values"])
     return {
         "logits": lc.float().cpu(),  # [1, T, vocab_full]
-        "token_ids": token_ids,      # [T_total] - no BOS
-        "test_start": ci,
-        "test_end": T_total - 2,
-        "p_mean": p_mean,
-        "p_std": p_std,
-        "day": day, "month": month, "year": year,
-        "feat": feat,
-        "close": close,
-        "T_total": T_total,
+        "token_ids": inputs["token_ids"],
+        "test_start": inputs["test_start"],
+        "test_end": inputs["test_end"],
+        "p_mean": arrays["p_mean"],
+        "p_std": arrays["p_std"],
+        "day": arrays["day"], "month": arrays["month"], "year": arrays["year"],
+        "feat": arrays["feat"],
+        "close": arrays["close"],
+        "T_total": arrays["T_total"],
+        "_arrays": arrays,  # for per-position BERT input building
     }
 
 
 @torch.no_grad()
 def bert_validate_candidates(bert, token_ids, candidates, mask_pos, day, month, year,
-                              p_value, device, batch_size=64):
+                              p_value, device, batch_size=64, arrays=None):
     """Run BERT validation for one test position p against K candidates.
 
-    Args:
-        bert: BERT model
-        token_ids: [T] the full sequence (no BOS), only used for the prefix
-        candidates: list of K candidate token ids (y's to be appended as future)
-        mask_pos: int, the position in [1, p] to mask (1-indexed in the BERT input,
-                  where position 0 is BOS and position p+1 is the candidate)
-        day/month/year: arrays for time embedding at the predicted position
-        p_value: int, the test position p (predicting tok_p). The BERT input will be:
-                 [BOS, tok_0, ..., MASK_at_mask_pos, ..., tok_{p-1}, candidate]
-                 where MASK is at position mask_pos in [0, p+1]
-        device: torch device
-        batch_size: BERT batch size
-
-    Returns:
-        scores: [K] array of P_BERT(tok_at_mask_pos | context_with_candidate)
+    FIXED (was buggy): per-position day/month/year used (each input position gets
+    its own date, not the predicted-position's date copied to all).
+    `arrays` is the dict returned by build_stock_arrays and carries the per-position
+    VA values; pass it through to the BERT forward.
     """
     K = len(candidates)
-    # Build prefix: [BOS, tok_0, ..., tok_{p-1}] (length p+1)
-    prefix = [BOS_ID] + token_ids[:p_value].tolist()  # length p+1
-    # prefix has positions 0..p, with prefix[0]=BOS, prefix[i]=tok_{i-1} for i>=1
-
-    # Build K inputs: each is prefix with mask_pos replaced by MASK and candidate appended
+    # Build the K candidate-augmented inputs using the shared helper.
     inputs = []
-    mask_positions = []
     for cand in candidates:
-        inp = list(prefix)  # copy
-        inp[mask_pos] = MASK_ID  # mask the boundary (or chosen) history position
-        inp.append(int(cand))   # append candidate as future
-        inputs.append(inp)
-        mask_positions.append(mask_pos)
-
-    # We can batch all K inputs together if they all have the same length (which they do).
-    max_len = len(inputs[0])
-    B = len(inputs)
-    inp_t = torch.tensor(inputs, dtype=torch.long, device=device)
+        ba = build_bert_position_arrays(arrays, p_value, cand, [mask_pos],
+                                         token_ids=token_ids)
+        inputs.append({
+            "inp": ba["inp"].to(device),
+            "tids": ba["tids"].to(device),
+            "pos": ba["pos"].to(device),
+            "va_values": ba["va_values"].to(device),
+            "S": ba["S"],
+        })
+    max_len = max(it["S"] for it in inputs)
+    B = K
+    inp_t = torch.zeros(B, max_len, dtype=torch.long, device=device)
     tids = torch.zeros(B, max_len, 3, dtype=torch.long, device=device)
     pos = torch.zeros(B, max_len, dtype=torch.long, device=device)
     va = torch.zeros(B, max_len, 2, device=device)
-
-    # Time embeddings: use the time at the predicted position (test position p)
-    tids[:, :, 0] = int(day[p_value])
-    tids[:, :, 1] = int(month[p_value])
-    tids[:, :, 2] = int(year[p_value])
-    pos[:] = torch.arange(max_len, device=device).unsqueeze(0)
+    for bi, it in enumerate(inputs):
+        L = it["S"]
+        inp_t[bi, :L] = it["inp"][0]
+        tids[bi, :L] = it["tids"][0]
+        pos[bi, :L] = it["pos"][0]
+        va[bi, :L] = it["va_values"][0]
 
     with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
         logits = bert(inp_t, tids, pos, va_values=va)  # [B, max_len, vocab_base]
 
-    # Extract probability at the original (masked) token position for each candidate
     scores = np.zeros(K, dtype=np.float32)
-    for bi, mp in enumerate(mask_positions):
-        probs = F.softmax(logits[bi, mp].float(), dim=-1).cpu().numpy()  # [vocab_base]
-        original_token = token_ids[p_value - (p_value + 1 - mask_pos)]  # = token_ids[mask_pos - 1]
-        # Wait let me recompute: prefix[mask_pos] = tok_{mask_pos - 1}. So original token is token_ids[mask_pos - 1].
+    for bi in range(B):
+        probs = F.softmax(logits[bi, mask_pos].float(), dim=-1).cpu().numpy()  # [vocab_base]
         original_token = int(token_ids[mask_pos - 1])
         scores[bi] = probs[original_token]
 
@@ -230,39 +185,38 @@ def bert_validate_candidates(bert, token_ids, candidates, mask_pos, day, month, 
 
 @torch.no_grad()
 def bert_validate_candidates_multi_mask(bert, token_ids, candidates, mask_positions,
-                                          day, month, year, p_value, device):
+                                          day, month, year, p_value, device, arrays=None):
     """Variant: mask MULTIPLE positions, return mean score across masked positions.
-
-    Args:
-        mask_positions: list of positions (in [1, p]) to mask
+    FIXED (was buggy): per-position dates used via build_bert_position_arrays.
     """
     K = len(candidates)
-    prefix = [BOS_ID] + token_ids[:p_value].tolist()
-    M = len(mask_positions)
-
     inputs = []
     for cand in candidates:
-        inp = list(prefix)
-        for mp in mask_positions:
-            inp[mp] = MASK_ID
-        inp.append(int(cand))
-        inputs.append(inp)
-
-    max_len = len(inputs[0])
-    B = len(inputs)
-    inp_t = torch.tensor(inputs, dtype=torch.long, device=device)
+        ba = build_bert_position_arrays(arrays, p_value, cand, mask_positions,
+                                         token_ids=token_ids)
+        inputs.append({
+            "inp": ba["inp"].to(device),
+            "tids": ba["tids"].to(device),
+            "pos": ba["pos"].to(device),
+            "va_values": ba["va_values"].to(device),
+            "S": ba["S"],
+        })
+    max_len = max(it["S"] for it in inputs)
+    B = K
+    inp_t = torch.zeros(B, max_len, dtype=torch.long, device=device)
     tids = torch.zeros(B, max_len, 3, dtype=torch.long, device=device)
     pos = torch.zeros(B, max_len, dtype=torch.long, device=device)
     va = torch.zeros(B, max_len, 2, device=device)
-    tids[:, :, 0] = int(day[p_value])
-    tids[:, :, 1] = int(month[p_value])
-    tids[:, :, 2] = int(year[p_value])
-    pos[:] = torch.arange(max_len, device=device).unsqueeze(0)
+    for bi, it in enumerate(inputs):
+        L = it["S"]
+        inp_t[bi, :L] = it["inp"][0]
+        tids[bi, :L] = it["tids"][0]
+        pos[bi, :L] = it["pos"][0]
+        va[bi, :L] = it["va_values"][0]
 
     with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
         logits = bert(inp_t, tids, pos, va_values=va)
 
-    # For each candidate, average P_BERT at each masked position
     scores = np.zeros(K, dtype=np.float32)
     for bi in range(B):
         total = 0.0
@@ -270,7 +224,7 @@ def bert_validate_candidates_multi_mask(bert, token_ids, candidates, mask_positi
             probs = F.softmax(logits[bi, mp].float(), dim=-1).cpu().numpy()
             original_token = int(token_ids[mp - 1])
             total += probs[original_token]
-        scores[bi] = total / M
+        scores[bi] = total / len(mask_positions)
 
     return scores
 
@@ -285,8 +239,8 @@ def decode_predicted_token(token_id, tokenizer, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpt_ckpt", type=str, default="checkpoints/expA_v2.pt")
-    parser.add_argument("--bert_ckpt", type=str, default="checkpoints/kronos_bert_v1.pt")
+    parser.add_argument("--gpt_ckpt", type=str, default="checkpoints/expA_v2_hpo.pt")
+    parser.add_argument("--bert_ckpt", type=str, default="checkpoints/kronos_bert_big_v1.pt")
     parser.add_argument("--tokenizer", type=str, default="checkpoints/tokenizer_v2_ohlc.pt")
     parser.add_argument("--K", type=int, default=20,
                         help="Number of GPT candidates to validate per test position")
@@ -375,6 +329,7 @@ def main():
         feat = info["feat"]
         close = info["close"]
         gpt_logits = info["logits"]  # [1, T_total, vocab_full]
+        arrays = info["_arrays"]  # for BERT per-position time/VA
 
         # For each test position
         for p in range(test_start, test_end + 1):
@@ -415,11 +370,11 @@ def main():
             if len(mask_positions) == 1:
                 bert_scores = bert_validate_candidates(
                     bert, token_ids, candidates, mask_positions[0],
-                    day, month, year, p, device)
+                    day, month, year, p, device, arrays=arrays)
             else:
                 bert_scores = bert_validate_candidates_multi_mask(
                     bert, token_ids, candidates, mask_positions,
-                    day, month, year, p, device)
+                    day, month, year, p, device, arrays=arrays)
 
             # Combine scores
             if args.combine == "product":

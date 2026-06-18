@@ -14,6 +14,7 @@ import time
 import json
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -180,7 +181,7 @@ def main(args=None):
             mlm_labels_list = []
             for b in range(B):
                 mlm_ids_b, mlm_labels_b = make_mlm_batch(
-                    inp[b], va[b], tid[b], vocab_base, mask_id, mlm_prob=mlm_prob)
+                    inp[b], vocab_base, mask_id, mlm_prob=mlm_prob)
                 mlm_ids_list.append(mlm_ids_b)
                 mlm_labels_list.append(mlm_labels_b)
             mlm_ids = torch.stack(mlm_ids_list, dim=0)
@@ -246,7 +247,7 @@ def main(args=None):
                 mlm_labels_list = []
                 for b in range(B):
                     mlm_ids_b, mlm_labels_b = make_mlm_batch(
-                        inp[b], va[b], tid[b], vocab_base, mask_id, mlm_prob=mlm_prob)
+                        inp[b], vocab_base, mask_id, mlm_prob=mlm_prob)
                     mlm_ids_list.append(mlm_ids_b)
                     mlm_labels_list.append(mlm_labels_b)
                 mlm_ids = torch.stack(mlm_ids_list, dim=0)
@@ -323,27 +324,28 @@ def main(args=None):
 
 
 if __name__ == "__main__":
-    import numpy as np
     parser = argparse.ArgumentParser(
-        description="Train KronosBert (bidirectional MLM calibrator).",
+        description="Train KronosBert (bidirectional MLM calibrator). Default: big BERT (16M, 4695 stocks) — HPO 2026-06-18 best.",
     )
     parser.add_argument("--save_path", type=str,
-                        default="checkpoints/kronos_bert.pt")
+                        default="checkpoints/kronos_bert_big_v1.pt")
     parser.add_argument("--tokenizer_path", type=str,
                         default="checkpoints/tokenizer_v2_ohlc.pt")
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--max_stocks", type=int, default=500)
-    parser.add_argument("--max_seq_len", type=int, default=2048)
+    parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--max_stocks", type=int, default=0,
+                        help="Subsample N stocks (0=all 4695). HPO 2026-06-18 best: 0 (full data).")
+    parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--mlm_prob", type=float, default=0.15)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--tag", type=str, default="kronos_bert_v1")
-    # Model size overrides (0 = keep default from config.py)
-    parser.add_argument("--dim", type=int, default=0)
-    parser.add_argument("--depth", type=int, default=0)
-    parser.add_argument("--heads", type=int, default=0)
-    parser.add_argument("--num_kv_heads", type=int, default=0)
-    parser.add_argument("--ffn_multiplier", type=int, default=0)
-    parser.add_argument("--dropout", type=float, default=-1.0)  # -1 = keep default
+    parser.add_argument("--tag", type=str, default="kronos_bert_big_v1")
+    # Model size overrides. Defaults below are the big BERT (16M) — HPO 2026-06-18 best.
+    # Pass 0 to fall back to ModelConfig values (small 2.5M).
+    parser.add_argument("--dim", type=int, default=512)
+    parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--num_kv_heads", type=int, default=2)
+    parser.add_argument("--ffn_multiplier", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--gradient_checkpointing", action="store_true")
     main(parser.parse_args())

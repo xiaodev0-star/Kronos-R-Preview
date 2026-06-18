@@ -31,7 +31,11 @@ class DataConfig:
     random_seed: int = 42
 
 
-# v1: 6D features (deprecated, kept for backward compat)
+# v1: 6D features (deprecated, kept for backward compat).
+# Note: this is the RAW feature layout used by `load_stocks` (6 columns).
+# The current pipeline (v2) tokenizes only the first 4 columns (OHLC) — see
+# TokenizerConfig.input_dim = 4 below — and feeds the last 2 columns (log_vol,
+# log_amt) to the model as continuous VA embeddings (no quantization).
 DataConfig.feature_cols = [
     "log_ret", "log_high", "log_low", "log_open", "log_vol", "log_amt",
 ]
@@ -81,7 +85,11 @@ class TrainingConfig:
     max_train_updates: int = 0
     save_dir: str = "checkpoints"
     tokenizer_path: str = "checkpoints/tokenizer_v2_ohlc.pt"
-    base_model_path: str = "checkpoints/v2_model.pt"
+    # Production GPT checkpoint. HPO 2026-06-18 best (phase3_t000, DA 48.12% with V2
+    # calibration) trains with focal γ=4 + heteroscedastic=ON, 10 epochs. The old
+    # expA_v2.pt (γ=6, ls=0.05) is kept for backward compatibility but is no longer
+    # the recommended baseline.
+    base_model_path: str = "checkpoints/expA_v2_hpo.pt"
     token_cache_dir: str = "checkpoints/token_cache"  # NEW: pre-tokenize cache
 
 

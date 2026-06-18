@@ -257,47 +257,24 @@ class CausalReasoningBlock(nn.Module):
         return x
 
 
-class KronosPreviewWithReasoning(nn.Module):
-    """KronosPreview + CausalReasoningBlock after transformer blocks."""
+class KronosPreviewWithReasoning(KronosPreview):
+    """KronosPreview + CausalReasoningBlock after transformer blocks.
+
+    Inherits all of KronosPreview's embedding/blocks/head setup; only adds the
+    reason tokens and reasoning cross-attention block(s) inserted between the
+    transformer stack and the final norm.
+    """
     def __init__(self, base_model_state=None, n_reason_tokens=8, n_reason_layers=1):
         super().__init__()
         cfg = ModelConfig
-        vocab_full = cfg.vocab_size + 2
-        self.token_emb = nn.Embedding(vocab_full, cfg.dim)
-        self.time_emb_day = nn.Embedding(32, cfg.dim)
-        self.time_emb_month = nn.Embedding(13, cfg.dim)
-        self.time_emb_year = nn.Embedding(100, cfg.dim)
-        # v2: Volume/Amount continuous embedding
-        self.va_proj = nn.Sequential(
-            nn.Linear(2, cfg.va_hidden_dim, bias=True),
-            nn.GELU(),
-            nn.Linear(cfg.va_hidden_dim, cfg.dim, bias=True),
-        )
-        self.blocks = nn.ModuleList([
-            TransformerBlock(cfg.dim, cfg.heads, cfg.num_kv_heads,
-                             cfg.ffn_multiplier, cfg.dropout)
-            for _ in range(cfg.depth)
-        ])
-        self.norm = RMSNorm(cfg.dim)
-        self.head_coarse = nn.Linear(cfg.dim, vocab_full, bias=True)
-        self.head_fine = nn.Linear(cfg.dim, vocab_full, bias=True)  # Reserved: 2-level residual (unused in current training)
-        # Heteroscedastic regression head: MLP -> (mean, log_var)
-        self.head_reg = nn.Sequential(
-            nn.Linear(cfg.dim, cfg.dim, bias=True),
-            nn.SiLU(),
-            nn.Linear(cfg.dim, 2, bias=True),
-        )
-        self.rotary = RotaryEmbedding(cfg.dim // cfg.heads, base=cfg.rope_base)
-        self.reason_tokens = nn.Parameter(torch.randn(1, n_reason_tokens, cfg.dim) * 0.02)
+        self.reason_tokens = nn.Parameter(
+            torch.randn(1, n_reason_tokens, cfg.dim) * 0.02)
         self.reason_blocks = nn.ModuleList([
-            CausalReasoningBlock(cfg.dim, heads=cfg.heads) for _ in range(n_reason_layers)
+            CausalReasoningBlock(cfg.dim, heads=cfg.heads)
+            for _ in range(n_reason_layers)
         ])
-        self._gradient_checkpointing = False
         if base_model_state is not None:
             self.load_state_dict(base_model_state, strict=False)
-
-    def enable_gradient_checkpointing(self):
-        self._gradient_checkpointing = True
 
     def forward(self, input_ids, time_ids, position_ids, attn_mask=None, targets=None,
                 va_values=None, reg_targets=None):
@@ -315,7 +292,6 @@ class KronosPreviewWithReasoning(nn.Module):
             if reg_targets is not None:
                 reg_targets = reg_targets.unsqueeze(0)
 
-        # SDPA requires 4D mask [B, 1, N, N] when B > 1
         if attn_mask is not None and attn_mask.dim() == 3:
             attn_mask = attn_mask.unsqueeze(1)
 
@@ -352,7 +328,6 @@ class KronosPreviewWithReasoning(nn.Module):
                     shift_logits.view(-1, shift_logits.size(-1)),
                     shift_targets.view(-1), ignore_index=-100)
 
-        # Heteroscedastic regression (float32 for numerical stability)
         reg_pred = None
         het_loss = None
         if reg_targets is not None:

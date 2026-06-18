@@ -228,14 +228,12 @@ class KronosBert(nn.Module):
         return logits
 
 
-def make_mlm_batch(input_ids, va_values, time_ids, vocab_base, mask_id,
+def make_mlm_batch(input_ids, vocab_base, mask_id,
                    mlm_prob=0.15, ignore_index=-100, generator=None):
     """Build an MLM batch: randomly mask non-special tokens and produce labels.
 
     Args:
         input_ids: [N] long (the *original* token ids, including BOS/EOS)
-        va_values: [N, 2] float (kept intact — BERT can see va at the masked position)
-        time_ids:  [N, 3] long
         vocab_base: int — tokens >= this are special (BOS/EOS/MASK) and never masked
         mask_id: int — the [MASK] token id
         mlm_prob: masking probability (default 0.15)

@@ -39,6 +39,7 @@ from model.tokenizer_config import build_tokenizer_kwargs
 from model.kronos_preview import KronosPreview
 from model.kronos_bert import KronosBert
 from reproducibility import set_global_seed
+from eval_helpers import build_stock_arrays, build_gpt_eval_inputs, build_bert_position_arrays, MASK_ID
 
 N_TEST_STOCKS = 30
 SEED = 42
@@ -98,55 +99,27 @@ def get_gpt_predictions_full_seq(gpt, tokenizer, stock, device):
       - test_start, test_end (in 1-step AR space: positions where t+1 <= T_total - 1)
       - p_mean, p_std (for denorm)
     """
-    feat = stock["features_raw"]
-    day, month, year = stock["day"], stock["month"], stock["year"]
-    close = stock["close_prices"]
-    ci = _cutoff_idx(stock)
-    T_total = len(feat)
-    m = NormConfig.min_lookback
-    if T_total < m + 10 or ci < m:
+    arrays = build_stock_arrays(stock)
+    if arrays is None:
         return None
-
-    price_feat = feat[:, :4]
-    price_normed, _ = document_normalize(feat, cutoff_idx=ci)
-    idx_c, _ = tokenizer.encode(torch.from_numpy(price_normed).float().unsqueeze(0).to(device))
-    token_ids = idx_c[0].cpu().numpy()
-
-    p_mean = price_feat[:ci].mean(axis=0)
-    p_std = np.maximum(price_feat[:ci].std(axis=0), 1e-8)
-
-    vocab = tokenizer.bsq_coarse.vocab_size
-    bos_id = vocab
-    N = T_total
-    ids = [bos_id] + token_ids[:N].tolist()
-    d_l = [day[0]] + day[:N].tolist()
-    m_l = [month[0]] + month[:N].tolist()
-    y_l = [year[0]] + year[:N].tolist()
-    S = len(ids)
-    inp = torch.tensor([ids[:-1]], dtype=torch.long, device=device)
-    tids = torch.stack([
-        torch.tensor([d_l[:-1]], dtype=torch.long),
-        torch.tensor([m_l[:-1]], dtype=torch.long),
-        torch.tensor([y_l[:-1]], dtype=torch.long),
-    ], dim=-1).to(device)
-    pos = torch.arange(S - 1, device=device).unsqueeze(0)
-    mask = torch.tril(torch.ones(S - 1, S - 1, dtype=torch.bool, device=device))
-    va = torch.zeros(1, S - 1, 2, device=device)
-
+    inputs = build_gpt_eval_inputs(arrays, tokenizer, device)
     with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-        lc, lf, _ = gpt(inp, tids, pos, mask, va_values=va)
-    # lc: [1, S-1, vocab_full]. Position i predicts token at i+1 in ids.
+        lc, _, _ = gpt(inputs["inp"], inputs["tids"], inputs["pos"],
+                       inputs["mask"], va_values=inputs["va_values"])
     return {
         "logits": lc.float().cpu(),     # [1, S-1, vocab_full]
-        "token_ids": token_ids,         # [T_total]
-        "test_start": ci,
-        "test_end": T_total - 2,        # last position where logit t predicts tok t+1
-        "p_mean": p_mean,
-        "p_std": p_std,
-        "day": day, "month": month, "year": year,
-        "feat": feat,
-        "close": close,
-        "T_total": T_total,
+        "token_ids": inputs["token_ids"],
+        "test_start": inputs["test_start"],
+        "test_end": inputs["test_end"],
+        "p_mean": arrays["p_mean"],
+        "p_std": arrays["p_std"],
+        "day": arrays["day"],
+        "month": arrays["month"],
+        "year": arrays["year"],
+        "feat": arrays["feat"],
+        "close": arrays["close"],
+        "T_total": arrays["T_total"],
+        "_arrays": arrays,  # for BERT position-arrays (per-position time/va)
     }
 
 
@@ -154,59 +127,79 @@ def get_gpt_predictions_full_seq(gpt, tokenizer, stock, device):
 def get_bert_scores_for_positions(bert, stock_info, positions, tokenizer, device, mask_id, batch_size=32):
     """For each position t in `positions`, compute BERT([BOS, tok_0, ..., tok_{t-1}, MASK]).
     Returns tensor [len(positions), vocab_base] of P_BERT(.|history) at MASK.
+
+    FIXED (was buggy): per-position day/month/year used; padding mask passed to BERT
+    so that padded positions cannot attend each other (and the MASK prediction is
+    not contaminated by padding tokens).
     """
     T_total = stock_info["T_total"]
     token_ids = stock_info["token_ids"]  # [T_total] - no BOS
-    day = stock_info["day"]
-    month = stock_info["month"]
-    year = stock_info["year"]
+    arrays = stock_info["_arrays"]
 
     # Build per-position sequences, then batch by length
     per_pos = []
     for t in positions:
-        # GPT predicts token at position t+1 (i.e., token_ids[t] for logit t-1)
-        # In our convention, t is the logit position (so predicts token_ids[t])
-        # We want BERT to predict at MASK after seeing [BOS, tok_0, ..., tok_{t-1}]
-        # i.e., input length = t+1 (BOS + t history tokens + MASK)
-        # MASK is at position t (0-indexed including BOS), so input shape is [1, t+1]
-        # The MASK position is the LAST position in the input.
-        hist = token_ids[:t].tolist()  # length t
-        full_input = [1024] + hist + [mask_id]  # [BOS, history..., MASK], length t+1
-        per_pos.append((t, full_input))
+        # The MASK is the last position in the input, length t+1
+        hist = token_ids[:t].tolist()
+        # prefix length (history tokens) = t  →  BERT input length = 1 (BOS) + t + 1 (MASK)
+        per_pos.append((t, hist))
 
     # Sort by length for efficient batching
     per_pos.sort(key=lambda x: len(x[1]))
 
-    results = np.zeros((len(positions), 1024), dtype=np.float32)  # P_BERT (we'll use log-prob)
+    results = np.zeros((len(positions), 1024), dtype=np.float32)  # P_BERT
 
     for batch_start in range(0, len(per_pos), batch_size):
         batch = per_pos[batch_start:batch_start + batch_size]
-        max_len = max(len(x[1]) for x in batch)
+        max_len = max(len(x[1]) for x in batch) + 2  # +1 BOS +1 MASK
         B = len(batch)
-        # Build padded batch
-        inp = torch.full((B, max_len), 1024, dtype=torch.long, device=device)  # pad with BOS (will be ignored via mask)
+        # Build padded batch — pad with 0 (a non-special, harmless token), not BOS
+        inp = torch.zeros(B, max_len, dtype=torch.long, device=device)
         tids = torch.zeros(B, max_len, 3, dtype=torch.long, device=device)
         pos = torch.zeros(B, max_len, dtype=torch.long, device=device)
         va = torch.zeros(B, max_len, 2, device=device)
-        # Track which positions in each row are "real" (not padding)
         real_mask = torch.zeros(B, max_len, dtype=torch.bool, device=device)
 
         mask_positions = []
-        for bi, (t_orig, full_input) in enumerate(batch):
-            L = len(full_input)
-            inp[bi, :L] = torch.tensor(full_input, device=device)
-            tids[bi, :L, 0] = day[t_orig]  # day at the predicted position
-            tids[bi, :L, 1] = month[t_orig]
-            tids[bi, :L, 2] = year[t_orig]
+        for bi, (t_orig, hist) in enumerate(batch):
+            L = len(hist) + 2  # +BOS +MASK
+            # BOS at position 0
+            inp[bi, 0] = 1024
+            tids[bi, 0, 0] = int(arrays["day"][0])
+            tids[bi, 0, 1] = int(arrays["month"][0])
+            tids[bi, 0, 2] = int(arrays["year"][0])
+            # History
+            for j, tok in enumerate(hist):
+                inp[bi, 1 + j] = tok
+                tids[bi, 1 + j, 0] = int(arrays["day"][j])
+                tids[bi, 1 + j, 1] = int(arrays["month"][j])
+                tids[bi, 1 + j, 2] = int(arrays["year"][j])
+            # MASK at the last real position
+            inp[bi, L - 1] = mask_id
+            tids[bi, L - 1, 0] = int(arrays["day"][t_orig])  # date of predicted position
+            tids[bi, L - 1, 1] = int(arrays["month"][t_orig])
+            tids[bi, L - 1, 2] = int(arrays["year"][t_orig])
             pos[bi, :L] = torch.arange(L, device=device)
             real_mask[bi, :L] = True
-            # The MASK token is the LAST position in full_input
+            # VA: zero at BOS, real at history positions, real at MASK from predicted day
+            va[bi, 0] = 0
+            if L - 1 > 0:
+                va[bi, 1:L - 1] = torch.tensor(arrays["va_normed"][:L - 2], device=device)
+            # MASK at position L-1: va_normed at the predicted day
+            if t_orig < len(arrays["va_normed"]):
+                va[bi, L - 1] = torch.tensor(arrays["va_normed"][t_orig], device=device)
             mask_positions.append(L - 1)
 
-        # No padding mask for now: pad positions all see each other and BOS
-        # This is fine for evaluation since we're extracting only the MASK position
+        # Build attention mask so padded positions cannot attend or be attended.
+        # real_mask[b, i] is True for real positions. We want attention to be
+        # allowed only between real positions. Build [B, L, L] True=attend mask.
+        L = max_len
+        attn = real_mask.unsqueeze(1) & real_mask.unsqueeze(2)  # [B, L, L]
+        # Convert to boolean; SDPA expects True=attend
+        attn = attn.bool()
+
         with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-            logits = bert(inp, tids, pos, va_values=va)  # [B, max_len, 1024]
+            logits = bert(inp, tids, pos, attn_mask=attn, va_values=va)  # [B, L, 1024]
 
         for bi, mp in enumerate(mask_positions):
             results[batch_start + bi] = F.softmax(logits[bi, mp].float(), dim=-1).cpu().numpy()
@@ -215,33 +208,16 @@ def get_bert_scores_for_positions(bert, stock_info, positions, tokenizer, device
 
 
 def compute_metrics_from_predictions(stock_info, pred_tokens, log_ret_only=False):
-    """Decode predicted tokens, compute DA, MAPE, AmpRatio for one stock.
-    pred_tokens: list of predicted coarse tokens (length test_end - test_start + 1)
-    """
-    test_start = stock_info["test_start"]
-    test_end = stock_info["test_end"]
-    p_mean = stock_info["p_mean"]
-    p_std = stock_info["p_std"]
-    feat = stock_info["feat"]
-    close = stock_info["close"]
-
-    if test_end <= test_start:
-        return None
-
-    # Decode each predicted token
-    pred_arr = np.array(pred_tokens, dtype=np.int64)
-    # Replicate coarse to both levels for decode (we only use coarse)
-    pred_indices = torch.from_numpy(pred_arr).unsqueeze(0).unsqueeze(-1).expand(-1, -1, 2).contiguous()
-
-    from model.tokenizer import HierarchicalQuantizer
-    # We need the tokenizer to decode — caller should pass it
-    raise NotImplementedError("Pass tokenizer to compute_metrics_from_predictions")
+    """REMOVED — this function raised NotImplementedError and was never called.
+    The actual metric computation lives inline in main() (see alpha_results loop)."""
+    raise NotImplementedError(
+        "compute_metrics_from_predictions is dead code; see main() for the real path.")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpt_ckpt", type=str, default="checkpoints/expA_v2.pt")
-    parser.add_argument("--bert_ckpt", type=str, default="checkpoints/kronos_bert_v1.pt")
+    parser.add_argument("--gpt_ckpt", type=str, default="checkpoints/expA_v2_hpo.pt")
+    parser.add_argument("--bert_ckpt", type=str, default="checkpoints/kronos_bert_big_v1.pt")
     parser.add_argument("--tokenizer", type=str, default="checkpoints/tokenizer_v2_ohlc.pt")
     parser.add_argument("--alphas", nargs="+", type=float, default=[0.0, 0.3, 0.5, 0.7, 1.0],
                         help="alpha values: P_GPT^(1-alpha) * P_BERT^alpha (alpha=0 → GPT only, 1 → BERT only)")

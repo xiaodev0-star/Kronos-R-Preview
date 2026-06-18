@@ -301,27 +301,6 @@ def pack_stocks(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutoff_d
     sequences = []
     buf_ids, buf_d, buf_m, buf_y = [], [], [], []
 
-    def _flush():
-        if len(buf_ids) < 2:
-            return
-        ids = torch.tensor([bos_id] + buf_ids + [eos_id], dtype=torch.long)
-        d = torch.tensor([buf_d[0]] + buf_d + [buf_d[-1]], dtype=torch.long)
-        m = torch.tensor([buf_m[0]] + buf_m + [buf_m[-1]], dtype=torch.long)
-        y = torch.tensor([buf_y[0]] + buf_y + [buf_y[-1]], dtype=torch.long)
-        # boundaries for attention mask: each stock segment
-        boundaries = []
-        start = 0
-        for i, s in enumerate(encoded if False else []):
-            pass
-        # Simpler: single stock per flush with boundaries recording
-        sequences.append({
-            "input_ids": ids,
-            "boundaries": [(1, len(ids) - 1)],  # single stock segment
-            "targets": ids[1:].clone(),
-            "time_ids": torch.stack([d, m, y], dim=-1),
-            "position_ids": torch.arange(len(ids), dtype=torch.long),
-        })
-
     # Actually pack multiple stocks per sequence
     current_len = 0
     current_ids, current_d, current_m, current_y = [], [], [], []

@@ -129,24 +129,6 @@ class HierarchicalQuantizer(nn.Module):
             nn.Linear(int(hidden_dim or self.hidden_dim), int(input_dim or self.input_dim)),
         )
 
-    def _bsq_quantize_latent(self, z):
-        residual = z
-        z_q_total = torch.zeros_like(z)
-        total_loss = torch.tensor(0.0, device=z.device)
-        indices = []
-        z_q_coarse = None
-        for i, bsq in enumerate(self.bsq_quantizers):
-            b, idx, q_loss = bsq.quantize(residual)[:2] + (bsq.quantize(residual)[2],)
-            b, _, idx = bsq.quantize(residual)
-            q_loss = 0  # just quantize, no loss in inference
-            z_q = bsq.decode_proj(bsq._int_to_bits(idx, bsq.bits).to(bsq.decode_proj.weight.dtype))
-            if i == 0:
-                z_q_coarse = z_q
-            residual = residual - z_q.detach()
-            z_q_total = z_q_total + z_q
-            indices.append(idx)
-        return z_q_total, indices, z_q_coarse
-
     def forward(self, x, return_all=False):
         z = self.encoder(x)
         # Quantize

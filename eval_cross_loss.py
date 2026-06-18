@@ -34,6 +34,7 @@ from model.tokenizer import HierarchicalQuantizer
 from model.tokenizer_config import build_tokenizer_kwargs
 from model.kronos_preview import KronosPreview
 from reproducibility import set_global_seed
+from eval_helpers import build_stock_arrays, build_gpt_eval_inputs
 
 N_TEST_STOCKS = 30
 SEED = 42
@@ -94,51 +95,30 @@ def eval_1step(model, tokenizer, test_stocks, device):
     all_pred_toks = []
 
     for si, stock in enumerate(test_stocks):
-        feat = stock["features_raw"]
-        day, month, year = stock["day"], stock["month"], stock["year"]
-        close = stock["close_prices"]
-        ci = _cutoff_idx(stock)
-
-        T_total = len(feat)
-        if T_total < m + 10 or ci < m:
+        arrays = build_stock_arrays(stock)
+        if arrays is None:
             continue
+        ci = arrays["ci"]
+        T_total = arrays["T_total"]
+        m = NormConfig.min_lookback
         n_test = T_total - ci
         if n_test < 5:
             continue
 
-        price_feat = feat[:, :4]
-        # Use document_normalize (matching training pipeline)
-        # Stats from train period only (feat[:ci]), applied to full sequence
-        price_normed, _ = document_normalize(feat, cutoff_idx=ci)
-        normed = price_normed
-        idx_c, _ = tokenizer.encode(torch.from_numpy(normed).float().unsqueeze(0).to(device))
-        token_ids = idx_c[0].cpu().numpy()
-
-        # Document-level stats (fixed, not time-varying) for denormalization
-        p_mean = price_feat[:ci].mean(axis=0)  # [4]
-        p_std = np.maximum(price_feat[:ci].std(axis=0), 1e-8)  # [4]
-
-        N = T_total
-        ids = [bos_id] + token_ids[:N].tolist()
-        d_l = [day[0]] + day[:N].tolist()
-        m_l = [month[0]] + month[:N].tolist()
-        y_l = [year[0]] + year[:N].tolist()
-        S = len(ids)
-
-        inp = torch.tensor([ids[:-1]], dtype=torch.long, device=device)
-        tids = torch.stack([
-            torch.tensor([d_l[:-1]], dtype=torch.long),
-            torch.tensor([m_l[:-1]], dtype=torch.long),
-            torch.tensor([y_l[:-1]], dtype=torch.long),
-        ], dim=-1).to(device)
-        pos = torch.arange(S - 1, device=device).unsqueeze(0)
-        mask = torch.tril(torch.ones(S - 1, S - 1, dtype=torch.bool, device=device))
+        # Build GPT inputs (uses real va_values, not zeros — see eval_helpers.py)
+        with torch.no_grad():
+            inputs = build_gpt_eval_inputs(arrays, tokenizer, device)
 
         with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-            lc, lf, _ = model(inp, tids, pos, mask)
+            lc, lf, _ = model(inputs["inp"], inputs["tids"], inputs["pos"],
+                              inputs["mask"], va_values=inputs["va_values"])
 
-        test_start = ci
-        test_end = T_total - 2
+        p_mean = arrays["p_mean"]
+        p_std = arrays["p_std"]
+        feat = arrays["feat"]
+        close = arrays["close"]
+        test_start = inputs["test_start"]
+        test_end = inputs["test_end"]
         if test_end <= test_start:
             continue
         n_pred = test_end - test_start + 1
@@ -146,13 +126,8 @@ def eval_1step(model, tokenizer, test_stocks, device):
         pred_c = lc[0, test_start:test_end + 1].argmax(dim=-1)
         all_pred_toks.append(pred_c.cpu().numpy())
 
-        # Experiment A: 2-level joint argmax with lf.std guard for backward-compat
-        lf_std = lf[0, test_start:test_end + 1].float().std().item()
-        if lf_std < 0.1:
-            pred_indices = pred_c.unsqueeze(0).unsqueeze(-1).expand(-1, -1, 2).contiguous()
-        else:
-            pred_f = lf[0, test_start:test_end + 1].argmax(dim=-1)
-            pred_indices = torch.stack([pred_c, pred_f], dim=-1).unsqueeze(0)
+        # head_fine is reserved but never trained in current pipeline (always replicate coarse).
+        pred_indices = pred_c.unsqueeze(0).unsqueeze(-1).expand(-1, -1, 2).contiguous()
 
         pred_feat = tokenizer.decode_all(pred_indices)[0].cpu().numpy()
 

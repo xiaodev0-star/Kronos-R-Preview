@@ -125,6 +125,21 @@ class BatchedDataLoader:
 def main(args=None):
     set_global_seed(TrainingConfig.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # GPT standard architecture (HPO 2026-06-18 best: phase3_t000, DA 48.12% with V2).
+    # Hardcode here so that any prior mutation of ModelConfig (e.g. by train_bert.py
+    # setting dim=512 for the big BERT) cannot leak into the GPT run.
+    ModelConfig.dim = 256
+    ModelConfig.depth = 2
+    ModelConfig.heads = 4
+    ModelConfig.num_kv_heads = 1
+    ModelConfig.dropout = 0.1
+    ModelConfig.ffn_multiplier = 4
+    ModelConfig.position_encoding = "rope"
+    ModelConfig.rope_base = 10000.0
+    ModelConfig.vocab_size = 1024
+    ModelConfig.va_hidden_dim = 64
+
     tag = args.tag if args else "default"
     save_path = args.save_path if args else TrainingConfig.base_model_path
     tok_path = args.tokenizer_path if args else TrainingConfig.tokenizer_path
@@ -132,8 +147,8 @@ def main(args=None):
     ckpt_path = save_path + ".ckpt"
 
     # Config overrides from CLI
-    loss_type = args.loss if args else "ce"
-    gamma = args.gamma if args else 2.0
+    loss_type = args.loss if args else "focal"
+    gamma = args.gamma if args else 4.0
     weight_decay = args.weight_decay if args else TrainingConfig.weight_decay
     use_reasoning = args.reasoning if args else False
     reasoning_frozen = args.reasoning_frozen if args else False
@@ -141,7 +156,7 @@ def main(args=None):
     label_smoothing = args.label_smoothing if args else 0.0
     entropy_alpha = args.entropy_alpha if args else 0.0
     dropout_override = args.dropout if args else None
-    use_heteroscedastic = args.heteroscedastic if args else False
+    use_heteroscedastic = args.heteroscedastic if args else True
     het_weight = args.het_weight if args else 0.1
     use_head_fine = args.use_head_fine if args else False
     fine_weight = args.fine_weight if args else 0.5
@@ -520,44 +535,51 @@ def main(args=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Kronos-Preview training. Default: focal γ=6 + label_smoothing=0.05 (HPO best 1-Step).",
+        description="Kronos-Preview training. Default: focal γ=4 + heteroscedastic=ON (HPO 2026-06-18 best, phase3_t000: DA 48.12% with V2).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # 1-Step best (HPO v3 winner: MAPE=3.99%%)
-  python train_base.py --loss focal --gamma 6.0 --label_smoothing 0.05
+  # HPO 2026-06-18 best (phase3_t000) — DA 48.12% with V2 calibration.
+  # Just run with defaults:
+  python train_base.py
 
-  # 10-Step AR best (HPO v3: MAPE=8.48%%)
-  python train_base.py --loss focal --gamma 8.0
+  # 15-epoch / lower-dropout variant (phase4_t003) — DA 47.93% with V2, lower collapse (16.8%).
+  python train_base.py --epochs 15 --dropout 0.05
 
-  # Standard CE baseline
+  # Disable heteroscedastic head (reproduces pre-HPO behavior):
+  python train_base.py --no-heteroscedastic
+
+  # Standard CE baseline (no focal):
   python train_base.py --loss ce --weight_decay 0.001
 
-  # Reasoning model (two-stage)
+  # Reasoning model (two-stage):
   python train_base.py --loss ce --reasoning --reasoning_frozen --base_checkpoint model.pt
-  python train_base.py --loss focal --gamma 6.0 --reasoning
+  python train_base.py --loss focal --gamma 4.0 --reasoning
         """)
     parser.add_argument("--save_path", type=str, default=TrainingConfig.base_model_path)
     parser.add_argument("--tokenizer_path", type=str, default="checkpoints/tokenizer_v2_ohlc.pt")
     parser.add_argument("--epochs", type=int, default=TrainingConfig.epochs)
     parser.add_argument("--tag", type=str, default="default")
     parser.add_argument("--loss", type=str, default="focal", choices=["ce", "focal"])
-    parser.add_argument("--gamma", type=float, default=6.0)
+    parser.add_argument("--gamma", type=float, default=4.0,
+                        help="Focal loss gamma (HPO 2026-06-18 best: 4.0)")
     parser.add_argument("--weight_decay", type=float, default=TrainingConfig.weight_decay)
     parser.add_argument("--reasoning", action="store_true")
     parser.add_argument("--reasoning_frozen", action="store_true")
     parser.add_argument("--base_checkpoint", type=str, default=None,
                         help="Pre-trained base model checkpoint for reasoning model")
     parser.add_argument("--label_smoothing", type=float, default=0.0,
-                        help="Label smoothing for CE/focal loss (0.0 = disabled)")
+                        help="Label smoothing for CE/focal loss (0.0 = disabled, HPO 2026-06-18 best)")
     parser.add_argument("--dropout", type=float, default=None,
-                        help="Override ModelConfig.dropout (default: use config value 0.1)")
+                        help="Override ModelConfig.dropout (default: 0.1, HPO 2026-06-18 best)")
     parser.add_argument("--entropy_alpha", type=float, default=0.0,
                         help="Entropy regularization weight for focal loss (0.0 = disabled)")
-    parser.add_argument("--heteroscedastic", action="store_true",
-                        help="Enable heteroscedastic regression head (auxiliary NLL loss)")
+    parser.add_argument("--heteroscedastic", dest="heteroscedastic", action="store_true", default=True,
+                        help="Enable heteroscedastic regression head (default: ON, HPO 2026-06-18 best)")
+    parser.add_argument("--no-heteroscedastic", dest="heteroscedastic", action="store_false",
+                        help="Disable heteroscedastic regression head (reproduces pre-HPO behavior)")
     parser.add_argument("--het_weight", type=float, default=0.1,
-                        help="Weight for heteroscedastic NLL loss (default: 0.1)")
+                        help="Weight for heteroscedastic NLL loss (HPO 2026-06-18 best: 0.1)")
     parser.add_argument("--use_head_fine", action="store_true",
                         help="[Experiment A] Enable fine-head CE loss (activates the 2-level head_fine)")
     parser.add_argument("--fine_weight", type=float, default=0.5,
