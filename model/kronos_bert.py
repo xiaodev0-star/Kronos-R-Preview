@@ -135,7 +135,6 @@ class KronosBert(nn.Module):
       - attention is full (no causal mask) when no attn_mask is provided
       - embedding vocab is +3 (adds [MASK] special token)
       - outputs logits over the *coarse* vocabulary at every position
-        (head_fine and head_reg are optional and disabled for simplicity)
 
     Special tokens:
       BOS  = ModelConfig.vocab_size       (=1024)

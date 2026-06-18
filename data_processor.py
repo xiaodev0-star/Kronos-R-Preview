@@ -1,7 +1,7 @@
 """数据处理：CSV 加载、归一化、股票打包。
 
-v1 (legacy): rolling_normalize + 多股票打包 (6D OHLCVA)
-v2 (current): historical_normalize + 单股票独立文档 (4D OHLC token + 2D VA continuous)
+单股票独立文档 (4D OHLC token + 2D VA continuous)。
+归一化：historical Z-Score（统计量仅来自 train 数据）。
 """
 from glob import glob
 import os
@@ -14,50 +14,15 @@ from tqdm import tqdm
 
 from config import DataConfig, NormConfig
 
-# --- v1 globals (backward compat) ---
-lookback_window = NormConfig.lookback_window
-min_lookback = NormConfig.min_lookback
-
-# --- v2 globals ---
+# --- globals ---
 _price_cols = NormConfig.price_features   # ["log_ret", "log_high", "log_low", "log_open"]
 _va_cols = NormConfig.va_features         # ["log_vol", "log_amt"]
 _n_price = len(_price_cols)               # 4
 _n_va = len(_va_cols)                     # 2
 
 
-def rolling_normalize(features, window=lookback_window, min_lookback=min_lookback):
-    """Vectorized rolling z-score, no future leak. features: [T, D]"""
-    T, D = features.shape
-    cs = np.cumsum(features, axis=0)
-    cs2 = np.cumsum(features ** 2, axis=0)
-
-    idx = np.arange(T)
-    starts = np.maximum(idx - window + 1, 0)
-    counts = (idx - starts + 1).astype(np.float32)
-
-    shifted = np.zeros_like(cs)
-    shifted[1:] = cs[:-1]
-    shifted2 = np.zeros_like(cs2)
-    shifted2[1:] = cs2[:-1]
-
-    mask = (starts > 0).astype(np.float32)[:, None]
-    win_sum = cs - shifted * mask
-    win_sum2 = cs2 - shifted2 * mask
-
-    means = win_sum / counts[:, None]
-    var = win_sum2 / counts[:, None] - means ** 2
-    stds = np.sqrt(np.maximum(var, 1e-08))
-
-    normed = np.where(
-        counts[:, None] >= min_lookback,
-        (features - means) / stds,
-        0.0,
-    )
-    return normed.astype(np.float32)
-
-
 # ============================================================================
-# v2: Per-stock document-level normalization
+# Per-stock document-level normalization
 # ============================================================================
 
 def document_normalize(features_raw, cutoff_idx=None):
@@ -182,21 +147,6 @@ def split_stocks(stocks, cutoff_date=DataConfig.cutoff_date, train_ratio=DataCon
     return train, val, test
 
 
-def get_tokenizer_features(stocks, window=lookback_window, cutoff_date=None):
-    """对每只股票做滚动归一化，拼接为 [N_total, 6]。
-    若 cutoff_date 提供，仅使用 ≤ cutoff 的数据（防止 tokenizer 数据泄漏）。"""
-    parts = []
-    for s in tqdm(stocks, desc="Rolling normalize"):
-        feat = s["features_raw"]
-        if cutoff_date is not None:
-            ci = _stock_cutoff_idx(s, cutoff_date)
-            feat = feat[:ci]
-        if len(feat) < min_lookback + 5:
-            continue
-        parts.append(rolling_normalize(feat, window))
-    return np.concatenate(parts, axis=0)
-
-
 def get_tokenizer_features_v2(stocks, cutoff_date=None):
     """v2: Per-stock historical normalize (4D OHLC only). Returns [N_total, 4]."""
     parts = []
@@ -229,192 +179,19 @@ def _tokenizer_hash(tokenizer):
     return hashlib.md5(buf).hexdigest()[:16]
 
 
-def _encode_and_cache(stock, tokenizer, mode, cutoff_date, cache_dir, tok_hash=None):
-    """Tokenize one stock and save to cache. Returns encoded dict."""
-    feat = stock["features_raw"]
-    day, month, year = stock["day"], stock["month"], stock["year"]
-    ci = _stock_cutoff_idx(stock, cutoff_date) if mode == "train" else len(feat)
-    if ci < min_lookback + 5:
-        return None
-    normed = rolling_normalize(feat[:ci])
-    device = next(tokenizer.parameters()).device
-    with torch.no_grad():
-        token_ids, _ = tokenizer.encode(
-            torch.from_numpy(normed).float().unsqueeze(0).to(device))
-    token_ids = token_ids[0].cpu().numpy()
-    save_dict = {"token_ids": token_ids, "day": day[:ci], "month": month[:ci], "year": year[:ci]}
-    if tok_hash:
-        save_dict["_tok_hash"] = tok_hash
-    np.savez_compressed(_token_cache_path(stock["symbol"], cache_dir), **save_dict)
-    return {"token_ids": token_ids, "day": day[:ci], "month": month[:ci], "year": year[:ci]}
-
-
-def _load_cached_or_encode(stock, tokenizer, mode, cutoff_date, cache_dir, tok_hash=None):
-    """Load tokenized sequence from cache, or encode and cache if missing."""
-    path = _token_cache_path(stock["symbol"], cache_dir)
-    if os.path.exists(path):
-        data = np.load(path, allow_pickle=True)
-        # Validate tokenizer hash to detect stale cache
-        cached_hash = str(data["_tok_hash"]) if "_tok_hash" in data else None
-        if tok_hash and cached_hash != tok_hash:
-            return _encode_and_cache(stock, tokenizer, mode, cutoff_date, cache_dir, tok_hash)
-        return {
-            "token_ids": data["token_ids"],
-            "day": data["day"],
-            "month": data["month"],
-            "year": data["year"],
-        }
-    return _encode_and_cache(stock, tokenizer, mode, cutoff_date, cache_dir, tok_hash)
-
-
-def pack_stocks(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutoff_date,
-                context_len=DataConfig.context_len, cache_dir=None):
-    """打包多股票为固定长度序列。返回 list[dict]。支持 token 缓存。"""
-    vocab = tokenizer.bsq_coarse.vocab_size
-    bos_id, eos_id = vocab, vocab + 1
-    device = next(tokenizer.parameters()).device
-
-    # Compute tokenizer hash for cache validation
-    tok_hash = _tokenizer_hash(tokenizer) if cache_dir else None
-
-    # Pre-tokenize with cache if provided
-    encoded = []
-    for s in tqdm(stocks, desc="Encoding (" + mode + ")"):
-        if cache_dir:
-            enc = _load_cached_or_encode(s, tokenizer, mode, cutoff_date, cache_dir, tok_hash)
-        else:
-            feat = s["features_raw"]
-            day, month, year = s["day"], s["month"], s["year"]
-            ci = _stock_cutoff_idx(s, cutoff_date) if mode == "train" else len(feat)
-            if ci < min_lookback + 5:
-                continue
-            normed = rolling_normalize(feat[:ci])
-            with torch.no_grad():
-                token_ids, _ = tokenizer.encode(
-                    torch.from_numpy(normed).float().unsqueeze(0).to(device))
-            token_ids = token_ids[0].cpu().numpy()
-            enc = {"token_ids": token_ids, "day": day[:ci], "month": month[:ci], "year": year[:ci]}
-        if enc is None or len(enc["token_ids"]) < min_lookback + 5:
-            continue
-        encoded.append(enc)
-
-    sequences = []
-    buf_ids, buf_d, buf_m, buf_y = [], [], [], []
-
-    # Actually pack multiple stocks per sequence
-    current_len = 0
-    current_ids, current_d, current_m, current_y = [], [], [], []
-    stock_boundaries = []
-
-    for enc in encoded:
-        slen = len(enc["token_ids"]) + 2  # +BOS +EOS
-        if current_len + slen > context_len and current_len > 0:
-            # Flush current
-            ids = torch.tensor([bos_id] + current_ids + [eos_id], dtype=torch.long)
-            d = torch.tensor([current_d[0]] + current_d + [current_d[-1]], dtype=torch.long)
-            m = torch.tensor([current_m[0]] + current_m + [current_m[-1]], dtype=torch.long)
-            y = torch.tensor([current_y[0]] + current_y + [current_y[-1]], dtype=torch.long)
-            sequences.append({
-                "input_ids": ids,
-                "boundaries": stock_boundaries,
-                "targets": ids[1:].clone(),
-                "time_ids": torch.stack([d, m, y], dim=-1),
-                "position_ids": torch.arange(len(ids), dtype=torch.long),
-            })
-            current_ids, current_d, current_m, current_y = [], [], [], []
-            stock_boundaries = []
-            current_len = 0
-
-        start = current_len + 1  # +1 for BOS
-        current_ids.extend(enc["token_ids"].tolist())
-        current_d.extend(enc["day"].tolist())
-        current_m.extend(enc["month"].tolist())
-        current_y.extend(enc["year"].tolist())
-        end = current_len + len(enc["token_ids"]) + 1
-        stock_boundaries.append((start, end))
-        current_len += len(enc["token_ids"])
-
-    # Flush remaining
-    if len(current_ids) >= 2:
-        ids = torch.tensor([bos_id] + current_ids + [eos_id], dtype=torch.long)
-        d = torch.tensor([current_d[0]] + current_d + [current_d[-1]], dtype=torch.long)
-        m = torch.tensor([current_m[0]] + current_m + [current_m[-1]], dtype=torch.long)
-        y = torch.tensor([current_y[0]] + current_y + [current_y[-1]], dtype=torch.long)
-        sequences.append({
-            "input_ids": ids,
-            "boundaries": stock_boundaries,
-            "targets": ids[1:].clone(),
-            "time_ids": torch.stack([d, m, y], dim=-1),
-            "position_ids": torch.arange(len(ids), dtype=torch.long),
-        })
-
-    return sequences
-
-
-def _build_segment_mask(S, boundaries):
-    """Build causal attention mask with cross-stock isolation.
-
-    Each stock segment can attend to:
-      - BOS token (position 0)
-      - All earlier positions within the same segment (causal)
-    Cross-stock attention is blocked.
-    """
-    mask = torch.zeros(S, S, dtype=torch.bool)
-    # BOS is visible to everyone
-    mask[:, 0] = True
-    for start, end in boundaries:
-        # Within segment: causal (each pos attends to [start..pos])
-        for pos in range(start, end):
-            mask[pos, start:pos + 1] = True
-    return mask
-
-
-class PackedDataset(Dataset):
-    def __init__(self, sequences):
-        self.sequences = sequences
-
-    def __len__(self):
-        return len(self.sequences)
-
-    def __getitem__(self, idx):
-        seq = self.sequences[idx]
-        S = seq["input_ids"].shape[0]
-        mask = _build_segment_mask(S, seq["boundaries"])
-        return (
-            seq["input_ids"],
-            seq["targets"],
-            seq["time_ids"],
-            seq["position_ids"],
-            mask,
-        )
-
-
-def make_dataloader(sequences, batch_size=1, shuffle=True):
-    def collate(batch):
-        # With batch_size=1, return tensors directly (no batch dim needed)
-        return batch[0]
-    return DataLoader(
-        PackedDataset(sequences),
-        batch_size=batch_size,
-        shuffle=shuffle,
-        collate_fn=collate,
-        pin_memory=True,
-    )
-
-
 # ============================================================================
 # v2: Single-stock document packing (OHLC token + VA continuous)
 # ============================================================================
 
 def _build_causal_mask(S, device="cpu"):
-    """Simple causal mask for a single-stock sequence.
+    """Causal mask for a single-stock sequence.
 
     Returns [S, S] bool: True = attend, False = block.
-    Position 0 (BOS) is visible to all; causal within [1..S).
+    Lower-triangular: position i attends to positions [0..i].
+    Position 0 (BOS) is visible to all by construction (it is the first column
+    of a lower-triangular matrix, which is entirely True).
     """
-    mask = torch.ones(S, S, dtype=torch.bool, device=device).tril()
-    mask[:, 0] = True  # BOS visible to all
-    return mask
+    return torch.ones(S, S, dtype=torch.bool, device=device).tril()
 
 
 def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutoff_date,
@@ -451,7 +228,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
             if os.path.exists(cache_path):
                 data = np.load(cache_path, allow_pickle=True)
                 cached_hash = str(data["_tok_hash"]) if "_tok_hash" in data else None
-                has_required = "reg_target" in data and "va_values" in data and "idx_fine" in data
+                has_required = "reg_target" in data and "va_values" in data
                 if tok_hash and cached_hash != tok_hash:
                     data.close()
                     os.remove(cache_path)
@@ -462,7 +239,6 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
                 else:
                     enc = {
                         "token_ids": data["token_ids"],
-                        "idx_fine": data["idx_fine"],
                         "day": data["day"], "month": data["month"], "year": data["year"],
                         "va_values": data["va_values"],
                         "reg_target": data["reg_target"],
@@ -473,14 +249,12 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
                     continue
 
         with torch.no_grad():
-            token_ids, idx_fine = tokenizer.encode(
+            token_ids, _ = tokenizer.encode(
                 torch.from_numpy(price_normed).float().unsqueeze(0).to(device))
         token_ids = token_ids[0].cpu().numpy()
-        idx_fine = idx_fine[0].cpu().numpy()
 
         enc = {
             "token_ids": token_ids,
-            "idx_fine": idx_fine,
             "day": day[:ci], "month": month[:ci], "year": year[:ci],
             "va_values": va_normed,
             "reg_target": reg_target,
@@ -489,7 +263,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
         if cache_dir:
             np.savez_compressed(
                 _token_cache_path(s["symbol"] + "_v2", cache_dir),
-                token_ids=token_ids, idx_fine=idx_fine,
+                token_ids=token_ids,
                 day=day[:ci], month=month[:ci], year=year[:ci],
                 va_values=va_normed, reg_target=reg_target, _tok_hash=tok_hash or "",
             )
@@ -503,14 +277,11 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
     sequences = []
     for enc in encoded:
         ids_list = enc["token_ids"].tolist()
-        ft_list = enc["idx_fine"].tolist()
         va_list = enc["va_values"].tolist()
         rt_list = enc["reg_target"].tolist()
         d_list, m_list, y_list = enc["day"].tolist(), enc["month"].tolist(), enc["year"].tolist()
 
         ids = torch.tensor([bos_id] + ids_list + [eos_id], dtype=torch.long)
-        # Fine targets: -100 sentinel at BOS/EOS so CE loss can ignore them
-        fine_ids = torch.tensor([-100] + ft_list + [-100], dtype=torch.long)
         d = torch.tensor([d_list[0]] + d_list + [d_list[-1]], dtype=torch.long)
         m = torch.tensor([m_list[0]] + m_list + [m_list[-1]], dtype=torch.long)
         y = torch.tensor([y_list[0]] + y_list + [y_list[-1]], dtype=torch.long)
@@ -522,7 +293,6 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
         # Truncate long sequences from the beginning (keep most recent data)
         if max_seq_len > 0 and len(ids) > max_seq_len:
             ids = torch.cat([ids[:1], ids[-(max_seq_len-1):]])  # BOS + last max_seq_len-1
-            fine_ids = torch.cat([fine_ids[:1], fine_ids[-(max_seq_len-1):]])
             d = torch.cat([d[:1], d[-(max_seq_len-1):]])
             m = torch.cat([m[:1], m[-(max_seq_len-1):]])
             y = torch.cat([y[:1], y[-(max_seq_len-1):]])
@@ -536,14 +306,13 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
             "position_ids": torch.arange(len(ids), dtype=torch.long),
             "va_values": va,
             "reg_targets": reg_targets,
-            "fine_targets": fine_ids,
         })
 
     return sequences
 
 
 class PackedDatasetV2(Dataset):
-    """v2 Dataset: returns (input_ids, targets, time_ids, position_ids, mask, va_values)."""
+    """Dataset: returns (input_ids, targets, time_ids, position_ids, mask, va_values, reg_targets)."""
 
     def __init__(self, sequences):
         self.sequences = sequences
@@ -555,27 +324,6 @@ class PackedDatasetV2(Dataset):
         seq = self.sequences[idx]
         S = seq["input_ids"].shape[0]
         mask = _build_causal_mask(S)
-        if "reg_targets" in seq and "fine_targets" in seq:
-            return (
-                seq["input_ids"],
-                seq["targets"],
-                seq["time_ids"],
-                seq["position_ids"],
-                mask,
-                seq["va_values"],
-                seq["reg_targets"],
-                seq["fine_targets"],
-            )
-        if "reg_targets" in seq:
-            return (
-                seq["input_ids"],
-                seq["targets"],
-                seq["time_ids"],
-                seq["position_ids"],
-                mask,
-                seq["va_values"],
-                seq["reg_targets"],
-            )
         return (
             seq["input_ids"],
             seq["targets"],
@@ -583,6 +331,7 @@ class PackedDatasetV2(Dataset):
             seq["position_ids"],
             mask,
             seq["va_values"],
+            seq["reg_targets"],
         )
 
 

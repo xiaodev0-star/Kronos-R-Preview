@@ -43,69 +43,19 @@ sys.path.insert(0, os.getcwd())
 import torch
 import torch.nn.functional as F
 import numpy as np
-import pandas as pd
-from glob import glob
 
-from config import DataConfig, NormConfig, TrainingConfig
-from data_processor import load_stocks, split_stocks, document_normalize, _stock_cutoff_idx
-from model.tokenizer import HierarchicalQuantizer
-from model.tokenizer_config import build_tokenizer_kwargs
-from model.kronos_preview import KronosPreview
-from model.kronos_bert import KronosBert
+from data_processor import load_stocks, split_stocks
 from reproducibility import set_global_seed
-from eval_helpers import build_stock_arrays, build_gpt_eval_inputs, build_bert_position_arrays, BOS_ID, MASK_ID, VOCAB_BASE
+from eval_helpers import (
+    build_stock_arrays, build_gpt_eval_inputs, build_bert_position_arrays,
+    BOS_ID, EOS_ID, MASK_ID, VOCAB_BASE,
+    load_tokenizer, load_gpt, load_bert, attach_close_prices, _cutoff_idx,
+)
 
 N_TEST_STOCKS = 30
 SEED = 42
 AMP_DTYPE = torch.bfloat16
-BOS_ID = 1024
-EOS_ID = 1025
-MASK_ID = 1026
-VOCAB_BASE = 1024
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-
-def load_tokenizer(path, device):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    tok = HierarchicalQuantizer(**build_tokenizer_kwargs(ckpt.get("config", {})))
-    tok.load_state_dict(ckpt["model_state_dict"])
-    tok.to(device).eval()
-    for p in tok.parameters():
-        p.requires_grad_(False)
-    return tok
-
-
-def load_gpt(path, device):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model = KronosPreview().to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    model.eval()
-    return model
-
-
-def load_bert(path, device):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    # Read config from checkpoint to support different model sizes
-    cfg_dict = ckpt.get("config", {})
-    from config import ModelConfig as _MC
-    class _Cfg:
-        pass
-    cfg = _Cfg()
-    for attr in dir(_MC):
-        if attr.startswith("_"):
-            continue
-        setattr(cfg, attr, getattr(_MC, attr))
-    for k, v in cfg_dict.items():
-        setattr(cfg, k, v)
-    model = KronosBert(cfg=cfg).to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    model.eval()
-    return model
-
-
-def _cutoff_idx(stock):
-    return int(np.searchsorted(stock["dates_dt"],
-                               np.datetime64(pd.Timestamp(DataConfig.cutoff_date)), side="left"))
 
 
 @torch.no_grad()
@@ -118,8 +68,8 @@ def get_gpt_full_seq_logits(gpt, tokenizer, stock, device):
         return None
     inputs = build_gpt_eval_inputs(arrays, tokenizer, device)
     with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-        lc, _, _ = gpt(inputs["inp"], inputs["tids"], inputs["pos"],
-                       inputs["mask"], va_values=inputs["va_values"])
+        lc, _ = gpt(inputs["inp"], inputs["tids"], inputs["pos"],
+                    inputs["mask"], va_values=inputs["va_values"])
     return {
         "logits": lc.float().cpu(),  # [1, T, vocab_full]
         "token_ids": inputs["token_ids"],
@@ -136,21 +86,22 @@ def get_gpt_full_seq_logits(gpt, tokenizer, stock, device):
 
 
 @torch.no_grad()
-def bert_validate_candidates(bert, token_ids, candidates, mask_pos, day, month, year,
-                              p_value, device, batch_size=64, arrays=None):
+def bert_validate_candidates(bert, token_ids, candidates, mask_positions, p_value, device, arrays):
     """Run BERT validation for one test position p against K candidates.
 
-    FIXED (was buggy): per-position day/month/year used (each input position gets
-    its own date, not the predicted-position's date copied to all).
+    For each candidate y_k, build the BERT input [BOS, tok_0, ..., MASK(s), ..., y_k]
+    and read P_BERT(original_token | context_with_y_k) at each masked position.
+    Returns scores [K] = mean over masked positions of the probability assigned to
+    the original (ground-truth) token at each mask.
+
     `arrays` is the dict returned by build_stock_arrays and carries the per-position
-    VA values; pass it through to the BERT forward.
+    VA values / dates; pass it through to build_bert_position_arrays.
     """
     K = len(candidates)
-    # Build the K candidate-augmented inputs using the shared helper.
     inputs = []
     for cand in candidates:
-        ba = build_bert_position_arrays(arrays, p_value, cand, [mask_pos],
-                                         token_ids=token_ids)
+        ba = build_bert_position_arrays(arrays, p_value, cand, mask_positions,
+                                        token_ids=token_ids)
         inputs.append({
             "inp": ba["inp"].to(device),
             "tids": ba["tids"].to(device),
@@ -175,57 +126,14 @@ def bert_validate_candidates(bert, token_ids, candidates, mask_pos, day, month, 
         logits = bert(inp_t, tids, pos, va_values=va)  # [B, max_len, vocab_base]
 
     scores = np.zeros(K, dtype=np.float32)
-    for bi in range(B):
-        probs = F.softmax(logits[bi, mask_pos].float(), dim=-1).cpu().numpy()  # [vocab_base]
-        original_token = int(token_ids[mask_pos - 1])
-        scores[bi] = probs[original_token]
-
-    return scores
-
-
-@torch.no_grad()
-def bert_validate_candidates_multi_mask(bert, token_ids, candidates, mask_positions,
-                                          day, month, year, p_value, device, arrays=None):
-    """Variant: mask MULTIPLE positions, return mean score across masked positions.
-    FIXED (was buggy): per-position dates used via build_bert_position_arrays.
-    """
-    K = len(candidates)
-    inputs = []
-    for cand in candidates:
-        ba = build_bert_position_arrays(arrays, p_value, cand, mask_positions,
-                                         token_ids=token_ids)
-        inputs.append({
-            "inp": ba["inp"].to(device),
-            "tids": ba["tids"].to(device),
-            "pos": ba["pos"].to(device),
-            "va_values": ba["va_values"].to(device),
-            "S": ba["S"],
-        })
-    max_len = max(it["S"] for it in inputs)
-    B = K
-    inp_t = torch.zeros(B, max_len, dtype=torch.long, device=device)
-    tids = torch.zeros(B, max_len, 3, dtype=torch.long, device=device)
-    pos = torch.zeros(B, max_len, dtype=torch.long, device=device)
-    va = torch.zeros(B, max_len, 2, device=device)
-    for bi, it in enumerate(inputs):
-        L = it["S"]
-        inp_t[bi, :L] = it["inp"][0]
-        tids[bi, :L] = it["tids"][0]
-        pos[bi, :L] = it["pos"][0]
-        va[bi, :L] = it["va_values"][0]
-
-    with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-        logits = bert(inp_t, tids, pos, va_values=va)
-
-    scores = np.zeros(K, dtype=np.float32)
+    n_masks = len(mask_positions)
     for bi in range(B):
         total = 0.0
         for mp in mask_positions:
             probs = F.softmax(logits[bi, mp].float(), dim=-1).cpu().numpy()
             original_token = int(token_ids[mp - 1])
             total += probs[original_token]
-        scores[bi] = total / len(mask_positions)
-
+        scores[bi] = total / n_masks
     return scores
 
 
@@ -275,21 +183,7 @@ def main():
     print("Loading test stocks ...")
     stocks = load_stocks(max_stocks=0)
     _, _, test_stocks_all = split_stocks(stocks)
-
-    csv_map = {os.path.basename(f).split(".")[0]: f for f in sorted(glob("dataset/*.csv"))}
-    for s in test_stocks_all:
-        fpath = csv_map.get(s["symbol"])
-        if fpath:
-            df = pd.read_csv(fpath, usecols=["date", "close"])
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = df.dropna(subset=["date", "close"]).sort_values("date")
-            prev = df["close"].shift(1)
-            df["log_ret"] = np.log(df["close"] / prev).replace([np.inf, -np.inf], np.nan)
-            df = df.dropna().reset_index(drop=True)
-            s["close_prices"] = df["close"].values.astype(np.float64)
-        else:
-            lr = s["features_raw"][:, 0]
-            s["close_prices"] = np.exp(np.cumsum(lr)).astype(np.float64)
+    attach_close_prices(test_stocks_all)
 
     rng = np.random.RandomState(SEED)
     indices = rng.choice(len(test_stocks_all), min(args.n_stocks, len(test_stocks_all)), replace=False)
@@ -320,9 +214,6 @@ def main():
             test_end = test_start + args.max_test_pos - 1
 
         token_ids = info["token_ids"]
-        day = info["day"]
-        month = info["month"]
-        year = info["year"]
         T_total = info["T_total"]
         p_mean = info["p_mean"]
         p_std = info["p_std"]
@@ -350,31 +241,19 @@ def main():
                 # Middle of history (not including BOS)
                 mid = max(1, p // 2)
                 mask_positions = [mid]
-            elif args.mask_strategy == "random_k":
+            else:
+                # random_k / all_history: sample n_masks random positions in history (excl. BOS)
                 rng_local = np.random.RandomState(p)  # deterministic per position
                 candidates_for_mask = list(range(1, p + 1))
                 if len(candidates_for_mask) > args.n_masks:
-                    mask_positions = sorted(rng_local.choice(candidates_for_mask, args.n_masks, replace=False).tolist())
-                else:
-                    mask_positions = candidates_for_mask
-            elif args.mask_strategy == "all_history":
-                # Sample n_masks random positions in history (excluding BOS)
-                rng_local = np.random.RandomState(p)
-                candidates_for_mask = list(range(1, p + 1))
-                if len(candidates_for_mask) > args.n_masks:
-                    mask_positions = sorted(rng_local.choice(candidates_for_mask, args.n_masks, replace=False).tolist())
+                    mask_positions = sorted(
+                        rng_local.choice(candidates_for_mask, args.n_masks, replace=False).tolist())
                 else:
                     mask_positions = candidates_for_mask
 
             # Get BERT validation scores for each candidate
-            if len(mask_positions) == 1:
-                bert_scores = bert_validate_candidates(
-                    bert, token_ids, candidates, mask_positions[0],
-                    day, month, year, p, device, arrays=arrays)
-            else:
-                bert_scores = bert_validate_candidates_multi_mask(
-                    bert, token_ids, candidates, mask_positions,
-                    day, month, year, p, device, arrays=arrays)
+            bert_scores = bert_validate_candidates(
+                bert, token_ids, candidates, mask_positions, p, device, arrays=arrays)
 
             # Combine scores
             if args.combine == "product":

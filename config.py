@@ -4,16 +4,13 @@ import json
 
 
 class NormConfig:
-    # --- v1: rolling window normalize (deprecated, kept for backward compat) ---
-    lookback_window: int = 252
-    min_lookback: int = 20
-
-    # --- v2: per-stock historical normalize ---
+    # --- per-stock historical normalize ---
     # Price features (OHLC): historical Z-Score (stats from full train history)
     # Volume/Amount: log1p → first-day baseline → Z-Score
     price_features: list = None   # set below after class
     va_features: list = None      # set below after class
     # Minimum days of history required for a stock to be included
+    min_lookback: int = 20
     min_doc_length: int = 30
 
 
@@ -27,15 +24,14 @@ class DataConfig:
     context_len: int = 8192
     train_ratio: float = 0.875
     max_stocks: int = 0          # 0 = all
-    feature_cols: list = None    # set below after class (backward compat)
+    # RAW feature layout (6 columns) loaded by `load_stocks`.
+    # The pipeline tokenizes only the first 4 columns (OHLC) — see
+    # TokenizerConfig.input_dim = 4 below — and feeds the last 2 columns (log_vol,
+    # log_amt) to the model as continuous VA embeddings (no quantization).
+    feature_cols: list = None    # set below after class
     random_seed: int = 42
 
 
-# v1: 6D features (deprecated, kept for backward compat).
-# Note: this is the RAW feature layout used by `load_stocks` (6 columns).
-# The current pipeline (v2) tokenizes only the first 4 columns (OHLC) — see
-# TokenizerConfig.input_dim = 4 below — and feeds the last 2 columns (log_vol,
-# log_amt) to the model as continuous VA embeddings (no quantization).
 DataConfig.feature_cols = [
     "log_ret", "log_high", "log_low", "log_open", "log_vol", "log_amt",
 ]

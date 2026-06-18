@@ -149,7 +149,6 @@ class KronosPreview(nn.Module):
         ])
         self.norm = RMSNorm(cfg.dim)
         self.head_coarse = nn.Linear(cfg.dim, vocab_full, bias=True)
-        self.head_fine = nn.Linear(cfg.dim, vocab_full, bias=True)  # Reserved: 2-level residual (unused in current training)
         # Heteroscedastic regression head: MLP -> (mean, log_var)
         self.head_reg = nn.Sequential(
             nn.Linear(cfg.dim, cfg.dim, bias=True),
@@ -200,12 +199,11 @@ class KronosPreview(nn.Module):
                 x = block(x, sin, cos, attn_mask)
 
         x = self.norm(x)
-        logits_coarse = self.head_coarse(x)
-        logits_fine = self.head_fine(x)
+        logits = self.head_coarse(x)
 
         loss = None
         if targets is not None:
-            shift_logits = logits_coarse[:, :-1, :].contiguous()
+            shift_logits = logits[:, :-1, :].contiguous()
             shift_targets = targets.contiguous()
             if (shift_targets != -100).any():
                 loss = F.cross_entropy(
@@ -215,8 +213,6 @@ class KronosPreview(nn.Module):
                 )
 
         # Heteroscedastic regression (float32 for numerical stability)
-        reg_pred = None
-        het_loss = None
         if reg_targets is not None:
             with torch.amp.autocast("cuda", enabled=False):
                 shift_hidden = x[:, :-1, :].float().contiguous()  # [B, S-1, dim]
@@ -227,14 +223,13 @@ class KronosPreview(nn.Module):
                     shift_reg_targets.reshape(-1),
                     ignore_val=-999.0,
                 )
+            if no_batch:
+                logits = logits.squeeze(0)
+            return logits, loss, reg_pred, het_loss
 
         if no_batch:
-            logits_coarse = logits_coarse.squeeze(0)
-            logits_fine = logits_fine.squeeze(0)
-
-        if reg_targets is not None:
-            return logits_coarse, logits_fine, loss, reg_pred, het_loss
-        return logits_coarse, logits_fine, loss
+            logits = logits.squeeze(0)
+        return logits, loss
 
 
 class CausalReasoningBlock(nn.Module):
@@ -316,20 +311,17 @@ class KronosPreviewWithReasoning(KronosPreview):
             x = rblock(x, memory)
 
         x = self.norm(x)
-        logits_coarse = self.head_coarse(x)
-        logits_fine = self.head_fine(x)
+        logits = self.head_coarse(x)
 
         loss = None
         if targets is not None:
-            shift_logits = logits_coarse[:, :-1, :].contiguous()
+            shift_logits = logits[:, :-1, :].contiguous()
             shift_targets = targets.contiguous()
             if (shift_targets != -100).any():
                 loss = F.cross_entropy(
                     shift_logits.view(-1, shift_logits.size(-1)),
                     shift_targets.view(-1), ignore_index=-100)
 
-        reg_pred = None
-        het_loss = None
         if reg_targets is not None:
             with torch.amp.autocast("cuda", enabled=False):
                 shift_hidden = x[:, :-1, :].float().contiguous()
@@ -340,11 +332,10 @@ class KronosPreviewWithReasoning(KronosPreview):
                     shift_reg_targets.reshape(-1),
                     ignore_val=-999.0,
                 )
+            if no_batch:
+                logits = logits.squeeze(0)
+            return logits, loss, reg_pred, het_loss
 
         if no_batch:
-            logits_coarse = logits_coarse.squeeze(0)
-            logits_fine = logits_fine.squeeze(0)
-
-        if reg_targets is not None:
-            return logits_coarse, logits_fine, loss, reg_pred, het_loss
-        return logits_coarse, logits_fine, loss
+            logits = logits.squeeze(0)
+        return logits, loss

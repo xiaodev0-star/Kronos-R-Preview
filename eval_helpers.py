@@ -1,6 +1,7 @@
 """Shared evaluation helpers.
 
-Centralizes the (previously duplicated) GPT forward path used by:
+Centralizes the (previously duplicated) GPT/BERT forward path and model loading
+used by all eval scripts:
   - eval_batch_1step.py
   - eval_cross_loss.py
   - eval_bert_calibration.py
@@ -14,18 +15,84 @@ The previous copies had two bugs that biased the eval distribution vs training:
 This module fixes both. All eval scripts should import `build_gpt_eval_inputs` and
 `build_bert_eval_inputs` from here.
 """
+import os
+from glob import glob
+
 import numpy as np
 import pandas as pd
 import torch
 
 from config import DataConfig, NormConfig
 from data_processor import document_normalize, _stock_cutoff_idx
+from model.tokenizer import HierarchicalQuantizer
+from model.tokenizer_config import build_tokenizer_kwargs
+from model.kronos_preview import KronosPreview
+from model.kronos_bert import KronosBert
 
 BOS_ID = 1024
 EOS_ID = 1025
 MASK_ID = 1026
 VOCAB_BASE = 1024
-AMP_DTYPE = torch.bfloat16
+
+
+def load_tokenizer(path, device):
+    """Load a frozen BSQ tokenizer for evaluation."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    tok = HierarchicalQuantizer(**build_tokenizer_kwargs(ckpt.get("config", {})))
+    tok.load_state_dict(ckpt["model_state_dict"])
+    tok.to(device).eval()
+    for p in tok.parameters():
+        p.requires_grad_(False)
+    return tok
+
+
+def load_gpt(path, device):
+    """Load a KronosPreview GPT model for evaluation."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    model = KronosPreview().to(device)
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    model.eval()
+    return model
+
+
+def load_bert(path, device):
+    """Load a KronosBert calibrator for evaluation (reads size config from ckpt)."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    cfg_dict = ckpt.get("config", {})
+    from config import ModelConfig as _MC
+
+    class _Cfg:
+        pass
+
+    cfg = _Cfg()
+    for attr in dir(_MC):
+        if attr.startswith("_"):
+            continue
+        setattr(cfg, attr, getattr(_MC, attr))
+    for k, v in cfg_dict.items():
+        setattr(cfg, k, v)
+    model = KronosBert(cfg=cfg).to(device)
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    model.eval()
+    return model
+
+
+def attach_close_prices(test_stocks):
+    """Attach `close_prices` [T] float64 to each stock by re-reading its CSV.
+
+    Falls back to exp(cumsum(log_ret)) when the CSV is unavailable.
+    """
+    csv_map = {os.path.basename(f).split(".")[0]: f for f in sorted(glob("dataset/*.csv"))}
+    for s in test_stocks:
+        fpath = csv_map.get(s["symbol"])
+        if fpath:
+            df = pd.read_csv(fpath, usecols=["date", "close"])
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date", "close"]).sort_values("date")
+            s["close_prices"] = df["close"].values.astype(np.float64)
+        else:
+            lr = s["features_raw"][:, 0]
+            s["close_prices"] = np.exp(np.cumsum(lr)).astype(np.float64)
 
 
 def _cutoff_idx(stock):

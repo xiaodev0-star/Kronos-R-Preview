@@ -159,13 +159,8 @@ def main(args=None):
 
         pbar = tqdm(train_loader, desc=f"[{tag}] Epoch {epoch+1}/{epochs}")
         for bi, batch in enumerate(pbar):
-            # v2 dataloader returns 6/7/8-tuple depending on cache contents
-            if len(batch) == 8:
-                inp, tgt, tid, pos, mask, va, _, _ = batch
-            elif len(batch) == 7:
-                inp, tgt, tid, pos, mask, va, _ = batch
-            else:
-                inp, tgt, tid, pos, mask, va = batch
+            # dataloader returns 7-tuple (input_ids, targets, time_ids, pos, mask, va, reg_targets)
+            inp, tgt, tid, pos, mask, va, _ = batch
             inp = inp.to(device, non_blocking=True)
             tid = tid.to(device, non_blocking=True)
             pos = pos.to(device, non_blocking=True)
@@ -228,12 +223,7 @@ def main(args=None):
         vaccs = []
         with torch.inference_mode():
             for batch in val_loader:
-                if len(batch) == 8:
-                    inp, tgt, tid, pos, mask, va, _, _ = batch
-                elif len(batch) == 7:
-                    inp, tgt, tid, pos, mask, va, _ = batch
-                else:
-                    inp, tgt, tid, pos, mask, va = batch
+                inp, tgt, tid, pos, mask, va, _ = batch
                 inp = inp.to(device)
                 tid = tid.to(device)
                 pos = pos.to(device)

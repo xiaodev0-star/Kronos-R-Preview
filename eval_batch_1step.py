@@ -12,62 +12,20 @@ sys.path.insert(0, os.getcwd())
 
 import torch
 import numpy as np
-import pandas as pd
 from glob import glob
 
-from config import DataConfig, NormConfig, TrainingConfig
-from data_processor import load_stocks, split_stocks, document_normalize, _stock_cutoff_idx, stratified_split_stocks
-from model.tokenizer import HierarchicalQuantizer
-from model.tokenizer_config import build_tokenizer_kwargs
-from model.kronos_preview import KronosPreview
+from config import NormConfig, TrainingConfig
+from data_processor import load_stocks, split_stocks, stratified_split_stocks
 from reproducibility import set_global_seed
-from eval_helpers import build_stock_arrays, build_gpt_eval_inputs
+from eval_helpers import (
+    build_stock_arrays, build_gpt_eval_inputs, load_tokenizer, load_gpt, attach_close_prices,
+    _cutoff_idx,
+)
 
 N_TEST_STOCKS = 30
 SEED = 42
 AMP_DTYPE = torch.bfloat16
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-
-def load_tokenizer(path, device):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    tok = HierarchicalQuantizer(**build_tokenizer_kwargs(ckpt.get("config", {})))
-    tok.load_state_dict(ckpt["model_state_dict"])
-    tok.to(device).eval()
-    for p in tok.parameters():
-        p.requires_grad_(False)
-    return tok
-
-
-def load_model(path, device):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model = KronosPreview().to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    model.eval()
-    return model
-
-
-def _cutoff_idx(stock):
-    return int(np.searchsorted(stock["dates_dt"],
-                               np.datetime64(pd.Timestamp(DataConfig.cutoff_date)), side="left"))
-
-
-def _rolling_stats(features, window=NormConfig.lookback_window):
-    T, D = features.shape
-    cs = np.cumsum(features, axis=0)
-    cs2 = np.cumsum(features ** 2, axis=0)
-    idx = np.arange(T)
-    starts = np.maximum(idx - window + 1, 0)
-    counts = (idx - starts + 1).astype(np.float32)
-    shifted = np.zeros_like(cs); shifted[1:] = cs[:-1]
-    shifted2 = np.zeros_like(cs2); shifted2[1:] = cs2[:-1]
-    mask_arr = (starts > 0).astype(np.float32)[:, None]
-    win_sum = cs - shifted * mask_arr
-    win_sum2 = cs2 - shifted2 * mask_arr
-    means = win_sum / counts[:, None]
-    var = win_sum2 / counts[:, None] - means ** 2
-    stds = np.sqrt(np.maximum(var, 1e-08))
-    return means.astype(np.float32), stds.astype(np.float32)
 
 
 @torch.no_grad()
@@ -103,8 +61,8 @@ def eval_1step_full(model, tokenizer, test_stocks, device):
 
         # ---- Forward pass on FULL sequence ----
         with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-            lc, lf, _ = model(inputs["inp"], inputs["tids"], inputs["pos"],
-                              inputs["mask"], va_values=inputs["va_values"])
+            lc, _ = model(inputs["inp"], inputs["tids"], inputs["pos"],
+                          inputs["mask"], va_values=inputs["va_values"])
         # Extract the precomputed rollouts from `inputs`
         p_mean = arrays["p_mean"]
         p_std = arrays["p_std"]
@@ -118,9 +76,8 @@ def eval_1step_full(model, tokenizer, test_stocks, device):
         pred_c = lc[0, test_start:test_end + 1].argmax(dim=-1)
         all_pred_toks.append(pred_c.cpu().numpy())
 
-        # head_fine is reserved but never trained in current pipeline (always replicate coarse).
+        # Replicate coarse id to both tokenizer levels for decoding
         pred_indices = pred_c.unsqueeze(0).unsqueeze(-1).expand(-1, -1, 2).contiguous()
-
         pred_feat = tokenizer.decode_all(pred_indices)[0].cpu().numpy()
 
         # Denormalize: pred_lr = pred_feat[:, 0] * rstd + rmean
@@ -190,20 +147,7 @@ def main():
 
     # Attach close_prices
     print("Attaching close prices ...")
-    csv_map = {os.path.basename(f).split(".")[0]: f for f in sorted(glob("dataset/*.csv"))}
-    for s in test_stocks_all:
-        fpath = csv_map.get(s["symbol"])
-        if fpath:
-            df = pd.read_csv(fpath, usecols=["date", "close"])
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = df.dropna(subset=["date", "close"]).sort_values("date")
-            prev = df["close"].shift(1)
-            df["log_ret"] = np.log(df["close"] / prev).replace([np.inf, -np.inf], np.nan)
-            df = df.dropna().reset_index(drop=True)
-            s["close_prices"] = df["close"].values.astype(np.float64)
-        else:
-            lr = s["features_raw"][:, 0]
-            s["close_prices"] = np.exp(np.cumsum(lr)).astype(np.float64)
+    attach_close_prices(test_stocks_all)
 
     # Select test stocks (30 fixed OR stratified_n via env var)
     stratified_n = int(os.environ.get("KRONOS_STRATIFIED_N", "0") or "0")
@@ -274,7 +218,7 @@ def main():
         print(f"  Path: {path}")
 
         try:
-            model = load_model(path, device)
+            model = load_gpt(path, device)
             res = eval_1step_full(model, tokenizer, test_stocks, device)
             res["name"] = name
             res["path"] = path

@@ -29,66 +29,19 @@ sys.path.insert(0, os.getcwd())
 import torch
 import torch.nn.functional as F
 import numpy as np
-import pandas as pd
-from glob import glob
 
-from config import DataConfig, NormConfig, TrainingConfig
-from data_processor import load_stocks, split_stocks, document_normalize, _stock_cutoff_idx
-from model.tokenizer import HierarchicalQuantizer
-from model.tokenizer_config import build_tokenizer_kwargs
-from model.kronos_preview import KronosPreview
-from model.kronos_bert import KronosBert
+from data_processor import load_stocks, split_stocks
 from reproducibility import set_global_seed
-from eval_helpers import build_stock_arrays, build_gpt_eval_inputs, build_bert_position_arrays, MASK_ID
+from eval_helpers import (
+    build_stock_arrays, build_gpt_eval_inputs, build_bert_position_arrays, MASK_ID,
+    load_tokenizer, load_gpt, load_bert, attach_close_prices, _cutoff_idx,
+)
 
 N_TEST_STOCKS = 30
 SEED = 42
 AMP_DTYPE = torch.bfloat16
 BERT_BATCH_SIZE = 4  # reduced from 32 to fit big BERT (16M params) on long sequences
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-
-def load_tokenizer(path, device):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    tok = HierarchicalQuantizer(**build_tokenizer_kwargs(ckpt.get("config", {})))
-    tok.load_state_dict(ckpt["model_state_dict"])
-    tok.to(device).eval()
-    for p in tok.parameters():
-        p.requires_grad_(False)
-    return tok
-
-
-def load_gpt(path, device):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model = KronosPreview().to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    model.eval()
-    return model
-
-
-def load_bert(path, device):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    # Read config from checkpoint to support different model sizes
-    cfg_dict = ckpt.get("config", {})
-    from config import ModelConfig as _MC
-    class _Cfg:
-        pass
-    cfg = _Cfg()
-    for attr in dir(_MC):
-        if attr.startswith("_"):
-            continue
-        setattr(cfg, attr, getattr(_MC, attr))
-    for k, v in cfg_dict.items():
-        setattr(cfg, k, v)
-    model = KronosBert(cfg=cfg).to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    model.eval()
-    return model
-
-
-def _cutoff_idx(stock):
-    return int(np.searchsorted(stock["dates_dt"],
-                               np.datetime64(pd.Timestamp(DataConfig.cutoff_date)), side="left"))
 
 
 @torch.no_grad()
@@ -104,8 +57,8 @@ def get_gpt_predictions_full_seq(gpt, tokenizer, stock, device):
         return None
     inputs = build_gpt_eval_inputs(arrays, tokenizer, device)
     with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-        lc, _, _ = gpt(inputs["inp"], inputs["tids"], inputs["pos"],
-                       inputs["mask"], va_values=inputs["va_values"])
+        lc, _ = gpt(inputs["inp"], inputs["tids"], inputs["pos"],
+                    inputs["mask"], va_values=inputs["va_values"])
     return {
         "logits": lc.float().cpu(),     # [1, S-1, vocab_full]
         "token_ids": inputs["token_ids"],
@@ -207,13 +160,6 @@ def get_bert_scores_for_positions(bert, stock_info, positions, tokenizer, device
     return results, [t for t, _ in per_pos]
 
 
-def compute_metrics_from_predictions(stock_info, pred_tokens, log_ret_only=False):
-    """REMOVED — this function raised NotImplementedError and was never called.
-    The actual metric computation lives inline in main() (see alpha_results loop)."""
-    raise NotImplementedError(
-        "compute_metrics_from_predictions is dead code; see main() for the real path.")
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpt_ckpt", type=str, default="checkpoints/expA_v2_hpo.pt")
@@ -247,20 +193,7 @@ def main():
     _, _, test_stocks_all = split_stocks(stocks)
 
     # Attach close_prices
-    csv_map = {os.path.basename(f).split(".")[0]: f for f in sorted(glob("dataset/*.csv"))}
-    for s in test_stocks_all:
-        fpath = csv_map.get(s["symbol"])
-        if fpath:
-            df = pd.read_csv(fpath, usecols=["date", "close"])
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = df.dropna(subset=["date", "close"]).sort_values("date")
-            prev = df["close"].shift(1)
-            df["log_ret"] = np.log(df["close"] / prev).replace([np.inf, -np.inf], np.nan)
-            df = df.dropna().reset_index(drop=True)
-            s["close_prices"] = df["close"].values.astype(np.float64)
-        else:
-            lr = s["features_raw"][:, 0]
-            s["close_prices"] = np.exp(np.cumsum(lr)).astype(np.float64)
+    attach_close_prices(test_stocks_all)
 
     rng = np.random.RandomState(SEED)
     indices = rng.choice(len(test_stocks_all), min(args.n_stocks, len(test_stocks_all)), replace=False)
