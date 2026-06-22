@@ -12,6 +12,7 @@ import math
 import os
 import time
 import json
+
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
@@ -19,40 +20,26 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from config import DataConfig, ModelConfig, TrainingConfig
+from config import DataConfig, ModelConfig, TrainingConfig, set_global_seed
 from data_processor import load_stocks, split_stocks, pack_stocks_v2, make_dataloader_v2
-from model.tokenizer import HierarchicalQuantizer
-from model.tokenizer_config import build_tokenizer_kwargs
+from model import load_tokenizer
 from model.kronos_bert import KronosBert, make_mlm_batch
-from reproducibility import set_global_seed
 
 
-def load_tokenizer(path, device):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    tok = HierarchicalQuantizer(**build_tokenizer_kwargs(ckpt.get("config", {})))
-    tok.load_state_dict(ckpt["model_state_dict"])
-    tok.to(device).eval()
-    for p in tok.parameters():
-        p.requires_grad_(False)
-    return tok
-
-
-def main(args=None):
+def main(args):
     set_global_seed(TrainingConfig.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tag = args.tag
     save_path = args.save_path
     tok_path = args.tokenizer_path
     epochs = args.epochs
-    max_stocks = args.max_stocks
     max_seq_len = args.max_seq_len
     mlm_prob = args.mlm_prob
     lr = args.lr
     weight_decay = args.weight_decay
     ckpt_path = save_path + ".ckpt"
 
-    if max_stocks > 0:
-        DataConfig.max_stocks = max_stocks
+    if args.max_stocks > 0:
+        DataConfig.max_stocks = args.max_stocks
 
     # Apply model size overrides (default: keep ModelConfig values)
     if args.dim > 0:
@@ -68,9 +55,9 @@ def main(args=None):
     if args.dropout >= 0:
         ModelConfig.dropout = args.dropout
 
-    print(f"Device: {device}, tag={tag}")
+    print(f"Device: {device}, tag={args.tag}")
     print(f"  save={save_path}, tok={tok_path}, ep={epochs}")
-    print(f"  max_stocks={max_stocks}, max_seq_len={max_seq_len}")
+    print(f"  max_stocks={args.max_stocks}, max_seq_len={max_seq_len}")
     print(f"  mlm_prob={mlm_prob}, lr={lr}, wd={weight_decay}")
     print(f"  model: dim={ModelConfig.dim} depth={ModelConfig.depth} heads={ModelConfig.heads} "
           f"num_kv_heads={ModelConfig.num_kv_heads} ffn_mult={ModelConfig.ffn_multiplier} "
@@ -100,8 +87,7 @@ def main(args=None):
 
     # Model
     model = KronosBert().to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Params: {n_params:,}")
+    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
 
     if args.gradient_checkpointing:
         model.enable_gradient_checkpointing()
@@ -123,7 +109,6 @@ def main(args=None):
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     amp_dtype = torch.bfloat16
-    accum = 1  # per-batch MLM updates; v2 sequences are short enough that 1 is fine
 
     # ---- Resume ----
     start_epoch = 0
@@ -157,33 +142,35 @@ def main(args=None):
         accs = []
         optimizer.zero_grad(set_to_none=True)
 
-        pbar = tqdm(train_loader, desc=f"[{tag}] Epoch {epoch+1}/{epochs}")
+        pbar = tqdm(train_loader, desc=f"[{args.tag}] Epoch {epoch+1}/{epochs}")
         for bi, batch in enumerate(pbar):
             # dataloader returns 7-tuple (input_ids, targets, time_ids, pos, mask, va, reg_targets)
-            inp, tgt, tid, pos, mask, va, _ = batch
-            inp = inp.to(device, non_blocking=True)
-            tid = tid.to(device, non_blocking=True)
-            pos = pos.to(device, non_blocking=True)
-            va = va.to(device, non_blocking=True)
+            input_ids, _, time_id, pos_id, _, va_val, _ = batch
+            input_ids = input_ids.to(device, non_blocking=True)
+            time_id = time_id.to(device, non_blocking=True)
+            pos_id = pos_id.to(device, non_blocking=True)
+            va_val = va_val.to(device, non_blocking=True)
 
-            if inp.dim() == 1:
-                inp, tid, pos = inp.unsqueeze(0), tid.unsqueeze(0), pos.unsqueeze(0)
-                va = va.unsqueeze(0)
+            if input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)
+                time_id = time_id.unsqueeze(0)
+                pos_id = pos_id.unsqueeze(0)
+                va_val = va_val.unsqueeze(0)
 
-            B, N = inp.shape
+            B, N = input_ids.shape
             # Build MLM batch (no padding — single sequence at a time)
             mlm_ids_list = []
             mlm_labels_list = []
             for b in range(B):
                 mlm_ids_b, mlm_labels_b = make_mlm_batch(
-                    inp[b], vocab_base, mask_id, mlm_prob=mlm_prob)
+                    input_ids[b], vocab_base, mask_id, mlm_prob=mlm_prob)
                 mlm_ids_list.append(mlm_ids_b)
                 mlm_labels_list.append(mlm_labels_b)
             mlm_ids = torch.stack(mlm_ids_list, dim=0)
             mlm_labels = torch.stack(mlm_labels_list, dim=0)
 
             with torch.amp.autocast("cuda", dtype=amp_dtype):
-                logits = model(mlm_ids, tid, pos, va_values=va)  # [B, N, vocab_base]
+                logits = model(mlm_ids, time_id, pos_id, va_values=va_val)
                 # CE loss only on masked positions
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
@@ -202,7 +189,7 @@ def main(args=None):
             if not torch.isfinite(loss):
                 continue
 
-            (loss / accum).backward()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
@@ -223,28 +210,30 @@ def main(args=None):
         vaccs = []
         with torch.inference_mode():
             for batch in val_loader:
-                inp, tgt, tid, pos, mask, va, _ = batch
-                inp = inp.to(device)
-                tid = tid.to(device)
-                pos = pos.to(device)
-                va = va.to(device)
-                if inp.dim() == 1:
-                    inp, tid, pos = inp.unsqueeze(0), tid.unsqueeze(0), pos.unsqueeze(0)
-                    va = va.unsqueeze(0)
+                input_ids, _, time_id, pos_id, _, va_val, _ = batch
+                input_ids = input_ids.to(device)
+                time_id = time_id.to(device)
+                pos_id = pos_id.to(device)
+                va_val = va_val.to(device)
+                if input_ids.dim() == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                    time_id = time_id.unsqueeze(0)
+                    pos_id = pos_id.unsqueeze(0)
+                    va_val = va_val.unsqueeze(0)
 
-                B, N = inp.shape
+                B, N = input_ids.shape
                 mlm_ids_list = []
                 mlm_labels_list = []
                 for b in range(B):
                     mlm_ids_b, mlm_labels_b = make_mlm_batch(
-                        inp[b], vocab_base, mask_id, mlm_prob=mlm_prob)
+                        input_ids[b], vocab_base, mask_id, mlm_prob=mlm_prob)
                     mlm_ids_list.append(mlm_ids_b)
                     mlm_labels_list.append(mlm_labels_b)
                 mlm_ids = torch.stack(mlm_ids_list, dim=0)
                 mlm_labels = torch.stack(mlm_labels_list, dim=0)
 
                 with torch.amp.autocast("cuda", dtype=amp_dtype):
-                    logits = model(mlm_ids, tid, pos, va_values=va)
+                    logits = model(mlm_ids, time_id, pos_id, va_values=va_val)
                     vloss = F.cross_entropy(
                         logits.view(-1, logits.size(-1)),
                         mlm_labels.view(-1),
@@ -266,7 +255,7 @@ def main(args=None):
         history["mlm_acc"].append(avg_val_acc)
         history["lr"].append(cur_lr)
 
-        tag_s = ""
+        save_tag = ""
         if avg_val < best_val:
             best_val = avg_val
             torch.save({
@@ -279,10 +268,10 @@ def main(args=None):
                 "mlm_acc": avg_val_acc,
                 "epoch": epoch,
                 "completed": epoch == epochs - 1,
-                "tag": tag,
+                "tag": args.tag,
                 "mlm_prob": mlm_prob,
             }, save_path)
-            tag_s = "  -> Saved best"
+            save_tag = "  -> Saved best"
 
         torch.save({
             "model_state_dict": model.state_dict(),
@@ -291,7 +280,7 @@ def main(args=None):
             "epoch": epoch,
             "best_val": best_val,
             "global_step": global_step,
-            "tag": tag,
+            "tag": args.tag,
         }, ckpt_path)
 
         epochs_done = epoch - start_epoch + 1
@@ -300,7 +289,7 @@ def main(args=None):
         print(f"  [{epochs_done}/{epochs - start_epoch}] Epoch {epoch+1}: "
               f"train={avg_train:.4f} val={avg_val:.4f} best={best_val:.4f} "
               f"mlm_acc={avg_val_acc:.3f} lr={cur_lr:.2e} elapsed={elapsed:.0f}s "
-              f"ETA={eta:.0f}s step={global_step}{tag_s}", flush=True)
+              f"ETA={eta:.0f}s step={global_step}{save_tag}", flush=True)
 
     # Mark completed
     if os.path.exists(save_path):
@@ -308,14 +297,14 @@ def main(args=None):
         ckpt["completed"] = True
         torch.save(ckpt, save_path)
 
-    with open(os.path.join(os.path.dirname(save_path) or ".", f"history_{tag}.json"), "w") as f:
+    with open(os.path.join(os.path.dirname(save_path) or ".", f"history_{args.tag}.json"), "w") as f:
         json.dump(history, f, indent=2)
     print(f"\nDone. Best val_loss: {best_val:.4f}, mlm_acc: {avg_val_acc:.3f}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train KronosBert (bidirectional MLM calibrator). Default: big BERT (16M, 4695 stocks) — HPO 2026-06-18 best.",
+        description="Train KronosBert (bidirectional MLM calibrator). Default: big BERT (16M, 4695 stocks).",
     )
     parser.add_argument("--save_path", type=str,
                         default="checkpoints/kronos_bert_big_v1.pt")
@@ -323,14 +312,13 @@ if __name__ == "__main__":
                         default="checkpoints/tokenizer_v2_ohlc.pt")
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--max_stocks", type=int, default=0,
-                        help="Subsample N stocks (0=all 4695). HPO 2026-06-18 best: 0 (full data).")
+                        help="Subsample N stocks (0=all 4695).")
     parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--mlm_prob", type=float, default=0.15)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--tag", type=str, default="kronos_bert_big_v1")
-    # Model size overrides. Defaults below are the big BERT (16M) — HPO 2026-06-18 best.
-    # Pass 0 to fall back to ModelConfig values (small 2.5M).
+    # Model size overrides. Defaults below are the big BERT (16M).
     parser.add_argument("--dim", type=int, default=512)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--heads", type=int, default=8)

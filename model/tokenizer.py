@@ -43,28 +43,21 @@ class BSQQuantizer(nn.Module):
         z_norm = F.normalize(z, dim=-1)
         logits = self.project(z_norm)
 
-        b_hard = torch.sign(logits)  # {-1, +1}
-        b_soft = torch.tanh(logits)  # smooth approx
+        b_soft = torch.tanh(logits)                         # smooth approx
+        b_hard = torch.sign(logits)                         # {-1, +1}
+        b = b_soft + (b_hard - b_soft).detach()             # STE (reordered: 1 sub vs 2)
 
-        # Straight-through estimator
-        b = (b_hard - b_soft).detach() + b_soft
-
-        bits_01 = ((b + 1) / 2).long().clamp(0, 1)  # {0, 1}
+        bits_01 = ((b + 1) * 0.5).long().clamp_(0, 1)      # in-place clamp
         indices = self._bits_to_int(bits_01)
 
-        # Commitment loss
-        commit_loss = F.mse_loss(b_soft.detach(), b_hard) * self.commitment_cost
-
-        # Entropy regularization
-        codebook_loss = torch.tensor(0.0, device=z.device)
-        ent_loss = torch.tensor(0.0, device=z.device)
+        # Entropy regularization (only regularizer with gradient to project)
+        ent_loss = torch.zeros((), device=z.device, dtype=z.dtype)
         if self.training:
-            prob = torch.sigmoid(logits).mean(dim=0).clamp(1e-10, 1 - 1e-10)
+            prob = (b_soft * 0.5 + 0.5).mean(0).clamp(1e-10, 1 - 1e-10)  # reuse tanh→sigmoid
             ent = -(prob * prob.log() + (1 - prob) * (1 - prob).log()).mean()
             ent_loss = -ent * self.entropy_weight
 
-        quant_loss = commit_loss + codebook_loss + ent_loss
-        return b, bits_01, indices, quant_loss
+        return b, bits_01, indices, ent_loss
 
     def quantize(self, z):
         z_norm = F.normalize(z, dim=-1)
@@ -105,9 +98,16 @@ class HierarchicalQuantizer(nn.Module):
         super().__init__()
         self.num_quantizers = max(1, int(num_quantizers or self.num_quantizers))
         self._embedding_dim = int(embedding_dim or self.embedding_dim)
-        _bits = getattr(TokenizerConfig, "bits_per_quantizer", bits_per_quantizer)
         _commit = getattr(TokenizerConfig, "bsq_commitment_cost", commitment_cost)
         _ent = getattr(TokenizerConfig, "bsq_entropy_weight", entropy_weight)
+
+        # bits_per_quantizer can be int (all layers same) or list (per-layer)
+        if isinstance(bits_per_quantizer, (list, tuple)):
+            _bits_list = [int(b) for b in bits_per_quantizer]
+        else:
+            _bits_list = [int(bits_per_quantizer)] * self.num_quantizers
+        assert len(_bits_list) == self.num_quantizers, \
+            f"bits_per_quantizer length {len(_bits_list)} != num_quantizers {self.num_quantizers}"
 
         self.encoder = nn.Sequential(
             nn.Linear(int(input_dim or self.input_dim), int(hidden_dim or self.hidden_dim)),
@@ -117,8 +117,8 @@ class HierarchicalQuantizer(nn.Module):
             nn.LayerNorm(self._embedding_dim),
         )
         self.bsq_quantizers = nn.ModuleList([
-            BSQQuantizer(self._embedding_dim, _bits, _commit, _ent)
-            for _ in range(self.num_quantizers)
+            BSQQuantizer(self._embedding_dim, _bits_list[i], _commit, _ent)
+            for i in range(self.num_quantizers)
         ])
         self.bsq_coarse = self.bsq_quantizers[0]
         self.bsq_fine = self.bsq_quantizers[1] if self.num_quantizers > 1 else self.bsq_quantizers[0]
@@ -131,28 +131,18 @@ class HierarchicalQuantizer(nn.Module):
 
     def forward(self, x, return_all=False):
         z = self.encoder(x)
-        # Quantize
         residual = z
-        z_q_total = torch.zeros_like(z)
-        total_loss = torch.tensor(0.0, device=z.device)
-        indices = []
-        z_q_coarse = None
-        for i, bsq in enumerate(self.bsq_quantizers):
+        z_q = torch.zeros_like(z)
+        total_loss = torch.zeros((), device=z.device, dtype=z.dtype)
+        for bsq in self.bsq_quantizers:
             b, bits_01, idx, q_loss = bsq(residual)
-            z_q = bsq.decode_proj(bsq._int_to_bits(idx, bsq.bits).to(bsq.decode_proj.weight.dtype))
-            if i == 0:
-                z_q_coarse = z_q
-            residual = residual - z_q.detach()
-            z_q_total = z_q_total + z_q
-            indices.append(idx)
-            total_loss = total_loss + q_loss
+            z_q_i = bsq.decode_proj(bsq._int_to_bits(idx, bsq.bits))
+            residual = residual - z_q_i.detach()
+            z_q.add_(z_q_i)
+            total_loss.add_(q_loss)
 
-        x_recon_full = self.decoder(z_q_total)
-        recon_loss = F.mse_loss(x_recon_full, x)
-
-        if self.num_quantizers > 1 and z_q_coarse is not None:
-            x_recon_coarse = self.decoder(z_q_coarse)
-            recon_loss = recon_loss + F.mse_loss(x_recon_coarse, x)
+        x_recon = self.decoder(z_q)
+        recon_loss = F.mse_loss(x_recon, x)
 
         return recon_loss + total_loss
 
@@ -168,10 +158,35 @@ class HierarchicalQuantizer(nn.Module):
         return torch.stack(indices, dim=-1)  # [B, N, num_quantizers]
 
     def encode(self, x):
+        """Return coarse token IDs for GPT/BERT input.
+
+        The fine layer only improves tokenizer reconstruction — GPT learns
+        to predict fine tokens separately via a dual-head architecture.
+        """
         all_indices = self.encode_all(x)
         idx_coarse = all_indices[..., 0]
-        idx_fine = all_indices[..., 1] if self.num_quantizers > 1 else all_indices[..., 0]
-        return idx_coarse, idx_fine
+        return idx_coarse, None
+
+    @property
+    def vocab_size(self):
+        """Joint vocabulary size (for tokenizer internal use)."""
+        v = 1
+        for bsq in self.bsq_quantizers:
+            v *= bsq.vocab_size
+        return v
+
+    @property
+    def vocab_coarse(self):
+        """Coarse vocabulary size — the GPT/BERT prediction target."""
+        return self.bsq_coarse.vocab_size
+
+    @property
+    def bits_l1(self):
+        return self.bsq_coarse.bits
+
+    @property
+    def bits_l2(self):
+        return self.bsq_fine.bits
 
     def decode_all(self, all_indices):
         if isinstance(all_indices, torch.Tensor):
@@ -193,12 +208,49 @@ class HierarchicalQuantizer(nn.Module):
         all_indices = torch.stack([idx_coarse, idx_fine], dim=-1)
         return self.decode_all(all_indices)
 
-    def codebook_stats(self):
-        stats = {}
-        for i, bsq in enumerate(self.bsq_quantizers):
-            stats[f"BSQ level_{i}"] = bsq.bits
-        if len(self.bsq_quantizers) >= 1:
-            stats["level_0"] = stats.get("BSQ level_0", "coarse")
-        if len(self.bsq_quantizers) >= 2:
-            stats["level_1"] = stats.get("BSQ level_1", "fine")
-        return stats
+
+def build_tokenizer_kwargs(config_dict=None):
+    """Build kwargs for HierarchicalQuantizer from an optional config dict.
+
+    Supports per-layer bits via TokenizerConfig.bits_l1/bits_l2.
+    """
+    cfg = config_dict or {}
+    # Per-layer bits: bits_l1/bits_l2 override bits_per_quantizer
+    b1 = cfg.get("bits_l1", getattr(TokenizerConfig, "bits_l1", 0))
+    b2 = cfg.get("bits_l2", getattr(TokenizerConfig, "bits_l2", 0))
+    default_bits = cfg.get(
+        "bits_per_quantizer", getattr(TokenizerConfig, "bits_per_quantizer", 10))
+    if b1 > 0 and b2 > 0:
+        bits = [int(b1), int(b2)]
+    elif isinstance(default_bits, (list, tuple)):
+        bits = [int(b) for b in default_bits]
+    else:
+        bits = int(default_bits)
+    return {
+        "input_dim": cfg.get("input_dim", TokenizerConfig.input_dim),
+        "hidden_dim": cfg.get("hidden_dim", TokenizerConfig.hidden_dim),
+        "embedding_dim": cfg.get("embedding_dim", TokenizerConfig.embedding_dim),
+        "num_quantizers": cfg.get("num_quantizers", TokenizerConfig.num_quantizers),
+        "bits_per_quantizer": bits,
+        "commitment_cost": cfg.get(
+            "bsq_commitment_cost", getattr(TokenizerConfig, "bsq_commitment_cost", 0.05)),
+        "entropy_weight": cfg.get(
+            "bsq_entropy_weight", getattr(TokenizerConfig, "bsq_entropy_weight", 0.05)),
+    }
+
+
+def export_tokenizer_config():
+    """Export current TokenizerConfig as a dict (for checkpoint saving)."""
+    b1 = getattr(TokenizerConfig, "bits_l1", 0)
+    b2 = getattr(TokenizerConfig, "bits_l2", 0)
+    default_bits = getattr(TokenizerConfig, "bits_per_quantizer", 10)
+    bits = [int(b1), int(b2)] if b1 > 0 and b2 > 0 else int(default_bits)
+    return {
+        "input_dim": TokenizerConfig.input_dim,
+        "hidden_dim": TokenizerConfig.hidden_dim,
+        "embedding_dim": TokenizerConfig.embedding_dim,
+        "num_quantizers": TokenizerConfig.num_quantizers,
+        "bits_per_quantizer": bits,
+        "bsq_commitment_cost": getattr(TokenizerConfig, "bsq_commitment_cost", 0.05),
+        "bsq_entropy_weight": getattr(TokenizerConfig, "bsq_entropy_weight", 0.05),
+    }

@@ -1,7 +1,15 @@
 """Kronos-R-Preview 全局配置。"""
 import os
 import json
+import random
 
+import numpy as np
+import torch
+
+
+# ============================================================================
+# Config classes
+# ============================================================================
 
 class NormConfig:
     # --- per-stock historical normalize ---
@@ -42,7 +50,9 @@ class TokenizerConfig:
     hidden_dim: int = 192
     embedding_dim: int = 48
     num_quantizers: int = 2
-    bits_per_quantizer: int = 10
+    bits_per_quantizer: int = 10  # single int → all layers same; list → per-layer
+    bits_l1: int = 0              # >0 overrides coarse layer bits
+    bits_l2: int = 0              # >0 overrides fine layer bits
     bsq_commitment_cost: float = 0.194
     bsq_entropy_weight: float = 0.01
     epochs: int = 100
@@ -62,7 +72,8 @@ class ModelConfig:
     position_encoding: str = "rope"
     rope_base: float = 10000.0
     dropout: float = 0.1
-    vocab_size: int = 1024
+    vocab_size: int = 1024       # coarse vocab (GPT prediction target)
+    vocab_fine: int = 256        # fine vocab (dual-head auxiliary)
     ffn_multiplier: int = 4
     va_hidden_dim: int = 64     # v2: Volume/Amount MLP hidden dim
 
@@ -88,6 +99,44 @@ class TrainingConfig:
     base_model_path: str = "checkpoints/expA_v2_hpo.pt"
     token_cache_dir: str = "checkpoints/token_cache"  # NEW: pre-tokenize cache
 
+
+# ============================================================================
+# Reproducibility
+# ============================================================================
+
+def set_global_seed(seed, deterministic=True):
+    """Set deterministic random seeds across Python, NumPy, and PyTorch."""
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except Exception:
+                pass
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+
+
+def seed_worker(worker_id):
+    """Worker init function for DataLoader (ensures reproducibility)."""
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+# ============================================================================
+# Runtime overrides
+# ============================================================================
 
 def _apply_runtime_overrides():
     path = os.environ.get("KRONOS_PREVIEW_OVERRIDE_JSON", "").strip()

@@ -1,9 +1,14 @@
-"""Kronos-Preview: SDPA + RMSNorm + SiLU-gated FFN + RoPE + Heteroscedastic regression head."""
+"""KronosPreview: GPT-style causal transformer for stock next-token prediction.
+
+Architecture: SDPA + RMSNorm + SiLU-gated FFN + RoPE + Heteroscedastic regression head.
+All shared building blocks (RMSNorm, Attention, FeedForward, etc.) live in model/layers.py.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from config import ModelConfig
+from model.layers import _BaseTransformer
 
 
 def heteroscedastic_nll_loss(pred, target, ignore_val=-999.0):
@@ -22,214 +27,83 @@ def heteroscedastic_nll_loss(pred, target, ignore_val=-999.0):
     mean = pred[mask, 0]
     log_var = pred[mask, 1]
     tgt = target[mask]
-    # Clamp log_var for numerical stability (equivalent to σ ∈ [e^{-5}, e^{2}])
+    # Clamp log_var for numerical stability (σ ∈ [e^{-5}, e^{2}])
     log_var = log_var.clamp(-5.0, 2.0)
     # Gaussian NLL: 0.5 * (log_var + (target - mean)^2 / exp(log_var))
-    nll = 0.5 * (log_var + (tgt - mean).pow(2) / log_var.exp().clamp(min=1e-6))
+    nll = 0.5 * (log_var + (tgt - mean).pow(2) / log_var.exp())
     return nll.mean()
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+class KronosPreview(_BaseTransformer):
+    """GPT with dual-head prediction: coarse (macro pattern) + fine (micro detail).
 
-    def forward(self, x):
-        norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x.float() * norm).type_as(x) * self.weight
-
-
-class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim, base=10000.0):
-        super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def forward(self, position_ids):
-        freqs = torch.einsum("bi,d->bid", position_ids.float(), self.inv_freq)
-        return torch.sin(freqs), torch.cos(freqs)
-
-
-def _rotate_half(x):
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-    return torch.cat([-x2, x1], dim=-1)
-
-
-def _apply_rope(q, k, sin, cos):
-    # sin, cos: [B, N, d//2] -> [B, 1, N, d//2]
-    sin = sin.unsqueeze(1)
-    cos = cos.unsqueeze(1)
-    # Expand to full head_dim by concatenating
-    cos2 = torch.cat([cos, cos], dim=-1)  # [B, 1, N, head_dim]
-    sin2 = torch.cat([sin, sin], dim=-1)
-    q_out = q * cos2 + _rotate_half(q) * sin2
-    k_out = k * cos2 + _rotate_half(k) * sin2
-    return q_out, k_out
-
-
-class Attention(nn.Module):
-    def __init__(self, dim, heads, num_kv_heads, dropout=0.0):
-        super().__init__()
-        self.heads = heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = dim // heads
-        self.kv_groups = heads // num_kv_heads
-        self.q_proj = nn.Linear(dim, heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(dim, num_kv_heads * self.head_dim, bias=False)
-        self.out_proj = nn.Linear(heads * self.head_dim, dim, bias=False)
-        self.dropout_p = dropout if dropout > 0.0 else 0.0
-
-    def forward(self, x, sin, cos, attn_mask=None):
-        B, N, _ = x.shape
-        q = self.q_proj(x).view(B, N, self.heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        q, k = _apply_rope(q, k, sin, cos)
-
-        if self.kv_groups > 1:
-            k = k.repeat_interleave(self.kv_groups, dim=1)
-            v = v.repeat_interleave(self.kv_groups, dim=1)
-
-        dp = self.dropout_p if self.training else 0.0
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dp)
-        out = out.transpose(1, 2).reshape(B, N, -1)
-        return self.out_proj(out)
-
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, multiplier=4, dropout=0.0):
-        super().__init__()
-        hidden = int(dim * multiplier)
-        self.gate_proj = nn.Linear(dim, hidden, bias=False)
-        self.up_proj = nn.Linear(dim, hidden, bias=False)
-        self.down_proj = nn.Linear(hidden, dim, bias=False)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-    def forward(self, x):
-        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, dim, heads, num_kv_heads, ffn_multiplier, dropout):
-        super().__init__()
-        self.attn_norm = RMSNorm(dim)
-        self.attn = Attention(dim, heads, num_kv_heads, dropout)
-        self.ffn_norm = RMSNorm(dim)
-        self.ffn = FeedForward(dim, ffn_multiplier, dropout)
-
-    def forward(self, x, sin, cos, attn_mask=None):
-        x = x + self.attn(self.attn_norm(x), sin, cos, attn_mask)
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
-
-
-class KronosPreview(nn.Module):
+    head_coarse predicts among V1 coarse codes (the main autoregressive target).
+    head_fine predicts among V2 fine codes, conditioned on coarse embedding.
+    Total head params: O(V1 + V2), not O(V1 * V2).
+    """
     def __init__(self, cfg=None):
-        super().__init__()
         cfg = cfg or ModelConfig
-        vocab_full = cfg.vocab_size + 2  # +2 for BOS/EOS
-        self.token_emb = nn.Embedding(vocab_full, cfg.dim)
-        self.time_emb_day = nn.Embedding(32, cfg.dim)
-        self.time_emb_month = nn.Embedding(13, cfg.dim)
-        self.time_emb_year = nn.Embedding(100, cfg.dim)
-        # v2: Volume/Amount continuous embedding
-        self.va_proj = nn.Sequential(
-            nn.Linear(2, cfg.va_hidden_dim, bias=True),
-            nn.GELU(),
-            nn.Linear(cfg.va_hidden_dim, cfg.dim, bias=True),
+        super().__init__(cfg, n_special=2)
+        self._vocab_l1 = cfg.vocab_size
+        self._vocab_l2 = getattr(cfg, "vocab_fine", 256)
+        self.head_coarse = nn.Linear(cfg.dim, cfg.vocab_size + 2, bias=True)
+        # Fine head: conditions on [hidden_state, coarse_embedding]
+        self._fine_emb = nn.Embedding(cfg.vocab_size + 2, cfg.dim)  # compact coarse repr
+        self.head_fine = nn.Sequential(
+            nn.Linear(cfg.dim * 2, cfg.dim, bias=True),
+            nn.SiLU(),
+            nn.Linear(cfg.dim, self._vocab_l2, bias=True),
         )
-
-        self.blocks = nn.ModuleList([
-            TransformerBlock(cfg.dim, cfg.heads, cfg.num_kv_heads,
-                             cfg.ffn_multiplier, cfg.dropout)
-            for _ in range(cfg.depth)
-        ])
-        self.norm = RMSNorm(cfg.dim)
-        self.head_coarse = nn.Linear(cfg.dim, vocab_full, bias=True)
-        # Heteroscedastic regression head: MLP -> (mean, log_var)
         self.head_reg = nn.Sequential(
             nn.Linear(cfg.dim, cfg.dim, bias=True),
             nn.SiLU(),
             nn.Linear(cfg.dim, 2, bias=True),
         )
-        self.rotary = RotaryEmbedding(cfg.dim // cfg.heads, base=cfg.rope_base)
-        self._gradient_checkpointing = False
 
-    def enable_gradient_checkpointing(self):
-        self._gradient_checkpointing = True
+    def _predict_reg(self, x, reg_targets):
+        with torch.amp.autocast("cuda", enabled=False):
+            shift_hidden = x[:, :-1, :].float().contiguous()
+            reg_pred = self.head_reg(shift_hidden)
+            shift_reg_targets = reg_targets[:, 1:].float().contiguous()
+            het_loss = heteroscedastic_nll_loss(
+                reg_pred.reshape(-1, 2), shift_reg_targets.reshape(-1), ignore_val=-999.0)
+        return reg_pred, het_loss
 
-    def forward(self, input_ids, time_ids, position_ids, attn_mask=None, targets=None,
-                va_values=None, reg_targets=None):
-        # Normalize: ensure [B, N] format
+    def forward(self, input_ids, time_ids, position_ids, attn_mask=None,
+                va_values=None, reg_targets=None, fine_targets=None):
         no_batch = input_ids.dim() == 1
-        if no_batch:
-            input_ids = input_ids.unsqueeze(0)
-            time_ids = time_ids.unsqueeze(0)
-            position_ids = position_ids.unsqueeze(0)
-            if attn_mask is not None:
-                attn_mask = attn_mask.unsqueeze(0)
-            if targets is not None:
-                targets = targets.unsqueeze(0)
-            if va_values is not None:
-                va_values = va_values.unsqueeze(0)
-            if reg_targets is not None:
-                reg_targets = reg_targets.unsqueeze(0)
+        extra = {"va_values": va_values, "reg_targets": reg_targets, "fine_targets": fine_targets}
+        input_ids, time_ids, position_ids, attn_mask, extra = self._prepare_inputs(
+            input_ids, time_ids, position_ids, attn_mask, **extra)
+        va_values, reg_targets, fine_targets = extra["va_values"], extra["reg_targets"], extra["fine_targets"]
 
-        # SDPA requires 4D mask [B, 1, N, N] when B > 1
-        if attn_mask is not None and attn_mask.dim() == 3:
-            attn_mask = attn_mask.unsqueeze(1)
-
-        x = self.token_emb(input_ids)
-        x = x + self.time_emb_day(time_ids[..., 0])
-        x = x + self.time_emb_month(time_ids[..., 1])
-        x = x + self.time_emb_year(time_ids[..., 2])
-        if va_values is not None:
-            x = x + self.va_proj(va_values)
-
+        x = self._embed(input_ids, time_ids, va_values)
         sin, cos = self.rotary(position_ids)
-
-        for block in self.blocks:
-            if self._gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(
-                    block, x, sin, cos, attn_mask, use_reentrant=False)
-            else:
-                x = block(x, sin, cos, attn_mask)
-
+        x = self._run_blocks(x, sin, cos, attn_mask)
         x = self.norm(x)
-        logits = self.head_coarse(x)
+        coarse_logits = self.head_coarse(x)
 
-        loss = None
-        if targets is not None:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_targets = targets.contiguous()
-            if (shift_targets != -100).any():
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_targets.view(-1),
-                    ignore_index=-100,
-                )
+        # Fine logits: conditioned on coarse embedding
+        if fine_targets is not None:
+            coarse_emb = self._fine_emb(input_ids[:, :fine_targets.shape[1]])
+        else:
+            coarse_pred = coarse_logits[:, :-1, :self._vocab_l1].argmax(dim=-1)
+            coarse_emb = self._fine_emb(coarse_pred)
+        T = coarse_emb.shape[1]
+        fine_input = torch.cat([x[:, :T, :], coarse_emb], dim=-1)
+        fine_logits = self.head_fine(fine_input)
 
-        # Heteroscedastic regression (float32 for numerical stability)
         if reg_targets is not None:
-            with torch.amp.autocast("cuda", enabled=False):
-                shift_hidden = x[:, :-1, :].float().contiguous()  # [B, S-1, dim]
-                reg_pred = self.head_reg(shift_hidden)              # [B, S-1, 2]
-                shift_reg_targets = reg_targets[:, 1:].float().contiguous()  # [B, S-1]
-                het_loss = heteroscedastic_nll_loss(
-                    reg_pred.reshape(-1, 2),
-                    shift_reg_targets.reshape(-1),
-                    ignore_val=-999.0,
-                )
+            reg_pred, het_loss = self._predict_reg(x, reg_targets)
             if no_batch:
-                logits = logits.squeeze(0)
-            return logits, loss, reg_pred, het_loss
+                coarse_logits = coarse_logits.squeeze(0)
+                fine_logits = fine_logits.squeeze(0)
+            return coarse_logits, fine_logits, reg_pred, het_loss
 
         if no_batch:
-            logits = logits.squeeze(0)
-        return logits, loss
+            coarse_logits = coarse_logits.squeeze(0)
+            fine_logits = fine_logits.squeeze(0)
+        return coarse_logits, fine_logits
 
 
 class CausalReasoningBlock(nn.Module):
@@ -253,11 +127,11 @@ class CausalReasoningBlock(nn.Module):
 
 
 class KronosPreviewWithReasoning(KronosPreview):
-    """KronosPreview + CausalReasoningBlock after transformer blocks.
+    """KronosPreview + CausalReasoningBlock inserted after transformer stack.
 
-    Inherits all of KronosPreview's embedding/blocks/head setup; only adds the
-    reason tokens and reasoning cross-attention block(s) inserted between the
-    transformer stack and the final norm.
+    Inherits everything from KronosPreview; only overrides `_run_blocks` to
+    inject reasoning cross-attention between the transformer blocks and the
+    final norm.
     """
     def __init__(self, base_model_state=None, n_reason_tokens=8, n_reason_layers=1):
         super().__init__()
@@ -271,71 +145,11 @@ class KronosPreviewWithReasoning(KronosPreview):
         if base_model_state is not None:
             self.load_state_dict(base_model_state, strict=False)
 
-    def forward(self, input_ids, time_ids, position_ids, attn_mask=None, targets=None,
-                va_values=None, reg_targets=None):
-        no_batch = input_ids.dim() == 1
-        if no_batch:
-            input_ids = input_ids.unsqueeze(0)
-            time_ids = time_ids.unsqueeze(0)
-            position_ids = position_ids.unsqueeze(0)
-            if attn_mask is not None:
-                attn_mask = attn_mask.unsqueeze(0)
-            if targets is not None:
-                targets = targets.unsqueeze(0)
-            if va_values is not None:
-                va_values = va_values.unsqueeze(0)
-            if reg_targets is not None:
-                reg_targets = reg_targets.unsqueeze(0)
-
-        if attn_mask is not None and attn_mask.dim() == 3:
-            attn_mask = attn_mask.unsqueeze(1)
-
-        x = self.token_emb(input_ids)
-        x = x + self.time_emb_day(time_ids[..., 0])
-        x = x + self.time_emb_month(time_ids[..., 1])
-        x = x + self.time_emb_year(time_ids[..., 2])
-        if va_values is not None:
-            x = x + self.va_proj(va_values)
-        sin, cos = self.rotary(position_ids)
-
-        for block in self.blocks:
-            if self._gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(
-                    block, x, sin, cos, attn_mask, use_reentrant=False)
-            else:
-                x = block(x, sin, cos, attn_mask)
-
+    def _run_blocks(self, x, sin, cos, attn_mask=None):
+        """Transformer stack + reasoning cross-attention."""
+        x = super()._run_blocks(x, sin, cos, attn_mask)
         B = x.size(0)
         memory = self.reason_tokens.expand(B, -1, -1)
         for rblock in self.reason_blocks:
             x = rblock(x, memory)
-
-        x = self.norm(x)
-        logits = self.head_coarse(x)
-
-        loss = None
-        if targets is not None:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_targets = targets.contiguous()
-            if (shift_targets != -100).any():
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_targets.view(-1), ignore_index=-100)
-
-        if reg_targets is not None:
-            with torch.amp.autocast("cuda", enabled=False):
-                shift_hidden = x[:, :-1, :].float().contiguous()
-                reg_pred = self.head_reg(shift_hidden)
-                shift_reg_targets = reg_targets[:, 1:].float().contiguous()
-                het_loss = heteroscedastic_nll_loss(
-                    reg_pred.reshape(-1, 2),
-                    shift_reg_targets.reshape(-1),
-                    ignore_val=-999.0,
-                )
-            if no_batch:
-                logits = logits.squeeze(0)
-            return logits, loss, reg_pred, het_loss
-
-        if no_batch:
-            logits = logits.squeeze(0)
-        return logits, loss
+        return x
