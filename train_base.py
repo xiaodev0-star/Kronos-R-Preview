@@ -20,6 +20,30 @@ from model.kronos_preview import KronosPreview, KronosPreviewWithReasoning
 from model.optimizer import build_muon_optimizers
 
 
+class EarlyStopping:
+    """Early stopping with patience."""
+    def __init__(self, patience=15, min_delta=1e-4, mode="min"):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.best = float("inf") if mode == "min" else float("-inf")
+        self.counter = 0
+        self.best_epoch = -1
+
+    def __call__(self, metric, epoch=0):
+        if self.mode == "min":
+            improved = metric < self.best - self.min_delta
+        else:
+            improved = metric > self.best + self.min_delta
+        if improved:
+            self.best = metric
+            self.counter = 0
+            self.best_epoch = epoch
+        else:
+            self.counter += 1
+        return self.counter >= self.patience
+
+
 def focal_loss(logits, targets, gamma=2.0, label_smoothing=0.0, entropy_alpha=0.0,
                ignore_index=-100):
     ce = F.cross_entropy(logits, targets, reduction='none', ignore_index=ignore_index,
@@ -213,6 +237,13 @@ def main(args):
     if TrainingConfig.use_gradient_checkpointing:
         model.enable_gradient_checkpointing()
 
+    # ── Early stopping ──
+    early_stop = None
+    esp = getattr(args, "early_stop_patience", 0)
+    if esp > 0:
+        early_stop = EarlyStopping(patience=esp, min_delta=1e-4)
+        print(f"  [early_stop] patience={esp}")
+
     # Optimizer: Muon+AdamW (2D→Muon, 1D→AdamW) or standard AdamW
     if args.optimizer == "muon":
         optimizer, optimizer_adam = build_muon_optimizers(
@@ -309,7 +340,7 @@ def main(args):
 
                 # Fine loss: f_logits is [B, S-1, V_fine], fine_target is [B, S-1]
                 # f_logits[t] predicts fine_target[t], skip first position (no context)
-                shift_fine = f_logits[:, 1:, :].contiguous()    # [B, S-2, V_fine]
+                shift_fine = fine_logits[:, 1:, :].contiguous()    # [B, S-2, V_fine]
                 shift_fine_tgt = fine_target[:, 1:].contiguous() # [B, S-2]
                 fine_mask = (shift_targets != -100)
                 if fine_mask.any():
@@ -421,7 +452,8 @@ def main(args):
             torch.save({
                 "model_state_dict": sd,
                 "config": {"dim": ModelConfig.dim, "depth": ModelConfig.depth,
-                           "heads": ModelConfig.heads, "num_kv_heads": ModelConfig.num_kv_heads},
+                           "heads": ModelConfig.heads, "num_kv_heads": ModelConfig.num_kv_heads,
+                           "vocab_size": ModelConfig.vocab_size, "vocab_fine": ModelConfig.vocab_fine},
                 "val_loss": best_val,
                 "epoch": epoch,
                 "completed": epoch == epochs - 1,
@@ -465,6 +497,12 @@ def main(args):
               f"train={avg_train:.4f} val={avg_val:.4f} best={best_val:.4f} "
               f"lr={cur_lr:.2e} elapsed={elapsed:.0f}s ETA={eta:.0f}s step={global_step}"
               f"{light_str}{save_tag}", flush=True)
+
+        # Early stopping check
+        if early_stop and early_stop(avg_val, epoch):
+            print(f"  [early_stop] Patience exhausted at epoch {epoch+1} "
+                  f"(best={early_stop.best:.4f} at epoch {early_stop.best_epoch+1}). Stopping.")
+            break
 
         if TrainingConfig.max_train_updates and global_step >= TrainingConfig.max_train_updates:
             break
@@ -545,4 +583,7 @@ Examples:
                         help="Force re-tokenization (clear cache)")
     parser.add_argument("--history_per_epoch", action="store_true",
                         help="Write per-epoch val_loss to JSON (for Optuna pruning)")
+    # ── Training improvement args ──
+    parser.add_argument("--early_stop_patience", type=int, default=0,
+                        help="Early stopping patience (0=disabled, recommended 3-5 for GPT)")
     main(parser.parse_args())

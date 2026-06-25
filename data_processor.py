@@ -363,7 +363,7 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
 
 
 class PackedDatasetV2(Dataset):
-    """Dataset: returns (input_ids, targets, time_ids, position_ids, mask, va_values, reg_targets)."""
+    """Dataset: returns sequence dict (mask built in collate)."""
 
     def __init__(self, sequences):
         self.sequences = sequences
@@ -372,23 +372,25 @@ class PackedDatasetV2(Dataset):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        seq = self.sequences[idx]
-        S = seq["input_ids"].shape[0]
-        mask = _build_causal_mask(S)
-        return (
-            seq["input_ids"],
-            seq["targets"],
-            seq["time_ids"],
-            seq["position_ids"],
-            mask,
-            seq["va_values"],
-            seq["reg_targets"],
-        )
+        return self.sequences[idx]
 
 
 def make_dataloader_v2(sequences, batch_size=1, shuffle=True):
+    """DataLoader for single-sequence batches. Returns 8-tuple matching _pad_batch format."""
     def collate(batch):
-        return batch[0]
+        s = batch[0]
+        S = s["input_ids"].shape[0]
+        mask = _build_causal_mask(S)
+        return (
+            s["input_ids"],
+            s["targets"],
+            s.get("fine_targets", torch.zeros_like(s["targets"])),
+            s["time_ids"],
+            s["position_ids"],
+            mask,
+            s["va_values"],
+            s["reg_targets"],
+        )
     return DataLoader(
         PackedDatasetV2(sequences),
         batch_size=batch_size,

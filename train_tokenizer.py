@@ -5,11 +5,15 @@ Core optimizations:
   - GPU-resident data: entire training set on GPU, zero CPU-GPU transfer
   - In-place forward: add_() for graph-compatible accumulation
   - Feature caching: skip repeat normalization on re-runs
+  - Early stopping: patience-based to avoid over-training
+  - LR scheduler: warmup + cosine decay for better convergence
 
 Usage:
     python train_tokenizer.py
     python train_tokenizer.py --bits_l1 7 --bits_l2 6
     python train_tokenizer.py --val_every 10 --epochs 100
+    python train_tokenizer.py --early_stop_patience 15
+    python train_tokenizer.py --scheduler
 """
 import argparse
 import os
@@ -28,6 +32,43 @@ from tqdm import tqdm
 from config import DataConfig, TokenizerConfig, set_global_seed
 from data_processor import load_stocks, split_stocks, get_tokenizer_features_v2
 from model.tokenizer import HierarchicalQuantizer, build_tokenizer_kwargs, export_tokenizer_config
+
+
+class EarlyStopping:
+    """Early stopping with patience."""
+    def __init__(self, patience=15, min_delta=1e-4, mode="min"):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.best = float("inf") if mode == "min" else float("-inf")
+        self.counter = 0
+        self.best_epoch = -1
+
+    def __call__(self, metric, epoch=0):
+        if self.mode == "min":
+            improved = metric < self.best - self.min_delta
+        else:
+            improved = metric > self.best + self.min_delta
+        if improved:
+            self.best = metric
+            self.counter = 0
+            self.best_epoch = epoch
+        else:
+            self.counter += 1
+        return self.counter >= self.patience
+
+
+def build_tokenizer_scheduler(optimizer, total_steps, warmup_frac=0.05,
+                               min_lr_ratio=0.1):
+    """Warmup + cosine LR scheduler."""
+    import math
+    warmup_steps = max(1, int(total_steps * warmup_frac))
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # ============================================================================
@@ -82,13 +123,21 @@ def _validate(tok, val_feat_gpu, bs, device):
 # ============================================================================
 
 def _train_cuda_graph(tok, train_feat_gpu, val_feat_gpu, bs, epochs, val_every,
-                      save_path, ckpt_path, lr, grad_clip, device):
+                      save_path, ckpt_path, lr, grad_clip, device,
+                      early_stop=None, use_scheduler=False):
     """torch.compile(reduce-overhead) training — automatic CUDA graphs."""
     N = len(train_feat_gpu)
     n_steps = N // bs
     print(f"  Compiled mode: {n_steps} steps/epoch, bs={bs}")
 
     optimizer = torch.optim.Adam(tok.parameters(), lr=lr)
+
+    # Optional LR scheduler
+    scheduler = None
+    if use_scheduler:
+        total_steps = n_steps * epochs
+        scheduler = build_tokenizer_scheduler(optimizer, total_steps, warmup_frac=0.05)
+        print(f"  LR scheduler: warmup+cosine ({total_steps} total steps)")
 
     # Pre-allocate static buffer
     static_input = torch.empty(bs, 4, device=device, dtype=torch.float32)
@@ -138,9 +187,12 @@ def _train_cuda_graph(tok, train_feat_gpu, val_feat_gpu, bs, epochs, val_every,
             loss.backward()
             torch.nn.utils.clip_grad_norm_(tok.parameters(), grad_clip)
             optimizer.step()
+            if scheduler:
+                scheduler.step()
             train_loss_acc += loss.detach()
 
         train_loss = (train_loss_acc / n_steps).item()
+        cur_lr = optimizer.param_groups[0]["lr"]
 
         do_val = (epoch + 1) % val_every == 0 or (epoch + 1) == epochs
         if do_val:
@@ -168,7 +220,13 @@ def _train_cuda_graph(tok, train_feat_gpu, val_feat_gpu, bs, epochs, val_every,
         log_interval = max(1, epochs // 6)
         if do_val and ((epoch + 1) % log_interval == 0 or epoch == start_epoch or (epoch + 1) == epochs):
             print(f"  Epoch {epoch+1}: train={train_loss:.4f} val={val_loss:.4f} best={best_val:.4f} "
-                  f"{time.time()-t0:.0f}s")
+                  f"lr={cur_lr:.2e} {time.time()-t0:.0f}s")
+
+        # Early stopping
+        if early_stop and do_val and early_stop(val_loss, epoch):
+            print(f"  Early stopping at epoch {epoch+1} (best={early_stop.best:.4f} "
+                  f"at epoch {early_stop.best_epoch+1}, patience={early_stop.patience})")
+            break
 
     return best_val
 
@@ -252,6 +310,8 @@ def main(args=None):
     save_path = args.save_path if args else TokenizerConfig.save_path
     val_every = args.val_every if args else 5
     use_cuda_graph = args.cuda_graph if args else True
+    early_stop_patience = getattr(args, "early_stop_patience", 0)
+    use_scheduler = getattr(args, "scheduler", False)
     ckpt_path = save_path + ".ckpt"
 
     print(f"Device: {device}")
@@ -263,6 +323,11 @@ def main(args=None):
     else:
         bpq = getattr(TokenizerConfig, "bits_per_quantizer", 10)
         print(f"  bits_per_quantizer={bpq}, vocab_per_layer={2**bpq}")
+
+    # Early stopping
+    early_stop = None
+    if early_stop_patience > 0:
+        early_stop = EarlyStopping(patience=early_stop_patience, min_delta=1e-5)
 
     # Data + feature cache
     stocks = load_stocks(max_stocks=DataConfig.max_stocks)
@@ -305,6 +370,8 @@ def main(args=None):
             lr=TokenizerConfig.learning_rate,
             grad_clip=TokenizerConfig.grad_clip,
             device=device,
+            early_stop=early_stop,
+            use_scheduler=use_scheduler,
         )
     else:
         print("  Falling back to standard training loop")
@@ -343,6 +410,11 @@ if __name__ == "__main__":
     p.add_argument("--val_every", type=int, default=5, help="Validate every N epochs")
     p.add_argument("--cuda_graph", action="store_true", default=True, help="Use CUDA Graphs (default: on)")
     p.add_argument("--no_cuda_graph", dest="cuda_graph", action="store_false", help="Disable CUDA Graphs")
+    # ── Training improvement args ──
+    p.add_argument("--early_stop_patience", type=int, default=0,
+                   help="Early stopping patience (0=disabled, recommended 15-20)")
+    p.add_argument("--scheduler", action="store_true", default=False,
+                   help="Enable warmup+cosine LR scheduler")
     parsed = p.parse_args()
     if parsed.bits_l1 > 0:
         TokenizerConfig.bits_l1 = parsed.bits_l1
