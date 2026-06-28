@@ -431,56 +431,74 @@ def batched_gpt_eval_windowed(gpt, tokenizer, test_stocks, device,
     vocab = tokenizer.vocab_coarse
 
     for bucket in buckets:
-        for batch_start in range(0, len(bucket), batch_size):
+        batch_start = 0
+        while batch_start < len(bucket):
             batch = bucket[batch_start:batch_start + batch_size]
             B = len(batch)
             max_len = max(s["seq_len"] for s in batch)
 
-            inp = torch.zeros(B, max_len, dtype=torch.long, device=device)
-            tids = torch.zeros(B, max_len, 3, dtype=torch.long, device=device)
-            pos = torch.arange(max_len, device=device).unsqueeze(0).expand(B, -1)
-            mask = torch.zeros(B, max_len, max_len, dtype=torch.bool, device=device)
-            va = torch.zeros(B, max_len, 2, dtype=torch.float32, device=device)
+            try:
+                inp = torch.zeros(B, max_len, dtype=torch.long, device=device)
+                tids = torch.zeros(B, max_len, 3, dtype=torch.long, device=device)
+                pos = torch.arange(max_len, device=device).unsqueeze(0).expand(B, -1)
+                mask = torch.zeros(B, max_len, max_len, dtype=torch.bool, device=device)
+                va = torch.zeros(B, max_len, 2, dtype=torch.float32, device=device)
 
-            for j, s in enumerate(batch):
-                L = s["seq_len"]
-                inp[j, :L] = torch.tensor(s["inp_ids"], dtype=torch.long)
-                tids[j, :L, 0] = torch.tensor(s["day"], dtype=torch.long)
-                tids[j, :L, 1] = torch.tensor(s["month"], dtype=torch.long)
-                tids[j, :L, 2] = torch.tensor(s["year"], dtype=torch.long)
-                va[j, :L] = torch.tensor(s["va"], dtype=torch.float32)
-                mask[j, :L, :L] = torch.tril(torch.ones(L, L, dtype=torch.bool))
-                mask[j, L:, 0] = True
+                for j, s in enumerate(batch):
+                    L = s["seq_len"]
+                    inp[j, :L] = torch.tensor(s["inp_ids"], dtype=torch.long)
+                    tids[j, :L, 0] = torch.tensor(s["day"], dtype=torch.long)
+                    tids[j, :L, 1] = torch.tensor(s["month"], dtype=torch.long)
+                    tids[j, :L, 2] = torch.tensor(s["year"], dtype=torch.long)
+                    va[j, :L] = torch.tensor(s["va"], dtype=torch.float32)
+                    mask[j, :L, :L] = torch.tril(torch.ones(L, L, dtype=torch.bool))
+                    mask[j, L:, 0] = True
 
-            with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-                coarse_logits, fine_logits = gpt(inp, tids, pos, mask, va_values=va)
-            n_forward += 1
+                with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
+                    coarse_logits, fine_logits = gpt(inp, tids, pos, mask, va_values=va)
+                n_forward += 1
 
-            coarse_cpu = coarse_logits.float().cpu()
-            fine_cpu = fine_logits.float().cpu()
+                coarse_cpu = coarse_logits.float().cpu()
+                fine_cpu = fine_logits.float().cpu()
 
-            for j, s in enumerate(batch):
-                p_start = s["test_pos"]
-                for offset in range(n_days):
-                    p = p_start + offset
-                    if p >= coarse_cpu.shape[1]:
-                        break  # out of bounds for this batch item
+                for j, s in enumerate(batch):
+                    p_start = s["test_pos"]
+                    for offset in range(n_days):
+                        p = p_start + offset
+                        if p >= coarse_cpu.shape[1]:
+                            break  # out of bounds for this batch item
 
-                    cid = int(coarse_cpu[j, p, :vocab].argmax().item())
-                    fl = fine_cpu[j, p] if p < fine_cpu.shape[1] else torch.zeros(tokenizer.bsq_fine.vocab_size)
+                        cid = int(coarse_cpu[j, p, :vocab].argmax().item())
+                        fl = fine_cpu[j, p] if p < fine_cpu.shape[1] else torch.zeros(tokenizer.bsq_fine.vocab_size)
 
-                    # Date for this prediction's target: pred is for feat[p], so true is feat[p, 0]
-                    date_key = s["dates_raw"][p] if p < len(s["dates_raw"]) else "unknown"
+                        # Date for this prediction's target: pred is for feat[p], so true is feat[p, 0]
+                        date_key = s["dates_raw"][p] if p < len(s["dates_raw"]) else "unknown"
 
-                    predictions.append({
-                        "coarse_id": cid,
-                        "fine_logits": fl,
-                        "test_pos": p,
-                        "date_key": date_key,
-                        "day_offset": offset,
-                        "p_mean": s["p_mean"], "p_std": s["p_std"],
-                        "feat": s["feat"], "close": s["close"],
-                    })
+                        predictions.append({
+                            "coarse_id": cid,
+                            "fine_logits": fl,
+                            "test_pos": p,
+                            "date_key": date_key,
+                            "day_offset": offset,
+                            "p_mean": s["p_mean"], "p_std": s["p_std"],
+                            "feat": s["feat"], "close": s["close"],
+                        })
+
+                batch_start += batch_size
+
+            except torch.cuda.OutOfMemoryError:
+                # OOM fallback: halve batch_size and retry; if already 1, skip this stock
+                torch.cuda.empty_cache()
+                if batch_size > 1:
+                    batch_size = max(1, batch_size // 2)
+                    if not silent:
+                        print(f"  [OOM] Reducing eval batch_size to {batch_size} "
+                              f"(seq_len={max_len})")
+                    continue  # retry same batch_start with smaller batch
+                else:
+                    if not silent:
+                        print(f"  [OOM] Skipping stock (seq_len={max_len}, bs=1)")
+                    batch_start += 1
 
     if not silent:
         print(f"  {n_forward} forward passes, {len(predictions)} predictions")

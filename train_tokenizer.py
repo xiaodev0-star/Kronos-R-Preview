@@ -103,19 +103,16 @@ def _load_or_compute_features(stocks, tag, cutoff_date):
 def _validate(tok, val_feat_gpu, bs, device):
     tok.eval()
     N = len(val_feat_gpu)
-    n_batches = (N + bs - 1) // bs
+    # Only iterate full batches — skip last incomplete to avoid zero-pad pollution
+    n_batches = N // bs
     val_loss_sum = 0.0
     with torch.inference_mode():
         for i in range(n_batches):
             batch = val_feat_gpu[i * bs : (i + 1) * bs]
-            if batch.shape[0] != bs:
-                # Pad last batch to fixed size for consistency
-                pad = torch.zeros(bs - batch.shape[0], *batch.shape[1:], device=device, dtype=batch.dtype)
-                batch = torch.cat([batch, pad], dim=0)
             loss = tok(batch)
             val_loss_sum += loss.item()
     tok.train()
-    return val_loss_sum / n_batches
+    return val_loss_sum / max(n_batches, 1)
 
 
 # ============================================================================
@@ -143,9 +140,14 @@ def _train_cuda_graph(tok, train_feat_gpu, val_feat_gpu, bs, epochs, val_every,
     static_input = torch.empty(bs, 4, device=device, dtype=torch.float32)
 
     # torch.compile with cudagraphs backend — uses CUDA graphs internally
-    if hasattr(torch, "compile"):
+    # torch.compile(backend="cudagraphs") — disabled on Windows (Jinja2/triton errors)
+    import sys as _sys
+    if _sys.platform != "win32" and hasattr(torch, "compile"):
         tok = torch.compile(tok, backend="cudagraphs")
         print("  torch.compile(backend='cudagraphs') enabled")
+    else:
+        if _sys.platform == "win32":
+            print("  torch.compile disabled (Windows)")
 
     # Warmup
     print("  Warming up (5 steps)...")

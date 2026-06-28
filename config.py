@@ -80,14 +80,14 @@ class ModelConfig:
 
 class TrainingConfig:
     epochs: int = 10
-    batch_size: int = 4             # batch_size=1 (stable; batching needs more VRAM)
-    accumulation_steps: int = 8     # was 16 — halved for faster updates
-    num_workers: int = 2            # was 0 — parallel data loading
+    batch_size: int = 1             # single-seq fastest for variable-length stocks
+    accumulation_steps: int = 32    # effective batch = 32
+    num_workers: int = 2            # parallel data loading
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     warmup_ratio: float = 0.05
-    use_gradient_checkpointing: bool = False  # was True — minimal benefit for 2 layers
+    use_gradient_checkpointing: bool = False  # minimal benefit for 2 layers
     random_seed: int = 42
     max_train_updates: int = 0
     save_dir: str = "checkpoints"

@@ -72,7 +72,11 @@ class Attention(nn.Module):
             v = v.repeat_interleave(self.kv_groups, dim=1)
 
         drop_rate = self.dropout_p if self.training else 0.0
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop_rate)
+        # Use is_causal=True when no explicit mask is provided — avoids allocating [N,N] mask
+        if attn_mask is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=drop_rate)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop_rate)
         out = out.transpose(1, 2).reshape(B, N, -1)
         return self.out_proj(out)
 

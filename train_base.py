@@ -46,28 +46,66 @@ class EarlyStopping:
 
 def focal_loss(logits, targets, gamma=2.0, label_smoothing=0.0, entropy_alpha=0.0,
                ignore_index=-100):
+    """Focal loss with optimized softmax computation (single log_softmax call)."""
     ce = F.cross_entropy(logits, targets, reduction='none', ignore_index=ignore_index,
                          label_smoothing=label_smoothing)
     mask = (targets != ignore_index).float()
     safe_targets = targets.clamp(min=0)
     with torch.no_grad():
-        probs = F.softmax(logits, dim=-1)
-        pt = probs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1).clamp(1e-8, 1.0)
+        # Single log_softmax instead of separate softmax — avoids redundant computation
+        log_probs = F.log_softmax(logits, dim=-1)
+        pt = log_probs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1).exp().clamp(1e-8, 1.0)
     focal_weight = (1 - pt) ** gamma
     loss = (focal_weight * ce * mask).sum() / mask.sum().clamp(min=1)
     if entropy_alpha > 0:
-        log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
         entropy = -(probs * log_probs).sum(dim=-1)
         ent_loss = (entropy * mask).sum() / mask.sum().clamp(min=1)
         loss = loss - entropy_alpha * ent_loss
     return loss
 
 
+def build_wsd_scheduler(optimizer, total_updates, warmup_ratio=0.05, stable_ratio=0.75):
+    """WSD (Warmup-Stable-Decay) scheduler — superior to cosine for short training runs.
+
+    Phases:
+      - Warmup (5%): linear ramp from 0 to peak lr
+      - Stable (75%): constant peak lr
+      - Decay (20%): linear decay to 0
+    """
+    warmup = max(1, int(total_updates * warmup_ratio))
+    stable_end = warmup + int(total_updates * stable_ratio)
+
+    def lr_lambda(step):
+        if step < warmup:
+            return step / max(warmup, 1)
+        if step < stable_end:
+            return 1.0
+        # Linear decay from 1.0 to 0 over remaining steps
+        decay_steps = total_updates - stable_end
+        if decay_steps <= 0:
+            return 1.0
+        progress = (step - stable_end) / decay_steps
+        return max(0.0, 1.0 - progress)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def _to_device(batch, device):
-    """Move an 8-tuple batch to device and ensure batch dimension."""
-    inp, tgt, ftgt, tids, pos, mask, va, rt = [x.to(device, non_blocking=True) for x in batch]
+    """Move an 8-tuple batch to device and ensure batch dimension. mask may be None (is_causal)."""
+    inp, tgt, ftgt, tids, pos, mask, va, rt = batch
+    inp = inp.to(device, non_blocking=True)
+    tgt = tgt.to(device, non_blocking=True)
+    ftgt = ftgt.to(device, non_blocking=True)
+    tids = tids.to(device, non_blocking=True)
+    pos = pos.to(device, non_blocking=True)
+    mask = mask.to(device, non_blocking=True) if mask is not None else None
+    va = va.to(device, non_blocking=True)
+    rt = rt.to(device, non_blocking=True)
     if inp.dim() == 1:
-        inp, tgt, ftgt, tids, pos, mask, va, rt = [x.unsqueeze(0) for x in (inp, tgt, ftgt, tids, pos, mask, va, rt)]
+        inp, tgt, ftgt, tids, pos, va, rt = [x.unsqueeze(0) for x in (inp, tgt, ftgt, tids, pos, va, rt)]
+        if mask is not None:
+            mask = mask.unsqueeze(0)
     return inp, tgt, ftgt, tids, pos, mask, va, rt
 
 
@@ -110,10 +148,42 @@ def _pad_batch(sequences, batch_size):
 
 
 class BatchedDataLoader:
-    def __init__(self, sequences, batch_size, shuffle=True):
+    """Length-sorted batched loader with tolerance-based bucketing and optional curriculum."""
+    def __init__(self, sequences, batch_size, shuffle=True, tolerance=500,
+                 curriculum_epoch=-1, total_epochs=30):
         self.sequences = sequences
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.tolerance = tolerance
+        self.curriculum_epoch = curriculum_epoch
+        self.total_epochs = total_epochs
+        self._epoch = 0
+
+    def set_epoch(self, epoch):
+        """Set current epoch for curriculum filtering."""
+        self._epoch = epoch
+
+    def _get_curriculum_max_len(self):
+        """Return max sequence length for current epoch (curriculum learning).
+
+        Thresholds are absolute (designed for 30-epoch training):
+          - Epoch 0-9:  max 2000 tokens (~70% stocks)
+          - Epoch 10-19: max 5000 tokens
+          - Epoch 20+:  no limit (all stocks)
+        For shorter runs, proportionally compressed thresholds are used.
+        """
+        if self.curriculum_epoch < 0:
+            return 0  # disabled
+        epoch = self._epoch
+        total = self.total_epochs
+        # Compute phase boundaries proportionally, with minimum 1 epoch per phase
+        phase1_end = max(1, total * 10 // 30)  # ~33% of training
+        phase2_end = max(phase1_end + 1, total * 20 // 30)  # ~67% of training
+        if epoch < phase1_end:
+            return 2000
+        elif epoch < phase2_end:
+            return 5000
+        return 0  # no limit
 
     def __iter__(self):
         indices = list(range(len(self.sequences)))
@@ -121,11 +191,42 @@ class BatchedDataLoader:
             rng = torch.Generator()
             rng.manual_seed(torch.randint(0, 2**31, (1,)).item())
             indices = torch.randperm(len(self.sequences), generator=rng).tolist()
+
+        # Curriculum filtering
+        max_len = self._get_curriculum_max_len()
+        if max_len > 0:
+            indices = [i for i in indices
+                       if self.sequences[i]["input_ids"].shape[0] <= max_len]
+            if not indices:
+                indices = list(range(len(self.sequences)))  # fallback to all
+
+        # Sort by length for efficient batching (tolerance-based bucketing)
         grouped = sorted(indices, key=lambda i: self.sequences[i]["input_ids"].shape[0])
-        for i in range(0, len(grouped), self.batch_size):
-            batch_idx = grouped[i:i + self.batch_size]
-            group = [self.sequences[j] for j in batch_idx]
-            yield _pad_batch(group, len(group))[0]
+        buckets = []
+        bucket = [grouped[0]] if grouped else []
+        for i in grouped[1:]:
+            seq_len = self.sequences[i]["input_ids"].shape[0]
+            bucket_max = max(self.sequences[j]["input_ids"].shape[0] for j in bucket)
+            if seq_len - bucket_max <= self.tolerance:
+                bucket.append(i)
+            else:
+                buckets.append(bucket)
+                bucket = [i]
+        if bucket:
+            buckets.append(bucket)
+
+        # Shuffle buckets for training diversity, then yield batches
+        if self.shuffle:
+            rng2 = torch.Generator()
+            rng2.manual_seed(torch.randint(0, 2**31, (1,)).item())
+            perm = torch.randperm(len(buckets), generator=rng2).tolist()
+            buckets = [buckets[p] for p in perm]
+
+        for bucket in buckets:
+            for i in range(0, len(bucket), self.batch_size):
+                batch_idx = bucket[i:i + self.batch_size]
+                group = [self.sequences[j] for j in batch_idx]
+                yield _pad_batch(group, len(group))[0]
 
     def __len__(self):
         return (len(self.sequences) + self.batch_size - 1) // self.batch_size
@@ -204,10 +305,16 @@ def main(args):
     print(f"Train seqs: {len(train_seqs)}, Val seqs: {len(val_seqs)}")
 
     bs = TrainingConfig.batch_size
+    use_curriculum = getattr(args, "curriculum", False)
     if bs > 1:
-        train_loader = BatchedDataLoader(train_seqs, bs, shuffle=True)
-        val_loader = BatchedDataLoader(val_seqs, bs, shuffle=False)
-        print(f"Loader: batched, bs={bs}, accum={TrainingConfig.accumulation_steps}")
+        train_loader = BatchedDataLoader(train_seqs, bs, shuffle=True, tolerance=500,
+                                          curriculum_epoch=0 if use_curriculum else -1,
+                                          total_epochs=epochs)
+        val_loader = BatchedDataLoader(val_seqs, bs, shuffle=False, tolerance=500)
+        print(f"Loader: batched, bs={bs}, accum={TrainingConfig.accumulation_steps}, tolerance=500")
+        if use_curriculum:
+            print(f"  [CURRICULUM] Phase 1 (ep 1-{epochs//3}): max 2000 tokens, "
+                  f"Phase 2 (ep {epochs//3+1}-{2*epochs//3}): max 5000, Phase 3: all")
     else:
         train_loader = make_dataloader_v2(train_seqs, batch_size=1, shuffle=True)
         val_loader = make_dataloader_v2(val_seqs, batch_size=1, shuffle=False)
@@ -258,20 +365,43 @@ def main(args):
         optimizer_adam = None
         print(f"Optimizer: AdamW, lr={effective_lr}, wd={args.weight_decay}")
 
-    total_updates = len(train_loader) * epochs
-    warmup = max(1, int(total_updates * TrainingConfig.warmup_ratio))
-
-    def lr_lambda(step):
-        if step < warmup:
-            return step / max(warmup, 1)
-        p = (step - warmup) / max(total_updates - warmup, 1)
-        return 0.5 * (1.0 + math.cos(math.pi * p))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scheduler_adam = torch.optim.lr_scheduler.LambdaLR(optimizer_adam, lr_lambda) if optimizer_adam else None
     amp_dtype = torch.bfloat16
     accum = TrainingConfig.accumulation_steps
     trainable_params = [p for group in optimizer.param_groups for p in group["params"]]
+
+    # Compute actual total optimizer steps (accounts for curriculum + dynamic accum)
+    n_train_seqs = len(train_seqs)
+    if use_curriculum:
+        phase1_end = max(1, epochs * 10 // 30)
+        phase2_end = max(phase1_end + 1, epochs * 20 // 30)
+        n_short = sum(1 for s in train_seqs if s["input_ids"].shape[0] <= 2000)
+        n_med = sum(1 for s in train_seqs if s["input_ids"].shape[0] <= 5000)
+        accum_late = accum * 2  # epoch >= 15
+        actual_total = (
+            phase1_end * max(1, n_short // accum)
+            + min(max(0, phase2_end - phase1_end), max(0, 15 - phase1_end)) * max(1, n_med // accum)
+            + max(0, min(phase2_end, epochs) - max(phase1_end, 15)) * max(1, n_med // accum_late)
+            + max(0, epochs - max(phase2_end, 15)) * max(1, n_train_seqs // accum_late)
+        )
+    else:
+        accum_late = accum * 2
+        early_epochs = min(15, epochs)
+        late_epochs = max(0, epochs - 15)
+        steps_per_epoch = max(1, n_train_seqs // accum)
+        steps_per_epoch_late = max(1, n_train_seqs // accum_late)
+        actual_total = early_epochs * steps_per_epoch + late_epochs * steps_per_epoch_late
+
+    total_updates = max(actual_total, 1)
+    print(f"  Scheduler: total_updates={total_updates} (actual optimizer steps, "
+          f"not naive {len(train_loader) * epochs})")
+
+    # WSD scheduler (Warmup-Stable-Decay)
+    scheduler = build_wsd_scheduler(optimizer, total_updates,
+                                     warmup_ratio=TrainingConfig.warmup_ratio,
+                                     stable_ratio=0.75)
+    scheduler_adam = build_wsd_scheduler(optimizer_adam, total_updates,
+                                          warmup_ratio=TrainingConfig.warmup_ratio,
+                                          stable_ratio=0.75) if optimizer_adam else None
 
     # ---- Resume ----
     start_epoch = 0
@@ -299,7 +429,41 @@ def main(args):
     history = {"train_loss": [], "val_loss": [], "val_het_loss": [], "lr": []}
     t0 = time.time()
 
+    # Profiler from args (passed by sweep_bits)
+    profiler = getattr(args, "profiler", None)
+    if profiler:
+        profiler.start("gpt_train")
+
+    epochs_done = 0
     for epoch in range(start_epoch, epochs):
+        # Update curriculum epoch for length filtering
+        if hasattr(train_loader, "set_epoch"):
+            train_loader.set_epoch(epoch)
+
+        # For single-seq mode: apply curriculum filter by rebuilding loader each epoch
+        if bs == 1 and use_curriculum:
+            phase1_end = max(1, epochs * 10 // 30)
+            phase2_end = max(phase1_end + 1, epochs * 20 // 30)
+            if epoch < phase1_end:
+                max_len = 2000
+            elif epoch < phase2_end:
+                max_len = 5000
+            else:
+                max_len = 0  # no limit
+            if max_len > 0:
+                filtered = [s for s in train_seqs if s["input_ids"].shape[0] <= max_len]
+                if filtered:
+                    train_loader = make_dataloader_v2(filtered, batch_size=1, shuffle=True)
+                # else: keep full dataset if filter is too aggressive
+
+        # Dynamic accumulation: double accum after epoch 15 for stronger gradient signal
+        # epoch 0-14: accum=32 (effective batch=32)
+        # epoch 15+:  accum=64 (effective batch=64, more stable gradients)
+        epoch_accum = accum if epoch < 15 else accum * 2
+        if epoch == 15:
+            print(f"  [accum] Doubling accumulation: {accum} -> {epoch_accum} "
+                  f"(effective batch {bs * epoch_accum})")
+
         model.train()
         loss_acc = torch.zeros((), device=device)
         n_loss = 0
@@ -307,70 +471,94 @@ def main(args):
         if optimizer_adam:
             optimizer_adam.zero_grad(set_to_none=True)
 
-        pbar = tqdm(train_loader, desc=f"[{args.tag}] Epoch {epoch+1}/{epochs}")
+        # Profiler sub-timing accumulators (sampled every 20 steps)
+        t_forward_acc = 0.0
+        t_backward_acc = 0.0
+
+        pbar = tqdm(train_loader, desc=f"[{args.tag}] Epoch {epoch+1}/{epochs}",
+                    ncols=80)
         for bi, batch in enumerate(pbar):
             input_ids, target, fine_target, time_id, pos_id, mask, va_val, reg_target = _to_device(batch, device)
 
-            with torch.amp.autocast("cuda", dtype=amp_dtype):
-                if args.heteroscedastic:
-                    coarse_logits, fine_logits, _, het_loss = model(
-                        input_ids, time_id, pos_id, mask,
-                        va_values=va_val, reg_targets=reg_target,
-                        fine_targets=fine_target)
-                else:
-                    coarse_logits, fine_logits = model(
-                        input_ids, time_id, pos_id, mask,
-                        va_values=va_val, fine_targets=fine_target)
-                    het_loss = None
+            try:
+                # Forward pass (timed every 20 steps)
+                t_fwd_start = time.perf_counter() if (bi + 1) % 20 == 0 else 0
+                with torch.amp.autocast("cuda", dtype=amp_dtype):
+                    if args.heteroscedastic:
+                        coarse_logits, fine_logits, _, het_loss = model(
+                            input_ids, time_id, pos_id, mask,
+                            va_values=va_val, reg_targets=reg_target,
+                            fine_targets=fine_target)
+                    else:
+                        coarse_logits, fine_logits = model(
+                            input_ids, time_id, pos_id, mask,
+                            va_values=va_val, fine_targets=fine_target)
+                        het_loss = None
 
-                # Coarse loss (main)
-                shift_coarse = coarse_logits[:, :-1, :].contiguous()
-                shift_targets = target.contiguous()
-                if (shift_targets == -100).all():
+                    # Coarse loss (main)
+                    shift_coarse = coarse_logits[:, :-1, :].contiguous()
+                    shift_targets = target.contiguous()
+                    if (shift_targets == -100).all():
+                        continue
+                    if args.loss == "focal":
+                        loss = focal_loss(shift_coarse.view(-1, shift_coarse.size(-1)),
+                                          shift_targets.view(-1), gamma=args.gamma,
+                                          label_smoothing=args.label_smoothing,
+                                          entropy_alpha=args.entropy_alpha)
+                    else:
+                        loss = F.cross_entropy(shift_coarse.view(-1, shift_coarse.size(-1)),
+                                               shift_targets.view(-1), ignore_index=-100,
+                                               label_smoothing=args.label_smoothing)
+
+                    # Fine loss: f_logits is [B, S-1, V_fine], fine_target is [B, S-1]
+                    shift_fine = fine_logits[:, 1:, :].contiguous()    # [B, S-2, V_fine]
+                    shift_fine_tgt = fine_target[:, 1:].contiguous() # [B, S-2]
+                    fine_mask = (shift_targets != -100)
+                    if fine_mask.any():
+                        fine_loss = F.cross_entropy(
+                            shift_fine.view(-1, shift_fine.size(-1)),
+                            shift_fine_tgt.view(-1), ignore_index=0)
+                        loss = loss + args.fine_weight * fine_loss
+
+                    if het_loss is not None and args.heteroscedastic:
+                        loss = loss + args.het_weight * het_loss
+
+                if t_fwd_start > 0:
+                    t_forward_acc += time.perf_counter() - t_fwd_start
+
+                if loss is None:
                     continue
-                if args.loss == "focal":
-                    loss = focal_loss(shift_coarse.view(-1, shift_coarse.size(-1)),
-                                      shift_targets.view(-1), gamma=args.gamma,
-                                      label_smoothing=args.label_smoothing,
-                                      entropy_alpha=args.entropy_alpha)
-                else:
-                    loss = F.cross_entropy(shift_coarse.view(-1, shift_coarse.size(-1)),
-                                           shift_targets.view(-1), ignore_index=-100,
-                                           label_smoothing=args.label_smoothing)
 
-                # Fine loss: f_logits is [B, S-1, V_fine], fine_target is [B, S-1]
-                # f_logits[t] predicts fine_target[t], skip first position (no context)
-                shift_fine = fine_logits[:, 1:, :].contiguous()    # [B, S-2, V_fine]
-                shift_fine_tgt = fine_target[:, 1:].contiguous() # [B, S-2]
-                fine_mask = (shift_targets != -100)
-                if fine_mask.any():
-                    fine_loss = F.cross_entropy(
-                        shift_fine.view(-1, shift_fine.size(-1)),
-                        shift_fine_tgt.view(-1), ignore_index=0)
-                    loss = loss + args.fine_weight * fine_loss
+                # Backward pass (timed every 20 steps)
+                t_bwd_start = time.perf_counter() if (bi + 1) % 20 == 0 else 0
+                (loss / epoch_accum).backward()
+                if t_bwd_start > 0:
+                    t_backward_acc += time.perf_counter() - t_bwd_start
 
-                if het_loss is not None and args.heteroscedastic:
-                    loss = loss + args.het_weight * het_loss
+                if (bi + 1) % epoch_accum == 0 or (bi + 1) == len(train_loader):
+                    torch.nn.utils.clip_grad_norm_(trainable_params, TrainingConfig.grad_clip)
+                    optimizer.step()
+                    if optimizer_adam:
+                        optimizer_adam.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    if optimizer_adam:
+                        optimizer_adam.zero_grad(set_to_none=True)
+                    scheduler.step()
+                    if scheduler_adam:
+                        scheduler_adam.step()
+                    global_step += 1
 
-            if loss is None:
-                continue
+                loss_acc += loss.detach()
+                n_loss += 1
 
-            (loss / accum).backward()
-            if (bi + 1) % accum == 0 or (bi + 1) == len(train_loader):
-                torch.nn.utils.clip_grad_norm_(trainable_params, TrainingConfig.grad_clip)
-                optimizer.step()
-                if optimizer_adam:
-                    optimizer_adam.step()
+            except torch.cuda.OutOfMemoryError:
+                # OOM fallback: skip this batch, clear cache
+                torch.cuda.empty_cache()
                 optimizer.zero_grad(set_to_none=True)
                 if optimizer_adam:
                     optimizer_adam.zero_grad(set_to_none=True)
-                scheduler.step()
-                if scheduler_adam:
-                    scheduler_adam.step()
-                global_step += 1
-
-            loss_acc += loss.detach()
-            n_loss += 1
+                print(f"  [OOM] Skipped batch {bi+1} (seq_len={input_ids.shape[-1]}, bs={input_ids.shape[0]})")
+                continue
 
             # Update pbar every 20 steps (avoids per-step .item() sync)
             if (bi + 1) % 20 == 0:
@@ -379,6 +567,13 @@ def main(args):
 
             if TrainingConfig.max_train_updates and global_step >= TrainingConfig.max_train_updates:
                 break
+
+        # Record profiler sub-timings (sampled, not exact per-step)
+        if profiler:
+            if t_forward_acc > 0:
+                profiler.record("gpt_forward", t_forward_acc)
+            if t_backward_acc > 0:
+                profiler.record("gpt_backward", t_backward_acc)
 
         avg_train = (loss_acc / max(n_loss, 1)).item()
 
@@ -446,9 +641,9 @@ def main(args):
                 json.dump(history, f, indent=2)
 
         save_tag = ""
+        sd = model.state_dict()
         if avg_val < best_val:
             best_val = avg_val
-            sd = model.state_dict()
             torch.save({
                 "model_state_dict": sd,
                 "config": {"dim": ModelConfig.dim, "depth": ModelConfig.depth,
@@ -473,6 +668,19 @@ def main(args):
             }, save_path)
             save_tag = "  -> Saved best"
 
+        # Per-epoch checkpoint (for inference reuse of any epoch's weights)
+        epoch_ckpt_path = save_path.replace(".pt", f"_ep{epoch+1}.pt")
+        torch.save({
+            "model_state_dict": sd,
+            "config": {"dim": ModelConfig.dim, "depth": ModelConfig.depth,
+                       "heads": ModelConfig.heads, "num_kv_heads": ModelConfig.num_kv_heads,
+                       "vocab_size": ModelConfig.vocab_size, "vocab_fine": ModelConfig.vocab_fine},
+            "val_loss": avg_val,
+            "epoch": epoch,
+            "tag": args.tag,
+        }, epoch_ckpt_path)
+
+        # Resume checkpoint (for training resume)
         ckpt_dict = {
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -515,7 +723,11 @@ def main(args):
 
     with open(os.path.join(os.path.dirname(save_path) or ".", f"history_{args.tag}.json"), "w") as f:
         json.dump(history, f, indent=2)
-    print(f"\nDone. Best val_loss: {best_val:.4f}")
+
+    if profiler:
+        profiler.end("gpt_train")
+
+    print(f"\nDone. Best val_loss: {best_val:.4f} (after {epochs_done} epochs)")
 
 
 if __name__ == "__main__":

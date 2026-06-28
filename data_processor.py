@@ -375,19 +375,21 @@ class PackedDatasetV2(Dataset):
         return self.sequences[idx]
 
 
-def make_dataloader_v2(sequences, batch_size=1, shuffle=True):
-    """DataLoader for single-sequence batches. Returns 8-tuple matching _pad_batch format."""
+def make_dataloader_v2(sequences, batch_size=1, shuffle=True, num_workers=0):
+    """DataLoader for single-sequence batches. Returns 8-tuple matching _pad_batch format.
+
+    When batch_size=1, no explicit mask is needed — SDPA uses is_causal=True instead.
+    """
     def collate(batch):
         s = batch[0]
-        S = s["input_ids"].shape[0]
-        mask = _build_causal_mask(S)
+        # Return None for mask — SDPA will use is_causal=True for causal attention
         return (
             s["input_ids"],
             s["targets"],
             s.get("fine_targets", torch.zeros_like(s["targets"])),
             s["time_ids"],
             s["position_ids"],
-            mask,
+            None,  # mask: let SDPA handle causal attention via is_causal=True
             s["va_values"],
             s["reg_targets"],
         )
@@ -397,4 +399,5 @@ def make_dataloader_v2(sequences, batch_size=1, shuffle=True):
         shuffle=shuffle,
         collate_fn=collate,
         pin_memory=True,
+        num_workers=num_workers,
     )
