@@ -1,6 +1,12 @@
 checkpoint/
 dataset/
 TEMP/
+.claude/
+.qoder/
+.workbuddy/
+.uploads/
+.trae-html-share-packages/
+__pycache__/
 *.json
 *.pyc
 *.pt
@@ -10,3 +16,7 @@ TEMP/
 *.db
 *.log
 *.txt
+CLAUDE.md
+Abilition.md
+Difussion-GPTNBERT.md
+gen*.py

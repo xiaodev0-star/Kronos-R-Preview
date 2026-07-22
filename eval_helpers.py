@@ -40,6 +40,8 @@ def load_gpt(path, device, tokenizer=None):
         ModelConfig.heads = cfg["heads"]
     if "num_kv_heads" in cfg:
         ModelConfig.num_kv_heads = cfg["num_kv_heads"]
+    if "ffn_multiplier" in cfg:
+        ModelConfig.ffn_multiplier = cfg["ffn_multiplier"]
     model = KronosPreview().to(device)
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
@@ -220,28 +222,32 @@ def _prepare_stocks_batch(stocks, tokenizer, device):
     # Tokenize on CPU to avoid GPU memory spike
     cpu_device = torch.device("cpu")
     max_T = max(a["T_total"] for a in all_arrays)
-    batch_np = np.zeros((len(all_arrays), max_T, 4), dtype=np.float32)
-    lengths = []
-    for j, a in enumerate(all_arrays):
-        T = a["T_total"]
-        batch_np[j, :T] = a["price_normed"][:T]
-        lengths.append(T)
+    N = len(all_arrays)
 
-    # Process in chunks of 256 to avoid CPU memory spike
-    chunk_size = 256
-    all_idx_chunks = []
-    for i in range(0, len(batch_np), chunk_size):
-        chunk = torch.from_numpy(batch_np[i:i+chunk_size]).float()
+    # Pre-allocate output directly (avoids building a list of chunks)
+    all_idx_np = np.zeros((N, max_T), dtype=np.int32)
+
+    # Process in chunks to avoid GPU memory spike
+    chunk_size = 64  # smaller chunks = less peak memory
+    for i in range(0, N, chunk_size):
+        end = min(i + chunk_size, N)
+        # Build chunk tensor from stocks one-by-one (avoid large batch_np)
+        chunk_len = end - i
+        chunk_np = np.zeros((chunk_len, max_T, 4), dtype=np.float32)
+        for k, a in enumerate(all_arrays[i:end]):
+            T = a["T_total"]
+            chunk_np[k, :T] = a["price_normed"][:T]
+        chunk_t = torch.from_numpy(chunk_np)
         with torch.no_grad():
-            idx, _ = tokenizer.encode(chunk.to(device))
-        all_idx_chunks.append(idx.cpu().numpy())
-    all_idx_np = np.concatenate(all_idx_chunks, axis=0)
+            idx, _ = tokenizer.encode(chunk_t.to(device))
+        all_idx_np[i:end, :] = idx.cpu().numpy().astype(np.int32)
+        del chunk_np, chunk_t, idx  # free immediately
 
     vocab = tokenizer.vocab_coarse
     bos_id = vocab
     results = []
     for j, arrays in enumerate(all_arrays):
-        T = lengths[j]
+        T = arrays["T_total"]
         token_ids = all_idx_np[j, :T]
         day, month, year = arrays["day"], arrays["month"], arrays["year"]
 
@@ -400,11 +406,12 @@ def batched_gpt_eval_windowed(gpt, tokenizer, test_stocks, device,
                               batch_size=16, n_days=20, silent=False):
     """Batched GPT evaluation with multi-day sliding window.
 
-    For each test stock, predicts positions test_pos .. test_pos+n_days-1.
-    Returns a list of dicts, one per prediction, with date info attached.
+    For each test stock, predicts up to n_days consecutive positions starting
+    from test_pos.  Stocks with fewer than n_days positions are still included
+    (evaluated for as many positions as available).
 
     Args:
-        n_days: number of consecutive days to predict (default 20)
+        n_days: maximum number of consecutive days to predict per stock (default 20)
     """
     # Phase 1: batch tokenize
     if not silent:
@@ -413,12 +420,13 @@ def batched_gpt_eval_windowed(gpt, tokenizer, test_stocks, device,
     if not silent:
         print(f"  {len(prepped)} valid stocks, n_days={n_days}")
 
-    # Filter stocks that have enough test data
-    valid = [p for p in prepped if p["test_pos"] + n_days < p["seq_len"]]
+    # Filter stocks that have at least some test data
+    min_required = min(n_days, 10)
+    valid = [p for p in prepped if p["test_pos"] + min_required <= p["seq_len"]]
     if not valid:
         return []
     if not silent:
-        print(f"  {len(valid)} stocks with >= {n_days} test days")
+        print(f"  {len(valid)} stocks with >= {min_required} test days")
 
     # Phase 2: bucket by length
     buckets = _bucket_by_length(valid, tolerance=100)
@@ -503,23 +511,33 @@ def batched_gpt_eval_windowed(gpt, tokenizer, test_stocks, device,
     if not silent:
         print(f"  {n_forward} forward passes, {len(predictions)} predictions")
 
-    # Phase 4: batch decode all coarse IDs
+    # Phase 4: decode in batches to avoid OOM (don't stack all 2M+ tensors at once)
+    decode_bs = 10000
+    n_preds = len(predictions)
     if not silent:
-        print(f"  Batch decoding {len(predictions)} predictions...")
-    fine_tensor = torch.stack([p["fine_logits"] for p in predictions])
-    coarse_ids = [p["coarse_id"] for p in predictions]
-    decoded = decode_coarse_batch(coarse_ids, fine_tensor, tokenizer, device)
+        print(f"  Decoding {n_preds} predictions in batches of {decode_bs}...")
 
-    for i, pred in enumerate(predictions):
-        pred["decoded_feat"] = decoded[i]
-        pred["pred_logret"] = float(decoded[i][0]) * pred["p_std"][0] + pred["p_mean"][0]
-        # Ground truth: pred is for feat[tp, 0] = log_ret[tp]
-        tp = pred["test_pos"]
-        pred["true_logret"] = float(pred["feat"][tp, 0]) if tp < len(pred["feat"]) else 0.0
-        pred["base_close"] = float(pred["close"][tp - 1]) if tp - 1 >= 0 else float(pred["close"][0])
-        pred["true_close"] = float(pred["close"][tp]) if tp < len(pred["close"]) else 0.0
-        # Clean up heavy metadata to save memory
-        del pred["fine_logits"], pred["feat"], pred["close"]
+    for start in range(0, n_preds, decode_bs):
+        end = min(start + decode_bs, n_preds)
+        chunk = predictions[start:end]
+        fine_tensor = torch.stack([p["fine_logits"] for p in chunk])
+        coarse_ids = [p["coarse_id"] for p in chunk]
+        decoded = decode_coarse_batch(coarse_ids, fine_tensor, tokenizer, device)
+
+        for i, pred in enumerate(chunk):
+            pred["decoded_feat"] = decoded[i]
+            pred["pred_logret"] = float(decoded[i][0]) * pred["p_std"][0] + pred["p_mean"][0]
+            tp = pred["test_pos"]
+            feat = pred["feat"]
+            close = pred["close"]
+            n_close = len(close)
+            pred["true_logret"] = float(feat[tp, 0]) if tp < len(feat) else 0.0
+            pred["base_close"] = float(close[tp - 1]) if 0 <= tp - 1 < n_close else float(close[-1])
+            pred["true_close"] = float(close[tp]) if 0 <= tp < n_close else float(close[-1])
+            del pred["fine_logits"], pred["feat"], pred["close"]
+
+        if not silent and end % 500000 == 0:
+            print(f"    decoded {end}/{n_preds}")
 
     return predictions
 
@@ -534,7 +552,12 @@ def compute_windowed_metrics(predictions):
     from collections import defaultdict
 
     if not predictions:
-        return {"avg_da_per_date": 0, "n_predictions": 0}
+        return {"avg_da_per_date": 0, "da_std": 0, "da_vol": 0,
+                "n_dates": 0, "n_predictions": 0,
+                "avg_da_above_baseline": 0, "signal_score": 0,
+                "collapse_rate": 0, "n_unique_tokens": 0,
+                "rank_ic": 0, "ampratio": 0, "mape": 0, "baseline_mape": 0,
+                "per_date": {}}
 
     # Group predictions by date
     by_date = defaultdict(list)
@@ -619,6 +642,20 @@ def compute_windowed_metrics(predictions):
     eps = 1e-8
     amp_ratio = float(np.mean(np.abs(all_pred_lrs_arr)) / max(np.mean(np.abs(all_true_lrs_arr)), eps))
 
+    # MAPE (price space): convert log returns to prices, compare
+    all_base_closes = np.array([p.get("base_close", 0) for p in predictions])
+    all_true_closes = np.array([p.get("true_close", 0) for p in predictions])
+    has_close = (all_base_closes > 0) & (all_true_closes > 0)
+    if has_close.sum() > 0:
+        pred_prices = all_base_closes[has_close] * np.exp(all_pred_lrs_arr[has_close].astype(np.float64))
+        true_prices = all_true_closes[has_close]
+        mape = float(np.mean(np.abs(pred_prices - true_prices) / np.maximum(np.abs(true_prices), eps))) * 100
+        # Baseline MAPE: if we always predict "no change" (pred = base_close)
+        bl_mape = float(np.mean(np.abs(all_base_closes[has_close] - true_prices) / np.maximum(np.abs(true_prices), eps))) * 100
+    else:
+        mape = 0.0
+        bl_mape = 0.0
+
     # Signal score: average DA above baseline across dates
     # Positive = better than always-predicting-majority
     signal_score = avg_da_above_baseline
@@ -639,5 +676,77 @@ def compute_windowed_metrics(predictions):
         "n_unique_tokens": n_unique_tokens,
         "rank_ic": rank_ic,
         "ampratio": amp_ratio,
+        "mape": mape,
+        "baseline_mape": bl_mape,
         "per_date": per_date,
     }
+
+
+# ============================================================================
+# High-level evaluation entry point
+# ============================================================================
+
+def evaluate_windowed(gpt_ckpt, tokenizer_ckpt, device,
+                      n_stocks=0, n_days=20, batch_size=4, silent=False, seed=42):
+    """Run multi-day windowed GPT evaluation. Returns metrics dict.
+
+    Args:
+        gpt_ckpt: path to GPT checkpoint
+        tokenizer_ckpt: path to tokenizer checkpoint
+        device: torch device
+        n_stocks: number of test stocks to evaluate (0 = all)
+        n_days: number of consecutive test days per stock
+        batch_size: evaluation batch size
+        silent: suppress print output
+        seed: random seed for stock sampling
+    """
+    import time as _time
+    ModelConfig = __import__("config", fromlist=["ModelConfig"]).ModelConfig
+
+    tokenizer = load_tokenizer(tokenizer_ckpt, device)
+    ModelConfig.vocab_size = tokenizer.vocab_coarse
+    ModelConfig.vocab_fine = tokenizer.bsq_fine.vocab_size
+    gpt = load_gpt(gpt_ckpt, device, tokenizer=tokenizer)
+
+    stocks = load_stocks(max_stocks=0)
+    _, _, test_stocks = split_stocks(stocks)
+    attach_close_prices(test_stocks)
+
+    rng = np.random.RandomState(seed)
+    n_sample = len(test_stocks) if n_stocks <= 0 else min(n_stocks, len(test_stocks))
+    indices = rng.choice(len(test_stocks), n_sample, replace=False)
+    test_sample = [test_stocks[i] for i in sorted(indices)]
+
+    t0 = _time.time()
+    preds = batched_gpt_eval_windowed(
+        gpt, tokenizer, test_sample, device,
+        batch_size=batch_size, n_days=n_days, silent=silent)
+
+    elapsed = _time.time() - t0
+    metrics = compute_windowed_metrics(preds)
+
+    if not silent:
+        print(f"\n  Eval done in {elapsed:.1f}s ({len(preds)} predictions, "
+              f"{metrics.get('n_dates', 0)} dates)")
+        print(f"  Avg DA per date:  {metrics['avg_da_per_date']*100:.2f}%")
+        print(f"  DA above baseline: {metrics['avg_da_above_baseline']*100:+.2f}%")
+        print(f"  DA std across dates: {metrics.get('da_std', 0)*100:.2f}%")
+        print(f"  Collapse: {metrics['collapse_rate']*100:.1f}%  "
+              f"Unique: {metrics['n_unique_tokens']}  "
+              f"RankIC: {metrics['rank_ic']:.4f}  "
+              f"AmpRatio: {metrics.get('ampratio', 0):.3f}x  "
+              f"MAPE: {metrics.get('mape', 0):.2f}%  "
+              f"BL-MAPE: {metrics.get('baseline_mape', 0):.2f}%")
+
+        per_date = metrics.get("per_date", {})
+        if per_date:
+            print(f"\n  Per-date detail (first 5 dates):")
+            for i, (d, v) in enumerate(sorted(per_date.items())):
+                if i >= 5:
+                    break
+                print(f"    {d}: DA={v['da']*100:5.1f}%  "
+                      f"base={v['baseline_da']*100:5.1f}%  "
+                      f"excess={v['da_above_baseline']*100:+5.1f}%  "
+                      f"n={v['n']}")
+
+    return metrics

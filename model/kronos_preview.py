@@ -70,7 +70,8 @@ class KronosPreview(_BaseTransformer):
         return reg_pred, het_loss
 
     def forward(self, input_ids, time_ids, position_ids, attn_mask=None,
-                va_values=None, reg_targets=None, fine_targets=None):
+                va_values=None, reg_targets=None, fine_targets=None,
+                return_hidden=False):
         no_batch = input_ids.dim() == 1
         extra = {"va_values": va_values, "reg_targets": reg_targets, "fine_targets": fine_targets}
         input_ids, time_ids, position_ids, attn_mask, extra = self._prepare_inputs(
@@ -98,11 +99,19 @@ class KronosPreview(_BaseTransformer):
             if no_batch:
                 coarse_logits = coarse_logits.squeeze(0)
                 fine_logits = fine_logits.squeeze(0)
+                if return_hidden:
+                    return coarse_logits, fine_logits, reg_pred, het_loss, x.squeeze(0)
+            if return_hidden:
+                return coarse_logits, fine_logits, reg_pred, het_loss, x
             return coarse_logits, fine_logits, reg_pred, het_loss
 
         if no_batch:
             coarse_logits = coarse_logits.squeeze(0)
             fine_logits = fine_logits.squeeze(0)
+            if return_hidden:
+                return coarse_logits, fine_logits, x.squeeze(0)
+        if return_hidden:
+            return coarse_logits, fine_logits, x
         return coarse_logits, fine_logits
 
 

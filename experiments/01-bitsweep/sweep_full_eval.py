@@ -19,8 +19,11 @@ import os
 import sys
 import time
 
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.getcwd())
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
+os.chdir(_HERE)
+sys.path.insert(0, _PROJECT_ROOT)  # project root for config, data_processor, etc.
+sys.path.insert(0, _HERE)          # this dir for sweep_bits imports
 
 import numpy as np
 import torch

@@ -19,8 +19,10 @@ import sys
 import time
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.getcwd())
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
+os.chdir(_HERE)
+sys.path.insert(0, _PROJECT_ROOT)
 
 import numpy as np
 import torch

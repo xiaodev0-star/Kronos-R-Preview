@@ -417,6 +417,12 @@ if __name__ == "__main__":
                    help="Early stopping patience (0=disabled, recommended 15-20)")
     p.add_argument("--scheduler", action="store_true", default=False,
                    help="Enable warmup+cosine LR scheduler")
+    p.add_argument("--embedding_dim", type=int, default=0,
+                   help="Override TokenizerConfig.embedding_dim (0=use config default)")
+    p.add_argument("--hidden_dim", type=int, default=0,
+                   help="Override TokenizerConfig.hidden_dim (0=use config default)")
+    p.add_argument("--tag", type=str, default="",
+                   help="Tag appended to save_path for distinguishing runs")
     parsed = p.parse_args()
     if parsed.bits_l1 > 0:
         TokenizerConfig.bits_l1 = parsed.bits_l1
@@ -424,4 +430,11 @@ if __name__ == "__main__":
         TokenizerConfig.bits_l2 = parsed.bits_l2
     if parsed.bits_per_quantizer > 0:
         TokenizerConfig.bits_per_quantizer = parsed.bits_per_quantizer
+    if parsed.embedding_dim > 0:
+        TokenizerConfig.embedding_dim = parsed.embedding_dim
+    if parsed.hidden_dim > 0:
+        TokenizerConfig.hidden_dim = parsed.hidden_dim
+    if parsed.tag:
+        base, ext = os.path.splitext(parsed.save_path)
+        parsed.save_path = f"{base}_{parsed.tag}{ext}"
     main(parsed)

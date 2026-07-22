@@ -65,6 +65,95 @@ def focal_loss(logits, targets, gamma=2.0, label_smoothing=0.0, entropy_alpha=0.
     return loss
 
 
+# ============================================================================
+# Per-sequence loss aggregation for token-budget batching.
+#
+# When multiple stocks are packed into one right-padded batch (with is_causal=True
+# so real tokens see identical logits to bs=1), we reduce the loss PER SEQUENCE
+# and SUM over the batch. This reproduces the exact sequence-weighted gradient of
+# the original bs=1 + accumulation loop (each stock contributes one mean loss),
+# so loss curves and optimization dynamics are numerically identical to bs=1 --
+# only the GPU efficiency changes.
+# ============================================================================
+
+def _per_seq_focal(logits, targets, gamma=2.0, label_smoothing=0.0,
+                   entropy_alpha=0.0, ignore_index=-100):
+    """Row-wise focal loss. logits [B,T,V], targets [B,T] -> [B] per-seq means.
+
+    Algebraically identical to focal_loss() but reduced per row instead of
+    globally, so summing the result over B equals the sum of per-sequence
+    focal_loss() scalars.
+    """
+    B, T, V = logits.shape
+    ce = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1),
+                         reduction='none', ignore_index=ignore_index,
+                         label_smoothing=label_smoothing).view(B, T)
+    mask = (targets != ignore_index).float()
+    safe_targets = targets.clamp(min=0)
+    with torch.no_grad():
+        log_probs = F.log_softmax(logits, dim=-1)
+        pt = log_probs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1).exp().clamp(1e-8, 1.0)
+    focal_weight = (1 - pt) ** gamma
+    denom = mask.sum(1).clamp(min=1)
+    per_seq = (focal_weight * ce * mask).sum(1) / denom
+    if entropy_alpha > 0:
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=-1)
+        per_seq = per_seq - entropy_alpha * ((entropy * mask).sum(1) / denom)
+    return per_seq
+
+
+def _per_seq_ce(logits, targets, ignore_index=-100, label_smoothing=0.0):
+    """Row-wise cross-entropy. logits [B,T,V], targets [B,T] -> [B] per-seq means."""
+    B, T, V = logits.shape
+    ce = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1),
+                         reduction='none', ignore_index=ignore_index,
+                         label_smoothing=label_smoothing).view(B, T)
+    mask = (targets != ignore_index).float()
+    return (ce * mask).sum(1) / mask.sum(1).clamp(min=1)
+
+
+def _per_seq_het(reg_pred, reg_targets_shifted, ignore_val=-999.0):
+    """Row-wise heteroscedastic NLL. reg_pred [B,T,2] (float), targets [B,T] -> [B].
+
+    Mirrors heteroscedastic_nll_loss() reduced per row. Masked positions have
+    their residual zeroed before squaring so sentinel targets (-999) never
+    create large intermediate values.
+    """
+    mask = (reg_targets_shifted != ignore_val).float()
+    mean = reg_pred[..., 0]
+    log_var = reg_pred[..., 1].clamp(-5.0, 2.0)
+    diff = (reg_targets_shifted - mean) * mask
+    nll = 0.5 * (log_var + diff.pow(2) / log_var.exp())
+    return (nll * mask).sum(1) / mask.sum(1).clamp(min=1)
+
+
+def compute_batched_loss(coarse_logits, target, fine_logits, fine_target,
+                         reg_pred, reg_target, args):
+    """Sum-of-per-sequence total loss for a right-padded batch.
+
+    Returns (loss_sum, coarse_sum, n_seq) where loss_sum aggregates
+    focal(+fine+het) over all sequences in the batch, exactly matching what the
+    bs=1 loop would accumulate for the same sequences.
+    """
+    shift_coarse = coarse_logits[:, :-1, :]
+    if args.loss == "focal":
+        coarse = _per_seq_focal(shift_coarse, target, gamma=args.gamma,
+                                label_smoothing=args.label_smoothing,
+                                entropy_alpha=args.entropy_alpha)
+    else:
+        coarse = _per_seq_ce(shift_coarse, target, ignore_index=-100,
+                             label_smoothing=args.label_smoothing)
+    total = coarse
+    shift_fine = fine_logits[:, 1:, :]
+    fine = _per_seq_ce(shift_fine, fine_target[:, 1:], ignore_index=0)
+    total = total + args.fine_weight * fine
+    if reg_pred is not None and args.heteroscedastic:
+        het = _per_seq_het(reg_pred, reg_target[:, 1:])
+        total = total + args.het_weight * het
+    return total.sum(), coarse.sum().detach(), total.shape[0]
+
+
 def build_wsd_scheduler(optimizer, total_updates, warmup_ratio=0.05, stable_ratio=0.75):
     """WSD (Warmup-Stable-Decay) scheduler — superior to cosine for short training runs.
 
@@ -232,6 +321,121 @@ class BatchedDataLoader:
         return (len(self.sequences) + self.batch_size - 1) // self.batch_size
 
 
+def _pad_batch_causal(group):
+    """Right-pad a group of variable-length stocks into one batch, mask=None.
+
+    Returns the same 8-tuple layout as make_dataloader_v2 but with a real batch
+    dimension and NO attention mask -- so the model uses SDPA is_causal=True.
+    With right-padding + causal attention, every REAL query position i attends
+    only to real keys 0..i, so its logits are identical to processing the stock
+    alone (bs=1). Padded query rows are discarded by the loss (targets = -100 /
+    fine 0 / reg -999), giving numerically identical training to bs=1.
+    """
+    Nmax = max(s["input_ids"].shape[0] for s in group)
+    B = len(group)
+    p_ids = torch.zeros(B, Nmax, dtype=torch.long)
+    p_tgt = torch.full((B, Nmax - 1), -100, dtype=torch.long)
+    p_ftgt = torch.zeros(B, Nmax - 1, dtype=torch.long)
+    p_time = torch.zeros(B, Nmax, 3, dtype=torch.long)
+    p_pos = torch.zeros(B, Nmax, dtype=torch.long)
+    p_va = torch.zeros(B, Nmax, 2, dtype=torch.float32)
+    p_rt = torch.full((B, Nmax), -999.0, dtype=torch.float32)
+    for k, s in enumerate(group):
+        L = s["input_ids"].shape[0]
+        Lt = s["targets"].shape[0]
+        p_ids[k, :L] = s["input_ids"]
+        p_tgt[k, :Lt] = s["targets"]
+        p_ftgt[k, :Lt] = s["fine_targets"]
+        p_time[k, :L] = s["time_ids"]
+        p_pos[k, :L] = s["position_ids"]
+        p_va[k, :L] = s["va_values"]
+        p_rt[k, :L] = s["reg_targets"]
+    return (p_ids, p_tgt, p_ftgt, p_time, p_pos, None, p_va, p_rt)
+
+
+class TokenBudgetLoader:
+    """Adaptive-batch loader: packs stocks into right-padded batches under a token
+    budget (B * max_len <= max_tokens), length-sorted to keep padding minimal.
+
+    This is the throughput lever for the tiny (2.7M) GPT: a single stock barely
+    occupies the GPU, so we process several per step. Because batches use
+    is_causal=True (no explicit mask), real-token logits/losses/grads are
+    identical to bs=1 (see compute_batched_loss); only GPU efficiency improves.
+
+    Adaptive B (vs a fixed batch size) is essential: it uses large B for short
+    stocks and B=1 for the longest ones, bounding per-step activation memory and
+    avoiding the O(B*N^2) attention blow-up that fixed large batches hit.
+    """
+    def __init__(self, sequences, max_tokens, shuffle=True, cap_B=64,
+                 curriculum_epoch=-1, total_epochs=30, band=64):
+        self.sequences = sequences
+        self.max_tokens = max_tokens
+        self.shuffle = shuffle
+        self.cap_B = cap_B
+        self.curriculum_epoch = curriculum_epoch
+        self.total_epochs = total_epochs
+        self.band = band
+        self._epoch = 0
+
+    def set_epoch(self, epoch):
+        self._epoch = epoch
+
+    def _curriculum_max_len(self):
+        if self.curriculum_epoch < 0:
+            return 0
+        epoch, total = self._epoch, self.total_epochs
+        phase1_end = max(1, total * 10 // 30)
+        phase2_end = max(phase1_end + 1, total * 20 // 30)
+        if epoch < phase1_end:
+            return 2000
+        if epoch < phase2_end:
+            return 5000
+        return 0
+
+    def _build_groups(self):
+        idx = list(range(len(self.sequences)))
+        max_len = self._curriculum_max_len()
+        if max_len > 0:
+            idx = [i for i in idx if self.sequences[i]["input_ids"].shape[0] <= max_len]
+            if not idx:
+                idx = list(range(len(self.sequences)))
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(torch.randint(0, 2**31, (1,)).item())
+            perm = torch.randperm(len(idx), generator=g).tolist()
+            idx = [idx[p] for p in perm]
+            # stable sort by coarse length band -> keeps randomness within a band
+            idx.sort(key=lambda i: self.sequences[i]["input_ids"].shape[0] // self.band)
+        else:
+            idx.sort(key=lambda i: self.sequences[i]["input_ids"].shape[0])
+        groups, cur, cur_max = [], [], 0
+        for i in idx:
+            L = self.sequences[i]["input_ids"].shape[0]
+            new_max = max(cur_max, L)
+            if cur and ((len(cur) + 1) * new_max > self.max_tokens or len(cur) + 1 > self.cap_B):
+                groups.append(cur)
+                cur, cur_max = [i], L
+            else:
+                cur.append(i)
+                cur_max = new_max
+        if cur:
+            groups.append(cur)
+        return groups
+
+    def __iter__(self):
+        groups = self._build_groups()
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(torch.randint(0, 2**31, (1,)).item())
+            perm = torch.randperm(len(groups), generator=g).tolist()
+            groups = [groups[p] for p in perm]
+        for grp in groups:
+            yield _pad_batch_causal([self.sequences[i] for i in grp])
+
+    def __len__(self):
+        return len(self._build_groups())
+
+
 def main(args):
     set_global_seed(TrainingConfig.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -306,7 +510,24 @@ def main(args):
 
     bs = TrainingConfig.batch_size
     use_curriculum = getattr(args, "curriculum", False)
-    if bs > 1:
+    # getattr keeps programmatic callers (sweep scripts that build a bare args
+    # object) working; default is ON since it is provably identical to bs=1.
+    batch_tokens = getattr(args, "batch_tokens", 12288)
+    batch_cap = getattr(args, "batch_cap", 64)
+    batched = batch_tokens > 0
+    if batched:
+        train_loader = TokenBudgetLoader(
+            train_seqs, batch_tokens, shuffle=True, cap_B=batch_cap,
+            curriculum_epoch=0 if use_curriculum else -1, total_epochs=epochs)
+        val_loader = TokenBudgetLoader(
+            val_seqs, batch_tokens, shuffle=False, cap_B=batch_cap)
+        print(f"Loader: token-budget batched, max_tokens={batch_tokens}, "
+              f"cap_B={batch_cap}, accum(seqs)={TrainingConfig.accumulation_steps} "
+              f"(right-pad + is_causal; math-identical to bs=1)")
+        if use_curriculum:
+            print(f"  [CURRICULUM] Phase 1 (ep 1-{epochs//3}): max 2000 tokens, "
+                  f"Phase 2 (ep {epochs//3+1}-{2*epochs//3}): max 5000, Phase 3: all")
+    elif bs > 1:
         train_loader = BatchedDataLoader(train_seqs, bs, shuffle=True, tolerance=500,
                                           curriculum_epoch=0 if use_curriculum else -1,
                                           total_epochs=epochs)
@@ -441,7 +662,8 @@ def main(args):
             train_loader.set_epoch(epoch)
 
         # For single-seq mode: apply curriculum filter by rebuilding loader each epoch
-        if bs == 1 and use_curriculum:
+        # (batched mode filters internally via TokenBudgetLoader.set_epoch).
+        if bs == 1 and use_curriculum and not batched:
             phase1_end = max(1, epochs * 10 // 30)
             phase2_end = max(phase1_end + 1, epochs * 20 // 30)
             if epoch < phase1_end:
@@ -477,10 +699,59 @@ def main(args):
 
         pbar = tqdm(train_loader, desc=f"[{args.tag}] Epoch {epoch+1}/{epochs}",
                     ncols=80)
+        seqs_in_accum = 0  # batched mode: sequences accumulated toward one opt step
         for bi, batch in enumerate(pbar):
             input_ids, target, fine_target, time_id, pos_id, mask, va_val, reg_target = _to_device(batch, device)
 
             try:
+                if batched:
+                    # Token-budget batched path: per-sequence loss summed over the
+                    # batch (identical gradient to bs=1), step every `epoch_accum`
+                    # SEQUENCES so the effective batch matches the single-seq loop.
+                    t_fwd_start = time.perf_counter() if (bi + 1) % 20 == 0 else 0
+                    with torch.amp.autocast("cuda", dtype=amp_dtype):
+                        if args.heteroscedastic:
+                            coarse_logits, fine_logits, reg_pred, _ = model(
+                                input_ids, time_id, pos_id, mask,
+                                va_values=va_val, reg_targets=reg_target,
+                                fine_targets=fine_target)
+                        else:
+                            coarse_logits, fine_logits = model(
+                                input_ids, time_id, pos_id, mask,
+                                va_values=va_val, fine_targets=fine_target)
+                            reg_pred = None
+                        loss_sum, _, n_seq = compute_batched_loss(
+                            coarse_logits, target, fine_logits, fine_target,
+                            reg_pred, reg_target, args)
+                    if t_fwd_start > 0:
+                        t_forward_acc += time.perf_counter() - t_fwd_start
+                    t_bwd_start = time.perf_counter() if (bi + 1) % 20 == 0 else 0
+                    (loss_sum / epoch_accum).backward()
+                    if t_bwd_start > 0:
+                        t_backward_acc += time.perf_counter() - t_bwd_start
+                    seqs_in_accum += n_seq
+                    if seqs_in_accum >= epoch_accum:
+                        torch.nn.utils.clip_grad_norm_(trainable_params, TrainingConfig.grad_clip)
+                        optimizer.step()
+                        if optimizer_adam:
+                            optimizer_adam.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        if optimizer_adam:
+                            optimizer_adam.zero_grad(set_to_none=True)
+                        scheduler.step()
+                        if scheduler_adam:
+                            scheduler_adam.step()
+                        global_step += 1
+                        seqs_in_accum = 0
+                    loss_acc += loss_sum.detach()
+                    n_loss += n_seq
+                    if (bi + 1) % 20 == 0:
+                        pbar.set_postfix({"loss": f"{loss_acc.item() / max(n_loss, 1):.4f}",
+                                          "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+                    if TrainingConfig.max_train_updates and global_step >= TrainingConfig.max_train_updates:
+                        break
+                    continue
+
                 # Forward pass (timed every 20 steps)
                 t_fwd_start = time.perf_counter() if (bi + 1) % 20 == 0 else 0
                 with torch.amp.autocast("cuda", dtype=amp_dtype):
@@ -557,6 +828,7 @@ def main(args):
                 optimizer.zero_grad(set_to_none=True)
                 if optimizer_adam:
                     optimizer_adam.zero_grad(set_to_none=True)
+                seqs_in_accum = 0  # discard the partial accumulation window
                 print(f"  [OOM] Skipped batch {bi+1} (seq_len={input_ids.shape[-1]}, bs={input_ids.shape[0]})")
                 continue
 
@@ -567,6 +839,21 @@ def main(args):
 
             if TrainingConfig.max_train_updates and global_step >= TrainingConfig.max_train_updates:
                 break
+
+        # Flush any remaining accumulated gradient (batched mode leftover < accum)
+        if batched and seqs_in_accum > 0:
+            torch.nn.utils.clip_grad_norm_(trainable_params, TrainingConfig.grad_clip)
+            optimizer.step()
+            if optimizer_adam:
+                optimizer_adam.step()
+            optimizer.zero_grad(set_to_none=True)
+            if optimizer_adam:
+                optimizer_adam.zero_grad(set_to_none=True)
+            scheduler.step()
+            if scheduler_adam:
+                scheduler_adam.step()
+            global_step += 1
+            seqs_in_accum = 0
 
         # Record profiler sub-timings (sampled, not exact per-step)
         if profiler:
@@ -587,23 +874,34 @@ def main(args):
                 input_ids, target, fine_target, time_id, pos_id, mask, va_val, reg_target = _to_device(batch, device)
                 with torch.amp.autocast("cuda", dtype=amp_dtype):
                     if args.heteroscedastic:
-                        coarse_logits, fine_logits, _, val_het = model(
+                        coarse_logits, fine_logits, reg_pred, val_het = model(
                             input_ids, time_id, pos_id, mask,
                             va_values=va_val, reg_targets=reg_target,
                             fine_targets=fine_target)
-                        if val_het is not None:
-                            v_het_losses.append(val_het.item())
                     else:
                         coarse_logits, fine_logits = model(
                             input_ids, time_id, pos_id, mask,
                             va_values=va_val, fine_targets=fine_target)
+                        reg_pred = None
+                        val_het = None
                     shift_logits = coarse_logits[:, :-1, :].contiguous()
                     shift_targets = target.contiguous()
-                    if (shift_targets != -100).any():
-                        vloss = F.cross_entropy(
-                            shift_logits.view(-1, shift_logits.size(-1)),
-                            shift_targets.view(-1), ignore_index=-100)
-                        vlosses.append(vloss.item())
+                    if batched:
+                        # Per-sequence means -> val_loss stays sequence-averaged
+                        # (identical metric to the bs=1 loop).
+                        vlosses.extend(_per_seq_ce(shift_logits, shift_targets,
+                                                   ignore_index=-100).tolist())
+                        if args.heteroscedastic and reg_pred is not None:
+                            v_het_losses.extend(
+                                _per_seq_het(reg_pred, reg_target[:, 1:]).tolist())
+                    else:
+                        if val_het is not None:
+                            v_het_losses.append(val_het.item())
+                        if (shift_targets != -100).any():
+                            vloss = F.cross_entropy(
+                                shift_logits.view(-1, shift_logits.size(-1)),
+                                shift_targets.view(-1), ignore_index=-100)
+                            vlosses.append(vloss.item())
                     if args.light_eval:
                         valid_mask = (shift_targets != -100)
                         if valid_mask.any():
@@ -798,4 +1096,10 @@ Examples:
     # ── Training improvement args ──
     parser.add_argument("--early_stop_patience", type=int, default=0,
                         help="Early stopping patience (0=disabled, recommended 3-5 for GPT)")
+    # ── Speed: token-budget batching (right-pad + is_causal, math-identical to bs=1) ──
+    parser.add_argument("--batch_tokens", type=int, default=12288,
+                        help="Max tokens per batch (B*max_len). Adaptive batching for "
+                             "~1.7x faster GPT training. 0 = legacy single-seq (bs=1).")
+    parser.add_argument("--batch_cap", type=int, default=64,
+                        help="Hard cap on sequences per batch (safety for very short stocks)")
     main(parser.parse_args())
