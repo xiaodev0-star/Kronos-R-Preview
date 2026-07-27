@@ -17,6 +17,9 @@ __pycache__/
 *.log
 *.txt
 CLAUDE.md
+AGENTS.md
 Abilition.md
 Difussion-GPTNBERT.md
 gen*.py
+rerun*/
+run*/

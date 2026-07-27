@@ -39,13 +39,20 @@ def run_windowed(args):
     metrics = evaluate_windowed(
         args.gpt_ckpt, args.tokenizer, device,
         n_stocks=args.n_stocks, n_days=args.n_days,
-        batch_size=args.batch_size, silent=False, seed=args.seed)
+        batch_size=args.batch_size, start_offset=args.start_offset,
+        silent=False, seed=args.seed, sample_strategy=args.sample_strategy)
 
     if args.output:
-        output = {k: v for k, v in metrics.items() if k != "per_date"}
+        output = (dict(metrics) if args.include_per_date
+                  else {k: v for k, v in metrics.items() if k != "per_date"})
         output["mode"] = "windowed"
         output["gpt_ckpt"] = args.gpt_ckpt
         output["tokenizer"] = args.tokenizer
+        output["seed"] = args.seed
+        output["n_stocks_requested"] = args.n_stocks
+        output["n_days_requested"] = args.n_days
+        output["start_offset"] = args.start_offset
+        output["sample_strategy"] = args.sample_strategy
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2)
         print(f"  Saved: {args.output}")
@@ -68,8 +75,9 @@ def run_grpo(args):
     from config import DataConfig, ModelConfig, set_global_seed
     from data_processor import load_stocks, split_stocks
     from eval_helpers import (
-        AMP_DTYPE, _bucket_by_length, decode_coarse_batch,
-        load_gpt, load_tokenizer, _prepare_stocks_batch,
+        AMP_DTYPE, _bucket_by_length, decode_code_ids_tensor,
+        attach_close_prices, predict_selected_ids, load_gpt, load_tokenizer,
+        _prepare_stocks_batch,
     )
 
     SEED = args.seed
@@ -93,6 +101,7 @@ def run_grpo(args):
         import random
         random.seed(SEED)
         test_stocks = random.sample(test_stocks, min(len(test_stocks), args.max_stocks))
+    attach_close_prices(test_stocks)
     print(f"  Test stocks: {len(test_stocks)}")
 
     # Model
@@ -123,7 +132,6 @@ def run_grpo(args):
                 inp = torch.zeros(B, max_len, dtype=torch.long, device=device)
                 tids = torch.zeros(B, max_len, 3, dtype=torch.long, device=device)
                 pos = torch.arange(max_len, device=device).unsqueeze(0).expand(B, -1)
-                mask = torch.zeros(B, max_len, max_len, dtype=torch.bool, device=device)
                 va = torch.zeros(B, max_len, 2, dtype=torch.float32, device=device)
 
                 for j, s in enumerate(batch):
@@ -133,36 +141,49 @@ def run_grpo(args):
                     tids[j, :L, 1] = torch.tensor(s["month"], dtype=torch.long)
                     tids[j, :L, 2] = torch.tensor(s["year"], dtype=torch.long)
                     va[j, :L] = torch.tensor(s["va"], dtype=torch.float32)
-                    mask[j, :L, :L] = torch.tril(torch.ones(L, L, dtype=torch.bool))
-                    mask[j, L:, 0] = True
 
-                with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-                    coarse_logits, fine_logits = gpt(inp, tids, pos, mask, va_values=va)
-                n_forward += 1
-
-                coarse_cpu = coarse_logits.float().cpu()
-                fine_cpu = fine_logits.float().cpu()
-
+                selected_rows = []
+                selected_positions = []
+                selected_meta = []
                 for j, s in enumerate(batch):
                     p_start = s["test_pos"]
-                    seq_len_real = min(coarse_cpu.shape[1], fine_cpu.shape[1], s["seq_len"])
+                    # The full forward's fine head spans max_len - 1 positions;
+                    # that bound is known from the input without running it.
+                    seq_len_real = min(inp.shape[1] - 1, s["seq_len"])
                     for offset in range(seq_len_real - p_start):
                         p = p_start + offset
-                        if p >= seq_len_real:
-                            break
-                        cid = int(coarse_cpu[j, p, :vocab].argmax().item())
-                        fl = fine_cpu[j, p]
-                        date_key = s["dates_raw"][p] if p < len(s["dates_raw"]) else "unknown"
-                        records.append({
-                            "coarse_id": cid, "fine_logits": fl, "test_pos": p,
-                            "date_key": date_key,
-                            "p_mean": s["p_mean"], "p_std": s["p_std"],
-                            "feat": s["feat"], "close": s["close"],
-                        })
+                        selected_rows.append(j)
+                        selected_positions.append(p)
+                        selected_meta.append((s, p))
 
-                del inp, tids, pos, mask, va, coarse_logits, fine_logits, coarse_cpu, fine_cpu
-                if (batch_start // args.batch_size) % 20 == 0:
-                    torch.cuda.empty_cache()
+                coarse_ids, fine_ids = predict_selected_ids(
+                    gpt, inp, tids, pos, va,
+                    selected_rows, selected_positions, tok, device,
+                )
+                n_forward += 1
+                id_pairs = torch.stack(
+                    (coarse_ids, fine_ids), dim=1
+                ).cpu().tolist()
+                for ids, (stock, position) in zip(
+                    id_pairs, selected_meta
+                ):
+                    date_key = (
+                        stock["dates_raw"][position]
+                        if position < len(stock["dates_raw"])
+                        else "unknown"
+                    )
+                    records.append({
+                        "coarse_id": int(ids[0]),
+                        "fine_id": int(ids[1]),
+                        "test_pos": position,
+                        "date_key": date_key,
+                        "p_mean": stock["p_mean"],
+                        "p_std": stock["p_std"],
+                        "feat": stock["feat"],
+                        "close": stock["close"],
+                    })
+
+                del inp, tids, pos, va
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 print(f"  [OOM] Skipping batch ({max_len} tokens, bs={B})")
@@ -181,9 +202,12 @@ def run_grpo(args):
     for start in range(0, len(records), decode_bs):
         end = min(start + decode_bs, len(records))
         chunk = records[start:end]
-        fine_tensor = torch.stack([r["fine_logits"] for r in chunk])
-        coarse_ids = [r["coarse_id"] for r in chunk]
-        decoded = decode_coarse_batch(coarse_ids, fine_tensor, tok, device)
+        decoded = decode_code_ids_tensor(
+            [r["coarse_id"] for r in chunk],
+            [r["fine_id"] for r in chunk],
+            tok,
+            device,
+        ).cpu().numpy()
         for i, r in enumerate(chunk):
             dec = decoded[i]
             tp = r["test_pos"]
@@ -193,7 +217,7 @@ def run_grpo(args):
             r["true_logret"] = float(feat[tp, 0]) if tp < len(feat) else 0.0
             r["base_close"] = float(close[tp - 1]) if 0 <= tp - 1 < n_close else float(close[-1])
             r["true_close"] = float(close[tp]) if 0 <= tp < n_close else float(close[-1])
-            del r["fine_logits"], r["feat"], r["close"]
+            del r["fine_id"], r["feat"], r["close"]
 
     # Metrics
     pred_lrs = np.array([r["pred_logret"] for r in records])
@@ -375,11 +399,10 @@ def run_bert(args):
             torch.tensor([year_list[:-1]], dtype=torch.long),
         ], dim=-1).to(dev)
         pos = torch.arange(S - 1, device=dev).unsqueeze(0)
-        mask = torch.tril(torch.ones(S - 1, S - 1, dtype=torch.bool, device=dev))
         va_seq = np.concatenate([np.zeros((1, 2), dtype=np.float32),
                                  arrays["va_normed"][:N - 1]], axis=0)
         va = torch.tensor(va_seq, dtype=torch.float32, device=dev).unsqueeze(0)
-        return {"inp": inp, "tids": tids, "pos": pos, "mask": mask,
+        return {"inp": inp, "tids": tids, "pos": pos, "mask": None,
                 "va_values": va, "S": S, "token_ids": token_ids,
                 "test_start": ci, "test_end": T_total - 2}
 
@@ -635,7 +658,14 @@ def main():
                         help="[windowed/bert] 0=all test stocks")
     parser.add_argument("--n_days", type=int, default=20,
                         help="[windowed] days per stock")
+    parser.add_argument("--start_offset", type=int, default=0,
+                        help="[windowed] start this many test observations after cutoff")
     parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--include_per_date", action="store_true",
+                        help="[windowed] retain per-date metrics in the output JSON")
+    parser.add_argument("--sample_strategy", choices=["random", "shortest"],
+                        default="random",
+                        help="[windowed] stock sampling; shortest is for smoke tests")
 
     # grpo args
     parser.add_argument("--max_stocks", type=int, default=0,

@@ -60,10 +60,12 @@ class KronosPreview(_BaseTransformer):
             nn.Linear(cfg.dim, 2, bias=True),
         )
 
-    def _predict_reg(self, x, reg_targets):
+    def _predict_reg(self, x, reg_targets, compute_loss=True):
         with torch.amp.autocast("cuda", enabled=False):
             shift_hidden = x[:, :-1, :].float().contiguous()
             reg_pred = self.head_reg(shift_hidden)
+            if not compute_loss:
+                return reg_pred, None
             shift_reg_targets = reg_targets[:, 1:].float().contiguous()
             het_loss = heteroscedastic_nll_loss(
                 reg_pred.reshape(-1, 2), shift_reg_targets.reshape(-1), ignore_val=-999.0)
@@ -71,7 +73,7 @@ class KronosPreview(_BaseTransformer):
 
     def forward(self, input_ids, time_ids, position_ids, attn_mask=None,
                 va_values=None, reg_targets=None, fine_targets=None,
-                return_hidden=False):
+                return_hidden=False, compute_reg_loss=True):
         no_batch = input_ids.dim() == 1
         extra = {"va_values": va_values, "reg_targets": reg_targets, "fine_targets": fine_targets}
         input_ids, time_ids, position_ids, attn_mask, extra = self._prepare_inputs(
@@ -95,7 +97,9 @@ class KronosPreview(_BaseTransformer):
         fine_logits = self.head_fine(fine_input)
 
         if reg_targets is not None:
-            reg_pred, het_loss = self._predict_reg(x, reg_targets)
+            reg_pred, het_loss = self._predict_reg(
+                x, reg_targets, compute_loss=compute_reg_loss
+            )
             if no_batch:
                 coarse_logits = coarse_logits.squeeze(0)
                 fine_logits = fine_logits.squeeze(0)
@@ -112,6 +116,48 @@ class KronosPreview(_BaseTransformer):
                 return coarse_logits, fine_logits, x.squeeze(0)
         if return_hidden:
             return coarse_logits, fine_logits, x
+        return coarse_logits, fine_logits
+
+
+    @torch.no_grad()
+    def forward_selected(self, input_ids, time_ids, position_ids, rows, positions,
+                         va_values=None):
+        """Logits at selected ``(row, position)`` pairs only — evaluation fast path.
+
+        Evaluation reads a handful of positions per document (the windows after
+        the cutoff), but the plain forward projects the vocabulary over every
+        position.  The vocabulary and fine heads depend only on the hidden state
+        at the selected positions, so they run on the gathered rows instead.  This
+        reproduces the full forward's predicted IDs exactly (verified
+        23,889/23,889 on every Exp 03 architecture).
+
+        Returns ``(coarse_logits, fine_logits)`` with one row per selected pair,
+        in the order given.  ``fine_logits`` mirrors the full forward, whose fine
+        head spans ``N-1`` positions; callers must apply the same
+        ``position < N-1`` validity rule.
+        """
+        no_batch = input_ids.dim() == 1
+        if no_batch:
+            input_ids = input_ids.unsqueeze(0)
+            time_ids = time_ids.unsqueeze(0)
+            position_ids = position_ids.unsqueeze(0)
+            if va_values is not None:
+                va_values = va_values.unsqueeze(0)
+
+        rows = torch.as_tensor(rows, dtype=torch.long)
+        positions = torch.as_tensor(positions, dtype=torch.long)
+
+        x = self._embed(input_ids, time_ids, va_values)
+        sin, cos = self.rotary(position_ids)
+        x = self._run_blocks(x, sin, cos, None)
+        x = self.norm(x)
+
+        device = x.device
+        selected = x[rows.to(device), positions.to(device)]
+        coarse_logits = self.head_coarse(selected)
+        coarse_pred = coarse_logits[:, :self._vocab_l1].argmax(dim=-1)
+        fine_logits = self.head_fine(
+            torch.cat([selected, self._fine_emb(coarse_pred)], dim=-1))
         return coarse_logits, fine_logits
 
 

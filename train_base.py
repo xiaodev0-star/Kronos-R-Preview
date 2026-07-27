@@ -4,11 +4,14 @@ Supports: focal loss, weight_decay override, reasoning module."""
 import argparse
 import math
 import os
+import random
 import time
 import json
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+if os.name != "nt":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -18,6 +21,51 @@ from data_processor import load_stocks, split_stocks, pack_stocks_v2, make_datal
 from model import load_tokenizer
 from model.kronos_preview import KronosPreview, KronosPreviewWithReasoning
 from model.optimizer import build_muon_optimizers
+from training_utils import clip_grad_norm_
+
+
+def _atomic_torch_save(payload, path):
+    temporary = path + ".tmp"
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def _cpu_state_dict(module):
+    """Snapshot model tensors to CPU once for all per-epoch checkpoint files."""
+    return {
+        name: value.detach().cpu()
+        for name, value in module.state_dict().items()
+    }
+
+
+def _rng_state():
+    state = {
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": np.random.get_state(),
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(checkpoint):
+    restored = False
+    if "python_rng_state" in checkpoint:
+        random.setstate(checkpoint["python_rng_state"])
+        restored = True
+    if "numpy_rng_state" in checkpoint:
+        np.random.set_state(checkpoint["numpy_rng_state"])
+        restored = True
+    if "torch_rng_state" in checkpoint:
+        torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+        restored = True
+    if torch.cuda.is_available() and "cuda_rng_state_all" in checkpoint:
+        torch.cuda.set_rng_state_all(
+            [state.cpu() for state in checkpoint["cuda_rng_state_all"]]
+        )
+        restored = True
+    return restored
 
 
 class EarlyStopping:
@@ -46,18 +94,32 @@ class EarlyStopping:
 
 def focal_loss(logits, targets, gamma=2.0, label_smoothing=0.0, entropy_alpha=0.0,
                ignore_index=-100):
-    """Focal loss with optimized softmax computation (single log_softmax call)."""
-    ce = F.cross_entropy(logits, targets, reduction='none', ignore_index=ignore_index,
+    """Focal loss without a redundant softmax on the common configuration."""
+    ce = F.cross_entropy(logits, targets, reduction="none", ignore_index=ignore_index,
                          label_smoothing=label_smoothing)
     mask = (targets != ignore_index).float()
-    safe_targets = targets.clamp(min=0)
-    with torch.no_grad():
-        # Single log_softmax instead of separate softmax — avoids redundant computation
-        log_probs = F.log_softmax(logits, dim=-1)
-        pt = log_probs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1).exp().clamp(1e-8, 1.0)
+    log_probs = None
+    if label_smoothing == 0.0 and entropy_alpha == 0.0:
+        # CE is -log(p_target) without label smoothing.  The focal weight is
+        # intentionally detached, so this removes a full extra log_softmax
+        # without changing the gradient path.
+        with torch.no_grad():
+            pt = (-ce).exp().clamp(1e-8, 1.0)
+    else:
+        safe_targets = targets.clamp(min=0)
+        with torch.no_grad():
+            log_probs = F.log_softmax(logits, dim=-1)
+            pt = (
+                log_probs.gather(-1, safe_targets.unsqueeze(-1))
+                .squeeze(-1)
+                .exp()
+                .clamp(1e-8, 1.0)
+            )
     focal_weight = (1 - pt) ** gamma
     loss = (focal_weight * ce * mask).sum() / mask.sum().clamp(min=1)
     if entropy_alpha > 0:
+        if log_probs is None:
+            log_probs = F.log_softmax(logits, dim=-1)
         probs = log_probs.exp()
         entropy = -(probs * log_probs).sum(dim=-1)
         ent_loss = (entropy * mask).sum() / mask.sum().clamp(min=1)
@@ -86,17 +148,29 @@ def _per_seq_focal(logits, targets, gamma=2.0, label_smoothing=0.0,
     """
     B, T, V = logits.shape
     ce = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1),
-                         reduction='none', ignore_index=ignore_index,
+                         reduction="none", ignore_index=ignore_index,
                          label_smoothing=label_smoothing).view(B, T)
     mask = (targets != ignore_index).float()
-    safe_targets = targets.clamp(min=0)
-    with torch.no_grad():
-        log_probs = F.log_softmax(logits, dim=-1)
-        pt = log_probs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1).exp().clamp(1e-8, 1.0)
+    log_probs = None
+    if label_smoothing == 0.0 and entropy_alpha == 0.0:
+        with torch.no_grad():
+            pt = (-ce).exp().clamp(1e-8, 1.0)
+    else:
+        safe_targets = targets.clamp(min=0)
+        with torch.no_grad():
+            log_probs = F.log_softmax(logits, dim=-1)
+            pt = (
+                log_probs.gather(-1, safe_targets.unsqueeze(-1))
+                .squeeze(-1)
+                .exp()
+                .clamp(1e-8, 1.0)
+            )
     focal_weight = (1 - pt) ** gamma
     denom = mask.sum(1).clamp(min=1)
     per_seq = (focal_weight * ce * mask).sum(1) / denom
     if entropy_alpha > 0:
+        if log_probs is None:
+            log_probs = F.log_softmax(logits, dim=-1)
         probs = log_probs.exp()
         entropy = -(probs * log_probs).sum(dim=-1)
         per_seq = per_seq - entropy_alpha * ((entropy * mask).sum(1) / denom)
@@ -128,6 +202,17 @@ def _per_seq_het(reg_pred, reg_targets_shifted, ignore_val=-999.0):
     return (nll * mask).sum(1) / mask.sum(1).clamp(min=1)
 
 
+def _mean_metric_chunks(chunks):
+    """Average validation chunks with at most one device-to-host sync."""
+    if not chunks:
+        return 0.0
+    if isinstance(chunks[0], torch.Tensor):
+        values = torch.cat([chunk.reshape(-1) for chunk in chunks]).cpu().tolist()
+    else:
+        values = chunks
+    return sum(values) / max(len(values), 1)
+
+
 def compute_batched_loss(coarse_logits, target, fine_logits, fine_target,
                          reg_pred, reg_target, args):
     """Sum-of-per-sequence total loss for a right-padded batch.
@@ -154,28 +239,32 @@ def compute_batched_loss(coarse_logits, target, fine_logits, fine_target,
     return total.sum(), coarse.sum().detach(), total.shape[0]
 
 
-def build_wsd_scheduler(optimizer, total_updates, warmup_ratio=0.05, stable_ratio=0.75):
-    """WSD (Warmup-Stable-Decay) scheduler — superior to cosine for short training runs.
+def build_wsd_scheduler(optimizer, total_updates, warmup_ratio=0.05, stable_ratio=0.0):
+    """Warmup + Cosine Decay scheduler.
 
     Phases:
       - Warmup (5%): linear ramp from 0 to peak lr
-      - Stable (75%): constant peak lr
-      - Decay (20%): linear decay to 0
+      - Cosine Decay (95%): cosine anneal from peak to 0
+
+    For fast-converging small models, a long stable phase wastes training budget
+    at constant high LR. Cosine decay after warmup lets the LR decrease
+    continuously, ensuring convergence even when early stopping triggers early.
+
+    stable_ratio=0 (default) gives pure warmup+cosine.
+    stable_ratio>0 inserts a constant-LR plateau before cosine decay starts.
     """
     warmup = max(1, int(total_updates * warmup_ratio))
-    stable_end = warmup + int(total_updates * stable_ratio)
+    stable_end = warmup + int(total_updates * min(stable_ratio, 0.60))
 
     def lr_lambda(step):
         if step < warmup:
             return step / max(warmup, 1)
         if step < stable_end:
             return 1.0
-        # Linear decay from 1.0 to 0 over remaining steps
-        decay_steps = total_updates - stable_end
-        if decay_steps <= 0:
-            return 1.0
-        progress = (step - stable_end) / decay_steps
-        return max(0.0, 1.0 - progress)
+        # Cosine decay from 1.0 to 0 over remaining steps
+        decay_steps = max(1, total_updates - stable_end)
+        progress = min(1.0, max(0.0, (step - stable_end) / decay_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -366,8 +455,18 @@ class TokenBudgetLoader:
     stocks and B=1 for the longest ones, bounding per-step activation memory and
     avoiding the O(B*N^2) attention blow-up that fixed large batches hit.
     """
-    def __init__(self, sequences, max_tokens, shuffle=True, cap_B=64,
-                 curriculum_epoch=-1, total_epochs=30, band=64):
+    def __init__(
+        self,
+        sequences,
+        max_tokens,
+        shuffle=True,
+        cap_B=64,
+        curriculum_epoch=-1,
+        total_epochs=30,
+        band=64,
+        loader_seed=None,
+        exact_accumulation=False,
+    ):
         self.sequences = sequences
         self.max_tokens = max_tokens
         self.shuffle = shuffle
@@ -376,9 +475,30 @@ class TokenBudgetLoader:
         self.total_epochs = total_epochs
         self.band = band
         self._epoch = 0
+        self.loader_seed = loader_seed
+        self.exact_accumulation = exact_accumulation
+        self.accumulation_boundary = 0
 
     def set_epoch(self, epoch):
         self._epoch = epoch
+
+    def set_accumulation_boundary(self, boundary):
+        self.accumulation_boundary = int(boundary)
+
+    def _generator(self, stream):
+        generator = torch.Generator()
+        if self.loader_seed is None:
+            seed = torch.randint(0, 2**31, (1,)).item()
+        else:
+            # Local, epoch-addressable RNG: model initialization/dropout can no
+            # longer perturb data order in controlled architecture studies.
+            seed = (
+                int(self.loader_seed)
+                + 1_000_003 * int(self._epoch)
+                + int(stream)
+            ) % (2**63 - 1)
+        generator.manual_seed(seed)
+        return generator
 
     def _curriculum_max_len(self):
         if self.curriculum_epoch < 0:
@@ -400,8 +520,7 @@ class TokenBudgetLoader:
             if not idx:
                 idx = list(range(len(self.sequences)))
         if self.shuffle:
-            g = torch.Generator()
-            g.manual_seed(torch.randint(0, 2**31, (1,)).item())
+            g = self._generator(0)
             perm = torch.randperm(len(idx), generator=g).tolist()
             idx = [idx[p] for p in perm]
             # stable sort by coarse length band -> keeps randomness within a band
@@ -422,41 +541,148 @@ class TokenBudgetLoader:
             groups.append(cur)
         return groups
 
+    def _build_exact_group_blocks(self):
+        """Pack deterministic blocks that end exactly on optimizer boundaries."""
+        boundary = int(self.accumulation_boundary)
+        if boundary <= 0:
+            raise RuntimeError(
+                "Exact accumulation requires a positive epoch boundary"
+            )
+        idx = list(range(len(self.sequences)))
+        max_len = self._curriculum_max_len()
+        if max_len > 0:
+            idx = [
+                i
+                for i in idx
+                if self.sequences[i]["input_ids"].shape[0] <= max_len
+            ]
+            if not idx:
+                idx = list(range(len(self.sequences)))
+        if self.shuffle:
+            permutation = torch.randperm(
+                len(idx), generator=self._generator(0)
+            ).tolist()
+            idx = [idx[position] for position in permutation]
+
+        # The controlled schedule follows the floor-based optimizer budget used
+        # by the scheduler and experiment protocol.  Drop the final incomplete
+        # accumulation *before* length sorting so omitted sequences rotate
+        # deterministically instead of always being the longest documents.
+        usable = len(idx) // boundary * boundary
+        if usable == 0:
+            raise RuntimeError(
+                "Exact accumulation has fewer usable sequences "
+                f"({len(idx)}) than its boundary ({boundary})"
+            )
+        idx = idx[:usable]
+        idx.sort(
+            key=lambda i: self.sequences[i]["input_ids"].shape[0] // self.band
+        )
+
+        blocks = []
+        for start in range(0, len(idx), boundary):
+            block_indices = idx[start : start + boundary]
+            groups, current, current_max = [], [], 0
+            for sequence_index in block_indices:
+                length = self.sequences[sequence_index]["input_ids"].shape[0]
+                new_max = max(current_max, length)
+                exceeds_tokens = (
+                    current
+                    and (len(current) + 1) * new_max > self.max_tokens
+                )
+                exceeds_cap = current and len(current) + 1 > self.cap_B
+                if exceeds_tokens or exceeds_cap:
+                    groups.append(current)
+                    current, current_max = [sequence_index], length
+                else:
+                    current.append(sequence_index)
+                    current_max = new_max
+            if current:
+                groups.append(current)
+            if sum(len(group) for group in groups) != boundary:
+                raise RuntimeError("Exact accumulation block was packed incorrectly")
+            blocks.append(groups)
+        if self.shuffle and blocks:
+            permutation = torch.randperm(
+                len(blocks), generator=self._generator(1)
+            ).tolist()
+            blocks = [blocks[position] for position in permutation]
+        return blocks
+
     def __iter__(self):
+        if self.exact_accumulation:
+            for block in self._build_exact_group_blocks():
+                for group in block:
+                    yield _pad_batch_causal(
+                        [self.sequences[i] for i in group]
+                    )
+            return
         groups = self._build_groups()
         if self.shuffle:
-            g = torch.Generator()
-            g.manual_seed(torch.randint(0, 2**31, (1,)).item())
+            g = self._generator(1)
             perm = torch.randperm(len(groups), generator=g).tolist()
             groups = [groups[p] for p in perm]
         for grp in groups:
             yield _pad_batch_causal([self.sequences[i] for i in grp])
 
     def __len__(self):
+        if self.exact_accumulation:
+            return sum(
+                len(block) for block in self._build_exact_group_blocks()
+            )
         return len(self._build_groups())
 
 
 def main(args):
-    set_global_seed(TrainingConfig.random_seed)
+    # Deterministic algorithms are off by default because they do not actually
+    # make this trainer reproducible: the memory-efficient SDPA backward is
+    # non-deterministic and `warn_only=True` lets it through, so two identical
+    # passes already differ (18/38 gradient tensors, verified in Exp 05).  The
+    # setting cost 4.3% of step time for nothing.  Seeding still fixes init,
+    # data order and dropout.  Pass --deterministic to restore the old flags.
+    set_global_seed(TrainingConfig.random_seed,
+                    deterministic=getattr(args, "deterministic", False))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # GPT standard architecture (HPO 2026-06-18 best: phase3_t000, DA 48.12% with V2).
-    # Hardcode here so that any prior mutation of ModelConfig cannot leak into the GPT run.
-    ModelConfig.dim = 256
-    ModelConfig.depth = 2
-    ModelConfig.heads = 4
-    ModelConfig.num_kv_heads = 1
+    # Explicit CLI overrides are required by the architecture-scaling experiment;
+    # otherwise retain the production baseline so prior in-process mutations cannot
+    # leak into an ordinary run.
+    ModelConfig.dim = args.dim or 256
+    ModelConfig.depth = args.depth or 2
+    ModelConfig.heads = args.heads or 4
+    ModelConfig.num_kv_heads = args.num_kv_heads or 1
     ModelConfig.dropout = args.dropout
-    ModelConfig.ffn_multiplier = 4
+    ModelConfig.ffn_multiplier = args.ffn_multiplier or 4
     ModelConfig.position_encoding = "rope"
     ModelConfig.rope_base = 10000.0
     ModelConfig.vocab_size = 1024
     ModelConfig.va_hidden_dim = 64
+    if ModelConfig.dim <= 0 or ModelConfig.depth <= 0:
+        raise ValueError("Model dim and depth must be positive")
+    if ModelConfig.heads <= 0 or ModelConfig.dim % ModelConfig.heads:
+        raise ValueError(
+            f"dim={ModelConfig.dim} must be divisible by heads={ModelConfig.heads}"
+        )
+    if (
+        ModelConfig.num_kv_heads <= 0
+        or ModelConfig.heads % ModelConfig.num_kv_heads
+    ):
+        raise ValueError(
+            f"heads={ModelConfig.heads} must be divisible by "
+            f"num_kv_heads={ModelConfig.num_kv_heads}"
+        )
+    if ModelConfig.ffn_multiplier <= 0:
+        raise ValueError("ffn_multiplier must be positive")
+    if args.gradient_checkpointing is not None:
+        TrainingConfig.use_gradient_checkpointing = args.gradient_checkpointing
 
     save_path = args.save_path
     tok_path = args.tokenizer_path
     epochs = args.epochs
     ckpt_path = save_path + ".ckpt"
+    save_stem, _ = os.path.splitext(save_path)
+    epoch_ckpt_index_path = save_stem + "_checkpoints.json"
     effective_lr = args.lr
 
     if args.max_stocks > 0:
@@ -465,6 +691,12 @@ def main(args):
     print(f"Device: {device}, tag={args.tag}")
     print(f"  save={save_path}, tok={tok_path}, ep={epochs}")
     print(f"  loss={args.loss}, gamma={args.gamma}, wd={args.weight_decay}, lr={effective_lr}")
+    print(
+        "  architecture="
+        f"dim{ModelConfig.dim}/depth{ModelConfig.depth}/heads{ModelConfig.heads}/"
+        f"kv{ModelConfig.num_kv_heads}/ffn{ModelConfig.ffn_multiplier}, "
+        f"gradient_checkpointing={TrainingConfig.use_gradient_checkpointing}"
+    )
     if args.label_smoothing > 0:
         print(f"  label_smoothing={args.label_smoothing}")
     if args.entropy_alpha > 0:
@@ -514,16 +746,40 @@ def main(args):
     # object) working; default is ON since it is provably identical to bs=1.
     batch_tokens = getattr(args, "batch_tokens", 12288)
     batch_cap = getattr(args, "batch_cap", 64)
+    controlled_loader_seed = getattr(args, "controlled_loader_seed", -1)
+    exact_accumulation = getattr(
+        args, "exact_accumulation_boundaries", False
+    )
     batched = batch_tokens > 0
+    if exact_accumulation and not batched:
+        raise ValueError(
+            "--exact_accumulation_boundaries requires --batch_tokens > 0"
+        )
+    if exact_accumulation and controlled_loader_seed < 0:
+        raise ValueError(
+            "--exact_accumulation_boundaries requires "
+            "--controlled_loader_seed >= 0"
+        )
     if batched:
         train_loader = TokenBudgetLoader(
             train_seqs, batch_tokens, shuffle=True, cap_B=batch_cap,
-            curriculum_epoch=0 if use_curriculum else -1, total_epochs=epochs)
+            curriculum_epoch=0 if use_curriculum else -1, total_epochs=epochs,
+            loader_seed=(
+                controlled_loader_seed
+                if controlled_loader_seed >= 0
+                else None
+            ),
+            exact_accumulation=exact_accumulation)
         val_loader = TokenBudgetLoader(
             val_seqs, batch_tokens, shuffle=False, cap_B=batch_cap)
         print(f"Loader: token-budget batched, max_tokens={batch_tokens}, "
               f"cap_B={batch_cap}, accum(seqs)={TrainingConfig.accumulation_steps} "
               f"(right-pad + is_causal; math-identical to bs=1)")
+        if exact_accumulation:
+            print(
+                "  [CONTROLLED] loader_seed="
+                f"{controlled_loader_seed}, exact accumulation boundaries"
+            )
         if use_curriculum:
             print(f"  [CURRICULUM] Phase 1 (ep 1-{epochs//3}): max 2000 tokens, "
                   f"Phase 2 (ep {epochs//3+1}-{2*epochs//3}): max 5000, Phase 3: all")
@@ -588,41 +844,61 @@ def main(args):
 
     amp_dtype = torch.bfloat16
     accum = TrainingConfig.accumulation_steps
+    constant_accumulation = getattr(args, "constant_accumulation", False)
+    print(
+        "  Accumulation policy: "
+        + (
+            f"constant {accum} sequences/update"
+            if constant_accumulation
+            else f"{accum} sequences/update, doubling at epoch 16"
+        )
+    )
     trainable_params = [p for group in optimizer.param_groups for p in group["params"]]
 
-    # Compute actual total optimizer steps (accounts for curriculum + dynamic accum)
+    # Compute the optimizer-step budget from the exact accumulation policy.  The
+    # historical default doubles accumulation at absolute epoch 15.  Exp 04 can
+    # opt out with --constant_accumulation after the 2026-07-27 audit showed that
+    # the larger batch removes updates without reducing forward/backward work.
     n_train_seqs = len(train_seqs)
-    if use_curriculum:
-        phase1_end = max(1, epochs * 10 // 30)
-        phase2_end = max(phase1_end + 1, epochs * 20 // 30)
-        n_short = sum(1 for s in train_seqs if s["input_ids"].shape[0] <= 2000)
-        n_med = sum(1 for s in train_seqs if s["input_ids"].shape[0] <= 5000)
-        accum_late = accum * 2  # epoch >= 15
-        actual_total = (
-            phase1_end * max(1, n_short // accum)
-            + min(max(0, phase2_end - phase1_end), max(0, 15 - phase1_end)) * max(1, n_med // accum)
-            + max(0, min(phase2_end, epochs) - max(phase1_end, 15)) * max(1, n_med // accum_late)
-            + max(0, epochs - max(phase2_end, 15)) * max(1, n_train_seqs // accum_late)
-        )
-    else:
-        accum_late = accum * 2
-        early_epochs = min(15, epochs)
-        late_epochs = max(0, epochs - 15)
-        steps_per_epoch = max(1, n_train_seqs // accum)
-        steps_per_epoch_late = max(1, n_train_seqs // accum_late)
-        actual_total = early_epochs * steps_per_epoch + late_epochs * steps_per_epoch_late
+    phase1_end = max(1, epochs * 10 // 30)
+    phase2_end = max(phase1_end + 1, epochs * 20 // 30)
+    n_short = sum(1 for s in train_seqs if s["input_ids"].shape[0] <= 2000)
+    n_med = sum(1 for s in train_seqs if s["input_ids"].shape[0] <= 5000)
+
+    def accumulation_for_epoch(epoch_index):
+        if constant_accumulation or epoch_index < 15:
+            return accum
+        return accum * 2
+
+    def sequences_for_epoch(epoch_index):
+        if not use_curriculum:
+            return n_train_seqs
+        if epoch_index < phase1_end:
+            return n_short
+        if epoch_index < phase2_end:
+            return n_med
+        return n_train_seqs
+
+    if exact_accumulation:
+        train_loader.set_accumulation_boundary(accumulation_for_epoch(0))
+
+    actual_total = sum(
+        max(1, sequences_for_epoch(epoch_index)
+            // accumulation_for_epoch(epoch_index))
+        for epoch_index in range(epochs)
+    )
 
     total_updates = max(actual_total, 1)
     print(f"  Scheduler: total_updates={total_updates} (actual optimizer steps, "
           f"not naive {len(train_loader) * epochs})")
 
-    # WSD scheduler (Warmup-Stable-Decay)
+    # Cosine scheduler: warmup → continuous cosine decay
+    # No stable plateau — LR starts decreasing immediately after warmup,
+    # ensuring convergence even when early stopping triggers early.
     scheduler = build_wsd_scheduler(optimizer, total_updates,
-                                     warmup_ratio=TrainingConfig.warmup_ratio,
-                                     stable_ratio=0.75)
+                                     warmup_ratio=TrainingConfig.warmup_ratio)
     scheduler_adam = build_wsd_scheduler(optimizer_adam, total_updates,
-                                          warmup_ratio=TrainingConfig.warmup_ratio,
-                                          stable_ratio=0.75) if optimizer_adam else None
+                                          warmup_ratio=TrainingConfig.warmup_ratio) if optimizer_adam else None
 
     # ---- Resume ----
     start_epoch = 0
@@ -640,14 +916,33 @@ def main(args):
             start_epoch = ckpt["epoch"] + 1
             best_val = ckpt.get("best_val", float("inf"))
             global_step = ckpt.get("global_step", 0)
+            restored_rng = _restore_rng_state(ckpt)
             print(f"  Resumed from epoch {start_epoch}, best_val={best_val:.4f}, step={global_step}")
+            if not restored_rng:
+                print("  [warning] Legacy checkpoint has no RNG state; resume is not bit-exact")
         except (RuntimeError, KeyError) as e:
             print(f"  Cannot resume from checkpoint (incompatible): {e}")
             print(f"  Starting fresh training.")
             os.remove(ckpt_path)
 
     os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
-    history = {"train_loss": [], "val_loss": [], "val_het_loss": [], "lr": []}
+    history = {"train_loss": [], "val_loss": [], "val_het_loss": [], "lr": [],
+               "epoch_time_s": []}
+    history_path = os.path.join(
+        os.path.dirname(save_path) or ".", f"history_{args.tag}.json"
+    )
+    if args.history_per_epoch and os.path.exists(history_path):
+        try:
+            with open(history_path, "r", encoding="utf-8") as f:
+                stored_history = json.load(f)
+            for key in history:
+                history[key] = list(stored_history.get(key, []))[:start_epoch]
+            for key in ("collapse_rate", "n_unique_tokens"):
+                if key in stored_history:
+                    history[key] = list(stored_history[key])[:start_epoch]
+            print(f"  Restored history through epoch {start_epoch}")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            print(f"  [warning] Could not restore history: {exc}")
     t0 = time.time()
 
     # Profiler from args (passed by sweep_bits)
@@ -657,6 +952,8 @@ def main(args):
 
     epochs_done = 0
     for epoch in range(start_epoch, epochs):
+        epoch_t0 = time.time()
+        epoch_step_start = global_step
         # Update curriculum epoch for length filtering
         if hasattr(train_loader, "set_epoch"):
             train_loader.set_epoch(epoch)
@@ -678,11 +975,13 @@ def main(args):
                     train_loader = make_dataloader_v2(filtered, batch_size=1, shuffle=True)
                 # else: keep full dataset if filter is too aggressive
 
-        # Dynamic accumulation: double accum after epoch 15 for stronger gradient signal
-        # epoch 0-14: accum=32 (effective batch=32)
-        # epoch 15+:  accum=64 (effective batch=64, more stable gradients)
-        epoch_accum = accum if epoch < 15 else accum * 2
-        if epoch == 15:
+        # Historical default: double accumulation after epoch 15.  Formal Exp 04
+        # passes --constant_accumulation and keeps the better-audited 32-sequence
+        # update batch throughout.
+        epoch_accum = accumulation_for_epoch(epoch)
+        if hasattr(train_loader, "set_accumulation_boundary"):
+            train_loader.set_accumulation_boundary(epoch_accum)
+        if epoch == 15 and not constant_accumulation:
             print(f"  [accum] Doubling accumulation: {accum} -> {epoch_accum} "
                   f"(effective batch {bs * epoch_accum})")
 
@@ -706,15 +1005,21 @@ def main(args):
             try:
                 if batched:
                     # Token-budget batched path: per-sequence loss summed over the
-                    # batch (identical gradient to bs=1), step every `epoch_accum`
-                    # SEQUENCES so the effective batch matches the single-seq loop.
-                    t_fwd_start = time.perf_counter() if (bi + 1) % 20 == 0 else 0
+                    # batch (identical gradient to bs=1). Historical mode steps
+                    # after the count reaches `epoch_accum` and may overshoot;
+                    # exact mode packs blocks that end exactly on the boundary.
+                    t_fwd_start = (
+                        time.perf_counter()
+                        if profiler and (bi + 1) % 20 == 0
+                        else 0
+                    )
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
                         if args.heteroscedastic:
                             coarse_logits, fine_logits, reg_pred, _ = model(
                                 input_ids, time_id, pos_id, mask,
                                 va_values=va_val, reg_targets=reg_target,
-                                fine_targets=fine_target)
+                                fine_targets=fine_target,
+                                compute_reg_loss=False)
                         else:
                             coarse_logits, fine_logits = model(
                                 input_ids, time_id, pos_id, mask,
@@ -725,13 +1030,17 @@ def main(args):
                             reg_pred, reg_target, args)
                     if t_fwd_start > 0:
                         t_forward_acc += time.perf_counter() - t_fwd_start
-                    t_bwd_start = time.perf_counter() if (bi + 1) % 20 == 0 else 0
+                    t_bwd_start = (
+                        time.perf_counter()
+                        if profiler and (bi + 1) % 20 == 0
+                        else 0
+                    )
                     (loss_sum / epoch_accum).backward()
                     if t_bwd_start > 0:
                         t_backward_acc += time.perf_counter() - t_bwd_start
                     seqs_in_accum += n_seq
                     if seqs_in_accum >= epoch_accum:
-                        torch.nn.utils.clip_grad_norm_(trainable_params, TrainingConfig.grad_clip)
+                        clip_grad_norm_(trainable_params, TrainingConfig.grad_clip)
                         optimizer.step()
                         if optimizer_adam:
                             optimizer_adam.step()
@@ -745,15 +1054,20 @@ def main(args):
                         seqs_in_accum = 0
                     loss_acc += loss_sum.detach()
                     n_loss += n_seq
-                    if (bi + 1) % 20 == 0:
-                        pbar.set_postfix({"loss": f"{loss_acc.item() / max(n_loss, 1):.4f}",
-                                          "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+                    if (bi + 1) % 100 == 0:
+                        pbar.set_postfix(
+                            {"lr": f"{optimizer.param_groups[0]['lr']:.2e}"}
+                        )
                     if TrainingConfig.max_train_updates and global_step >= TrainingConfig.max_train_updates:
                         break
                     continue
 
                 # Forward pass (timed every 20 steps)
-                t_fwd_start = time.perf_counter() if (bi + 1) % 20 == 0 else 0
+                t_fwd_start = (
+                    time.perf_counter()
+                    if profiler and (bi + 1) % 20 == 0
+                    else 0
+                )
                 with torch.amp.autocast("cuda", dtype=amp_dtype):
                     if args.heteroscedastic:
                         coarse_logits, fine_logits, _, het_loss = model(
@@ -801,13 +1115,17 @@ def main(args):
                     continue
 
                 # Backward pass (timed every 20 steps)
-                t_bwd_start = time.perf_counter() if (bi + 1) % 20 == 0 else 0
+                t_bwd_start = (
+                    time.perf_counter()
+                    if profiler and (bi + 1) % 20 == 0
+                    else 0
+                )
                 (loss / epoch_accum).backward()
                 if t_bwd_start > 0:
                     t_backward_acc += time.perf_counter() - t_bwd_start
 
                 if (bi + 1) % epoch_accum == 0 or (bi + 1) == len(train_loader):
-                    torch.nn.utils.clip_grad_norm_(trainable_params, TrainingConfig.grad_clip)
+                    clip_grad_norm_(trainable_params, TrainingConfig.grad_clip)
                     optimizer.step()
                     if optimizer_adam:
                         optimizer_adam.step()
@@ -822,7 +1140,12 @@ def main(args):
                 loss_acc += loss.detach()
                 n_loss += 1
 
-            except torch.cuda.OutOfMemoryError:
+            except torch.cuda.OutOfMemoryError as error:
+                if exact_accumulation:
+                    raise RuntimeError(
+                        "OOM in controlled exact-accumulation mode; aborting "
+                        "instead of changing the optimizer-step/data schedule"
+                    ) from error
                 # OOM fallback: skip this batch, clear cache
                 torch.cuda.empty_cache()
                 optimizer.zero_grad(set_to_none=True)
@@ -832,17 +1155,19 @@ def main(args):
                 print(f"  [OOM] Skipped batch {bi+1} (seq_len={input_ids.shape[-1]}, bs={input_ids.shape[0]})")
                 continue
 
-            # Update pbar every 20 steps (avoids per-step .item() sync)
-            if (bi + 1) % 20 == 0:
-                pbar.set_postfix({"loss": f"{loss_acc.item() / n_loss:.4f}",
-                                  "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+            # Keep the CUDA stream asynchronous; loss is synchronized once at
+            # epoch end instead of every progress-bar refresh.
+            if (bi + 1) % 100 == 0:
+                pbar.set_postfix(
+                    {"lr": f"{optimizer.param_groups[0]['lr']:.2e}"}
+                )
 
             if TrainingConfig.max_train_updates and global_step >= TrainingConfig.max_train_updates:
                 break
 
         # Flush any remaining accumulated gradient (batched mode leftover < accum)
         if batched and seqs_in_accum > 0:
-            torch.nn.utils.clip_grad_norm_(trainable_params, TrainingConfig.grad_clip)
+            clip_grad_norm_(trainable_params, TrainingConfig.grad_clip)
             optimizer.step()
             if optimizer_adam:
                 optimizer_adam.step()
@@ -854,6 +1179,18 @@ def main(args):
                 scheduler_adam.step()
             global_step += 1
             seqs_in_accum = 0
+
+        epoch_optimizer_steps = global_step - epoch_step_start
+        if exact_accumulation:
+            expected_epoch_steps = (
+                sequences_for_epoch(epoch) // epoch_accum
+            )
+            if epoch_optimizer_steps != expected_epoch_steps:
+                raise RuntimeError(
+                    "Controlled optimizer-step invariant failed at epoch "
+                    f"{epoch + 1}: observed {epoch_optimizer_steps}, "
+                    f"expected {expected_epoch_steps}"
+                )
 
         # Record profiler sub-timings (sampled, not exact per-step)
         if profiler:
@@ -877,7 +1214,8 @@ def main(args):
                         coarse_logits, fine_logits, reg_pred, val_het = model(
                             input_ids, time_id, pos_id, mask,
                             va_values=va_val, reg_targets=reg_target,
-                            fine_targets=fine_target)
+                            fine_targets=fine_target,
+                            compute_reg_loss=not batched)
                     else:
                         coarse_logits, fine_logits = model(
                             input_ids, time_id, pos_id, mask,
@@ -889,11 +1227,17 @@ def main(args):
                     if batched:
                         # Per-sequence means -> val_loss stays sequence-averaged
                         # (identical metric to the bs=1 loop).
-                        vlosses.extend(_per_seq_ce(shift_logits, shift_targets,
-                                                   ignore_index=-100).tolist())
+                        vlosses.append(
+                            _per_seq_ce(
+                                shift_logits, shift_targets, ignore_index=-100
+                            ).detach()
+                        )
                         if args.heteroscedastic and reg_pred is not None:
-                            v_het_losses.extend(
-                                _per_seq_het(reg_pred, reg_target[:, 1:]).tolist())
+                            v_het_losses.append(
+                                _per_seq_het(
+                                    reg_pred, reg_target[:, 1:]
+                                ).detach()
+                            )
                     else:
                         if val_het is not None:
                             v_het_losses.append(val_het.item())
@@ -904,12 +1248,11 @@ def main(args):
                             vlosses.append(vloss.item())
                     if args.light_eval:
                         valid_mask = (shift_targets != -100)
-                        if valid_mask.any():
-                            preds = shift_logits.argmax(dim=-1)
-                            val_pred_tokens.append(preds[valid_mask].cpu())
+                        preds = shift_logits.argmax(dim=-1)
+                        val_pred_tokens.append(preds[valid_mask].detach())
 
-        avg_val = sum(vlosses) / max(len(vlosses), 1)
-        avg_val_het = sum(v_het_losses) / max(len(v_het_losses), 1) if v_het_losses else 0.0
+        avg_val = _mean_metric_chunks(vlosses)
+        avg_val_het = _mean_metric_chunks(v_het_losses)
         cur_lr = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - t0
 
@@ -917,7 +1260,7 @@ def main(args):
         collapse_rate = 0.0
         n_unique_tokens = 0
         if args.light_eval and val_pred_tokens:
-            all_preds = torch.cat(val_pred_tokens)
+            all_preds = torch.cat(val_pred_tokens).cpu()
             total = all_preds.numel()
             if total > 0:
                 unique, counts = torch.unique(all_preds, return_counts=True)
@@ -928,24 +1271,27 @@ def main(args):
         history["val_loss"].append(avg_val)
         history["val_het_loss"].append(avg_val_het)
         history["lr"].append(cur_lr)
+        history["epoch_time_s"].append(time.time() - epoch_t0)
         if args.light_eval:
             history.setdefault("collapse_rate", []).append(collapse_rate)
             history.setdefault("n_unique_tokens", []).append(n_unique_tokens)
 
         # Write per-epoch history for Optuna pruning
         if args.history_per_epoch:
-            hp_path = os.path.join(os.path.dirname(save_path) or ".", f"history_{args.tag}.json")
-            with open(hp_path, "w") as f:
+            temporary_history = history_path + ".tmp"
+            with open(temporary_history, "w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2)
+            os.replace(temporary_history, history_path)
 
         save_tag = ""
-        sd = model.state_dict()
+        sd = _cpu_state_dict(model)
         if avg_val < best_val:
             best_val = avg_val
-            torch.save({
+            _atomic_torch_save({
                 "model_state_dict": sd,
                 "config": {"dim": ModelConfig.dim, "depth": ModelConfig.depth,
                            "heads": ModelConfig.heads, "num_kv_heads": ModelConfig.num_kv_heads,
+                           "ffn_multiplier": ModelConfig.ffn_multiplier,
                            "vocab_size": ModelConfig.vocab_size, "vocab_fine": ModelConfig.vocab_fine},
                 "val_loss": best_val,
                 "epoch": epoch,
@@ -961,37 +1307,84 @@ def main(args):
                 "dropout": ModelConfig.dropout,
                 "heteroscedastic": args.heteroscedastic,
                 "het_weight": args.het_weight,
+                "constant_accumulation": constant_accumulation,
+                "controlled_loader_seed": controlled_loader_seed,
+                "exact_accumulation_boundaries": exact_accumulation,
                 "collapse_rate": collapse_rate,
                 "n_unique_tokens": n_unique_tokens,
             }, save_path)
             save_tag = "  -> Saved best"
 
-        # Per-epoch checkpoint (for inference reuse of any epoch's weights)
-        epoch_ckpt_path = save_path.replace(".pt", f"_ep{epoch+1}.pt")
-        torch.save({
-            "model_state_dict": sd,
-            "config": {"dim": ModelConfig.dim, "depth": ModelConfig.depth,
-                       "heads": ModelConfig.heads, "num_kv_heads": ModelConfig.num_kv_heads,
-                       "vocab_size": ModelConfig.vocab_size, "vocab_fine": ModelConfig.vocab_fine},
-            "val_loss": avg_val,
-            "epoch": epoch,
-            "tag": args.tag,
-        }, epoch_ckpt_path)
+        # Optional per-epoch inference checkpoint plus a compact index.  These
+        # snapshots make it possible to revisit special points on the training
+        # trajectory without retaining optimizer state for every epoch.
+        if not getattr(args, "no_epoch_checkpoints", False):
+            epoch_ckpt_path = f"{save_stem}_ep{epoch+1}.pt"
+            _atomic_torch_save({
+                "model_state_dict": sd,
+                "config": {"dim": ModelConfig.dim, "depth": ModelConfig.depth,
+                           "heads": ModelConfig.heads, "num_kv_heads": ModelConfig.num_kv_heads,
+                           "ffn_multiplier": ModelConfig.ffn_multiplier,
+                           "vocab_size": ModelConfig.vocab_size, "vocab_fine": ModelConfig.vocab_fine},
+                "val_loss": avg_val,
+                "epoch": epoch,
+                "tag": args.tag,
+                "constant_accumulation": constant_accumulation,
+                "controlled_loader_seed": controlled_loader_seed,
+                "exact_accumulation_boundaries": exact_accumulation,
+            }, epoch_ckpt_path)
+            try:
+                if os.path.exists(epoch_ckpt_index_path):
+                    with open(epoch_ckpt_index_path, "r", encoding="utf-8") as f:
+                        checkpoint_index = json.load(f)
+                else:
+                    checkpoint_index = {"checkpoints": []}
+                entries = [
+                    item for item in checkpoint_index.get("checkpoints", [])
+                    if int(item.get("epoch", 0)) < epoch + 1
+                ]
+                entries.append({
+                    "epoch": epoch + 1,
+                    "path": os.path.abspath(epoch_ckpt_path),
+                    "size_bytes": os.path.getsize(epoch_ckpt_path),
+                    "train_loss": avg_train,
+                    "val_loss": avg_val,
+                    "learning_rate": cur_lr,
+                    "best_so_far": bool(save_tag),
+                    "global_step": global_step,
+                    "optimizer_steps_this_epoch": epoch_optimizer_steps,
+                })
+                checkpoint_index = {
+                    "tag": args.tag,
+                    "save_path": os.path.abspath(save_path),
+                    "updated_epoch": epoch + 1,
+                    "checkpoints": entries,
+                }
+                temporary_index = epoch_ckpt_index_path + ".tmp"
+                with open(temporary_index, "w", encoding="utf-8") as f:
+                    json.dump(checkpoint_index, f, indent=2)
+                os.replace(temporary_index, epoch_ckpt_index_path)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                print(f"  [warning] Could not update checkpoint index: {exc}")
 
         # Resume checkpoint (for training resume)
         ckpt_dict = {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": sd,
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "epoch": epoch,
             "best_val": best_val,
             "global_step": global_step,
             "tag": args.tag,
+            "constant_accumulation": constant_accumulation,
+            "controlled_loader_seed": controlled_loader_seed,
+            "exact_accumulation_boundaries": exact_accumulation,
+            **_rng_state(),
         }
         if optimizer_adam:
             ckpt_dict["optimizer_adam_state"] = optimizer_adam.state_dict()
             ckpt_dict["scheduler_adam_state"] = scheduler_adam.state_dict()
-        torch.save(ckpt_dict, ckpt_path)
+        _atomic_torch_save(ckpt_dict, ckpt_path)
 
         epochs_done = epoch - start_epoch + 1
         epochs_left = epochs - epoch - 1
@@ -1006,9 +1399,22 @@ def main(args):
 
         # Early stopping check
         if early_stop and early_stop(avg_val, epoch):
-            print(f"  [early_stop] Patience exhausted at epoch {epoch+1} "
-                  f"(best={early_stop.best:.4f} at epoch {early_stop.best_epoch+1}). Stopping.")
-            break
+            remaining = epochs - (epoch + 1)
+            if remaining >= 3:
+                # Instead of stopping, reset scheduler to cosine decay over remaining epochs.
+                # This lets the LR decrease naturally while training continues.
+                new_total = max(remaining * steps_per_epoch, 1)
+                scheduler = build_wsd_scheduler(optimizer, new_total, warmup_ratio=0.0)
+                if scheduler_adam:
+                    scheduler_adam = build_wsd_scheduler(optimizer_adam, new_total, warmup_ratio=0.0)
+                early_stop.counter = 0  # reset patience counter
+                early_stop.patience = remaining  # remaining patience = remaining epochs
+                print(f"  [scheduler_reset] Patience exhausted → cosine decay over {remaining} "
+                      f"remaining epochs ({new_total} steps)")
+            else:
+                print(f"  [early_stop] Patience exhausted at epoch {epoch+1} "
+                      f"(best={early_stop.best:.4f} at epoch {early_stop.best_epoch+1}). Stopping.")
+                break
 
         if TrainingConfig.max_train_updates and global_step >= TrainingConfig.max_train_updates:
             break
@@ -1017,7 +1423,7 @@ def main(args):
     if os.path.exists(save_path):
         ckpt = torch.load(save_path, map_location="cpu", weights_only=False)
         ckpt["completed"] = True
-        torch.save(ckpt, save_path)
+        _atomic_torch_save(ckpt, save_path)
 
     with open(os.path.join(os.path.dirname(save_path) or ".", f"history_{args.tag}.json"), "w") as f:
         json.dump(history, f, indent=2)
@@ -1085,6 +1491,23 @@ Examples:
                         help="Pre-trained base model checkpoint for reasoning model")
     # Overrides
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dim", type=int, default=0,
+                        help="Transformer width (0=production baseline 256)")
+    parser.add_argument("--depth", type=int, default=0,
+                        help="Transformer block count (0=production baseline 2)")
+    parser.add_argument("--heads", type=int, default=0,
+                        help="Attention head count (0=production baseline 4)")
+    parser.add_argument("--num_kv_heads", type=int, default=0,
+                        help="GQA key/value head count (0=production baseline 1)")
+    parser.add_argument("--ffn_multiplier", type=int, default=0,
+                        help="Feed-forward expansion multiplier (0=production baseline 4)")
+    parser.add_argument("--gradient_checkpointing",
+                        dest="gradient_checkpointing", action="store_true",
+                        default=None,
+                        help="Enable per-block activation checkpointing")
+    parser.add_argument("--no-gradient-checkpointing",
+                        dest="gradient_checkpointing", action="store_false",
+                        help="Explicitly disable activation checkpointing")
     parser.add_argument("--max_stocks", type=int, default=0,
                         help="Subsample N stocks for fast HPO screening (0=all)")
     parser.add_argument("--max_seq_len", type=int, default=0,
@@ -1093,6 +1516,8 @@ Examples:
                         help="Force re-tokenization (clear cache)")
     parser.add_argument("--history_per_epoch", action="store_true",
                         help="Write per-epoch val_loss to JSON (for Optuna pruning)")
+    parser.add_argument("--no_epoch_checkpoints", action="store_true",
+                        help="Do not save *_epN.pt inference snapshots; best .pt and resumable .ckpt are still kept")
     # ── Training improvement args ──
     parser.add_argument("--early_stop_patience", type=int, default=0,
                         help="Early stopping patience (0=disabled, recommended 3-5 for GPT)")
@@ -1102,4 +1527,32 @@ Examples:
                              "~1.7x faster GPT training. 0 = legacy single-seq (bs=1).")
     parser.add_argument("--batch_cap", type=int, default=64,
                         help="Hard cap on sequences per batch (safety for very short stocks)")
+    parser.add_argument(
+        "--controlled_loader_seed",
+        type=int,
+        default=-1,
+        help="Architecture-independent token-loader seed (-1 preserves the "
+             "historical global-RNG behaviour).",
+    )
+    parser.add_argument(
+        "--exact_accumulation_boundaries",
+        action="store_true",
+        default=False,
+        help="Partition token-budget batches into deterministic blocks that "
+             "end exactly at each optimizer update. Requires "
+             "--controlled_loader_seed >= 0.",
+    )
+    parser.add_argument("--deterministic", action="store_true", default=False,
+                        help="Restore torch.use_deterministic_algorithms + cuBLAS "
+                             "workspace pinning. Costs ~4%% and does NOT make this "
+                             "trainer reproducible (SDPA backward stays "
+                             "non-deterministic); kept for debugging only.")
+    parser.add_argument(
+        "--constant_accumulation",
+        action="store_true",
+        default=False,
+        help="Keep TrainingConfig.accumulation_steps for every epoch instead of "
+             "doubling it at absolute epoch 15. The historical default is "
+             "preserved unless this flag is passed.",
+    )
     main(parser.parse_args())

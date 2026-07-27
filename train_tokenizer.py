@@ -1,7 +1,8 @@
 """Stage A: Train BSQ Tokenizer — CUDA Graphs optimized.
 
 Core optimizations:
-  - CUDA Graphs: capture forward+backward+step as single replayed graph
+  - CUDA Graphs: capture forward+backward+gradient clipping; keep Adam eager
+    so the update trajectory remains bit-identical to the historical trainer
   - GPU-resident data: entire training set on GPU, zero CPU-GPU transfer
   - In-place forward: add_() for graph-compatible accumulation
   - Feature caching: skip repeat normalization on re-runs
@@ -17,10 +18,12 @@ Usage:
 """
 import argparse
 import os
+import random
 import sys
 import time
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+if os.name != "nt":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.getcwd())
 
@@ -32,6 +35,11 @@ from tqdm import tqdm
 from config import DataConfig, TokenizerConfig, set_global_seed
 from data_processor import load_stocks, split_stocks, get_tokenizer_features_v2
 from model.tokenizer import HierarchicalQuantizer, build_tokenizer_kwargs, export_tokenizer_config
+from training_utils import (
+    FixedBatchCudaGraphStep,
+    clip_grad_norm_,
+    optimizer_lr,
+)
 
 
 class EarlyStopping:
@@ -75,12 +83,45 @@ def build_tokenizer_scheduler(optimizer, total_steps, warmup_frac=0.05,
 # Feature cache
 # ============================================================================
 
-_FEATURE_CACHE_DIR = "checkpoints/feature_cache"
+_FEATURE_CACHE_DIR = os.environ.get(
+    "KRONOS_TOKENIZER_FEATURE_CACHE_DIR", "checkpoints/feature_cache"
+)
 
 
 def _feature_cache_path(tag, cutoff_date):
     os.makedirs(_FEATURE_CACHE_DIR, exist_ok=True)
     return os.path.join(_FEATURE_CACHE_DIR, f"tok_feat_{tag}_{cutoff_date}.npz")
+
+
+def _atomic_torch_save(payload, path):
+    """Write a checkpoint without exposing a partially written target."""
+    temporary = path + ".tmp"
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def _rng_state():
+    state = {
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": np.random.get_state(),
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(checkpoint):
+    if "python_rng_state" in checkpoint:
+        random.setstate(checkpoint["python_rng_state"])
+    if "numpy_rng_state" in checkpoint:
+        np.random.set_state(checkpoint["numpy_rng_state"])
+    if "torch_rng_state" in checkpoint:
+        torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+    if torch.cuda.is_available() and "cuda_rng_state_all" in checkpoint:
+        torch.cuda.set_rng_state_all(
+            [state.cpu() for state in checkpoint["cuda_rng_state_all"]]
+        )
 
 
 def _load_or_compute_features(stocks, tag, cutoff_date):
@@ -103,16 +144,42 @@ def _load_or_compute_features(stocks, tag, cutoff_date):
 def _validate(tok, val_feat_gpu, bs, device):
     tok.eval()
     N = len(val_feat_gpu)
-    # Only iterate full batches — skip last incomplete to avoid zero-pad pollution
-    n_batches = N // bs
-    val_loss_sum = 0.0
+    # Include the final short batch directly; no padding is introduced.
+    losses = []
+    counts = []
     with torch.inference_mode():
-        for i in range(n_batches):
-            batch = val_feat_gpu[i * bs : (i + 1) * bs]
+        for start in range(0, N, bs):
+            batch = val_feat_gpu[start : start + bs]
+            if len(batch) == 0:
+                continue
             loss = tok(batch)
-            val_loss_sum += loss.item()
+            losses.append(loss.detach())
+            counts.append(len(batch))
     tok.train()
-    return val_loss_sum / max(n_batches, 1)
+    values = torch.stack(losses).cpu().tolist() if losses else []
+    return sum(
+        value * count for value, count in zip(values, counts)
+    ) / max(sum(counts), 1)
+
+
+def _validate_loader(tok, val_loader, device, use_amp=False,
+                     amp_dtype=torch.float32):
+    tok.eval()
+    losses = []
+    counts = []
+    with torch.inference_mode():
+        for (batch,) in val_loader:
+            batch = batch.to(device, non_blocking=True)
+            with torch.amp.autocast(
+                    "cuda", dtype=amp_dtype, enabled=use_amp):
+                loss = tok(batch)
+            losses.append(loss.detach())
+            counts.append(len(batch))
+    tok.train()
+    values = torch.stack(losses).cpu().tolist() if losses else []
+    return sum(
+        value * count for value, count in zip(values, counts)
+    ) / max(sum(counts), 1)
 
 
 # ============================================================================
@@ -122,12 +189,13 @@ def _validate(tok, val_feat_gpu, bs, device):
 def _train_cuda_graph(tok, train_feat_gpu, val_feat_gpu, bs, epochs, val_every,
                       save_path, ckpt_path, lr, grad_clip, device,
                       early_stop=None, use_scheduler=False):
-    """torch.compile(reduce-overhead) training — automatic CUDA graphs."""
+    """Native fixed-shape CUDA graph training (including Windows)."""
     N = len(train_feat_gpu)
     n_steps = N // bs
-    print(f"  Compiled mode: {n_steps} steps/epoch, bs={bs}")
+    print(f"  Native CUDA Graph: {n_steps} steps/epoch, bs={bs}")
 
-    optimizer = torch.optim.Adam(tok.parameters(), lr=lr)
+    params = list(tok.parameters())
+    optimizer = torch.optim.Adam(params, lr=lr)
 
     # Optional LR scheduler
     scheduler = None
@@ -136,65 +204,61 @@ def _train_cuda_graph(tok, train_feat_gpu, val_feat_gpu, bs, epochs, val_every,
         scheduler = build_tokenizer_scheduler(optimizer, total_steps, warmup_frac=0.05)
         print(f"  LR scheduler: warmup+cosine ({total_steps} total steps)")
 
+    # Resume a coherent model/optimizer/scheduler snapshot before compilation.
+    # RNG is restored after the dry warmup so continuation stays reproducible.
+    start_epoch, best_val = 0, float("inf")
+    resume_checkpoint = None
+    if os.path.exists(ckpt_path):
+        resume_checkpoint = torch.load(
+            ckpt_path, map_location=device, weights_only=False
+        )
+        tok.load_state_dict(resume_checkpoint["model_state_dict"])
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+        if scheduler and "scheduler_state_dict" in resume_checkpoint:
+            scheduler.load_state_dict(
+                resume_checkpoint["scheduler_state_dict"]
+            )
+        start_epoch = resume_checkpoint["epoch"] + 1
+        best_val = resume_checkpoint.get("best_val", float("inf"))
+        print(f"  Resumed from epoch {start_epoch}, best_val={best_val:.4f}")
+
     # Pre-allocate static buffer
     static_input = torch.empty(bs, 4, device=device, dtype=torch.float32)
 
-    # torch.compile with cudagraphs backend — uses CUDA graphs internally
-    # torch.compile(backend="cudagraphs") — disabled on Windows (Jinja2/triton errors)
-    import sys as _sys
-    if _sys.platform != "win32" and hasattr(torch, "compile"):
-        tok = torch.compile(tok, backend="cudagraphs")
-        print("  torch.compile(backend='cudagraphs') enabled")
-    else:
-        if _sys.platform == "win32":
-            print("  torch.compile disabled (Windows)")
+    if resume_checkpoint is not None:
+        _restore_rng_state(resume_checkpoint)
 
-    # Warmup
-    print("  Warming up (5 steps)...")
+    raw_tok = tok
     tok.train()
-    for _ in range(5):
-        idx = torch.randint(0, N, (bs,), device=device)
-        static_input.copy_(train_feat_gpu[idx])
-        loss = tok(static_input)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(tok.parameters(), grad_clip)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-    torch.cuda.synchronize()
-    print("  Warmup done. Training...")
-
-    # Resume
-    start_epoch, best_val = 0, float("inf")
-    raw_tok = tok._orig_mod if hasattr(tok, "_orig_mod") else tok
-    if os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        raw_tok.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = ckpt["epoch"] + 1
-        best_val = ckpt.get("best_val", float("inf"))
-        print(f"  Resumed from epoch {start_epoch}, best_val={best_val:.4f}")
+    static_input.copy_(train_feat_gpu[:bs])
+    train_loss_acc = torch.zeros((), device=device)
+    print("  Capturing forward + backward + gradient clipping...")
+    graph_step = FixedBatchCudaGraphStep.capture(
+        tok,
+        optimizer,
+        params,
+        loss_closure=lambda: tok(static_input),
+        grad_clip=grad_clip,
+        loss_accumulator=train_loss_acc,
+    )
+    print("  CUDA graph captured; Adam remains on the exact eager path.")
 
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     t0 = time.time()
 
     for epoch in range(start_epoch, epochs):
-        train_loss_acc = 0.0
+        train_loss_acc.zero_()
 
         for step in range(n_steps):
             idx = torch.randint(0, N, (bs,), device=device)  # O(1) vs randperm O(N)
             static_input.copy_(train_feat_gpu[idx])
 
-            optimizer.zero_grad(set_to_none=True)
-            loss = tok(static_input)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(tok.parameters(), grad_clip)
-            optimizer.step()
+            graph_step.replay()
             if scheduler:
                 scheduler.step()
-            train_loss_acc += loss.detach()
 
         train_loss = (train_loss_acc / n_steps).item()
-        cur_lr = optimizer.param_groups[0]["lr"]
+        cur_lr = optimizer_lr(optimizer)
 
         do_val = (epoch + 1) % val_every == 0 or (epoch + 1) == epochs
         if do_val:
@@ -208,16 +272,28 @@ def _train_cuda_graph(tok, train_feat_gpu, val_feat_gpu, bs, epochs, val_every,
 
         # Compute state_dict once per checkpoint save
         sd = raw_tok.state_dict()
-        torch.save({"model_state_dict": sd,
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "epoch": epoch, "best_val": best_val}, ckpt_path)
+        resume_payload = {
+            "model_state_dict": sd,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_val": best_val,
+            **_rng_state(),
+        }
+        if scheduler:
+            resume_payload["scheduler_state_dict"] = scheduler.state_dict()
+        _atomic_torch_save(resume_payload, ckpt_path)
         if improved:
-            torch.save({"model_state_dict": sd,
-                        "config": export_tokenizer_config(),
-                        "best_val_loss": best_val,
-                        "best_epoch": epoch,
-                        "total_epochs": epochs,
-                        "completed": epoch == epochs - 1}, save_path)
+            _atomic_torch_save(
+                {
+                    "model_state_dict": sd,
+                    "config": export_tokenizer_config(),
+                    "best_val_loss": best_val,
+                    "best_epoch": epoch,
+                    "total_epochs": epochs,
+                    "completed": epoch == epochs - 1,
+                },
+                save_path,
+            )
 
         log_interval = max(1, epochs // 6)
         if do_val and ((epoch + 1) % log_interval == 0 or epoch == start_epoch or (epoch + 1) == epochs):
@@ -238,20 +314,31 @@ def _train_cuda_graph(tok, train_feat_gpu, val_feat_gpu, bs, epochs, val_every,
 # ============================================================================
 
 def _train_standard(tok, train_loader, val_loader, epochs, val_every,
-                    save_path, ckpt_path, lr, grad_clip, device):
+                    save_path, ckpt_path, lr, grad_clip, device,
+                    early_stop=None, use_scheduler=False):
     optimizer = torch.optim.Adam(tok.parameters(), lr=lr)
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
     use_amp = amp_dtype != torch.float32
+    scheduler = None
+    if use_scheduler:
+        scheduler = build_tokenizer_scheduler(
+            optimizer, max(1, len(train_loader) * epochs), warmup_frac=0.05
+        )
 
     t0 = time.time()
     best_val = float("inf")
     start_epoch = 0
     if os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        tok.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = ckpt["epoch"] + 1
-        best_val = ckpt.get("best_val", float("inf"))
+        checkpoint = torch.load(
+            ckpt_path, map_location=device, weights_only=False
+        )
+        tok.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if scheduler and "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1
+        best_val = checkpoint.get("best_val", float("inf"))
+        _restore_rng_state(checkpoint)
 
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     raw_tok = tok._orig_mod if hasattr(tok, "_orig_mod") else tok
@@ -266,35 +353,63 @@ def _train_standard(tok, train_loader, val_loader, epochs, val_every,
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 loss = tok(batch)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(tok.parameters(), grad_clip)
+            clip_grad_norm_(tok.parameters(), grad_clip)
             optimizer.step()
+            if scheduler:
+                scheduler.step()
             loss_acc += loss.detach()
             count += 1
 
         train_loss = (loss_acc / max(count, 1)).item()
         do_val = (epoch + 1) % val_every == 0 or (epoch + 1) == epochs
-        val_loss = _validate(raw_tok, next(iter(val_loader))[0].to(device),
-                             train_loader.batch_size, device) if do_val else best_val
+        val_loss = (
+            _validate_loader(
+                raw_tok, val_loader, device,
+                use_amp=use_amp, amp_dtype=amp_dtype,
+            )
+            if do_val
+            else best_val
+        )
 
         improved = val_loss < best_val
         if improved:
             best_val = val_loss
 
-        torch.save({"model_state_dict": raw_tok.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "epoch": epoch, "best_val": best_val}, ckpt_path)
+        resume_payload = {
+            "model_state_dict": raw_tok.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_val": best_val,
+            **_rng_state(),
+        }
+        if scheduler:
+            resume_payload["scheduler_state_dict"] = scheduler.state_dict()
+        _atomic_torch_save(resume_payload, ckpt_path)
         if improved:
-            torch.save({"model_state_dict": raw_tok.state_dict(),
-                        "config": export_tokenizer_config(),
-                        "best_val_loss": best_val,
-                        "best_epoch": epoch,
-                        "total_epochs": epochs,
-                        "completed": epoch == epochs - 1}, save_path)
+            _atomic_torch_save(
+                {
+                    "model_state_dict": raw_tok.state_dict(),
+                    "config": export_tokenizer_config(),
+                    "best_val_loss": best_val,
+                    "best_epoch": epoch,
+                    "total_epochs": epochs,
+                    "completed": epoch == epochs - 1,
+                },
+                save_path,
+            )
 
         log_interval = max(1, epochs // 6)
         if do_val and ((epoch + 1) % log_interval == 0 or epoch == start_epoch or (epoch + 1) == epochs):
             print(f"  Epoch {epoch+1}: train={train_loss:.4f} val={val_loss:.4f} best={best_val:.4f} "
                   f"{time.time()-t0:.0f}s")
+
+        if early_stop and do_val and early_stop(val_loss, epoch):
+            print(
+                f"  Early stopping at epoch {epoch+1} "
+                f"(best={early_stop.best:.4f} at epoch "
+                f"{early_stop.best_epoch+1}, patience={early_stop.patience})"
+            )
+            break
 
     return best_val
 
@@ -304,7 +419,16 @@ def _train_standard(tok, train_loader, val_loader, epochs, val_every,
 # ============================================================================
 
 def main(args=None):
-    set_global_seed(TokenizerConfig.random_seed, deterministic=False)
+    global _FEATURE_CACHE_DIR
+    seed = (
+        getattr(args, "seed", TokenizerConfig.random_seed)
+        if args else TokenizerConfig.random_seed
+    )
+    TokenizerConfig.random_seed = int(seed)
+    DataConfig.random_seed = int(seed)
+    if args and getattr(args, "feature_cache_dir", ""):
+        _FEATURE_CACHE_DIR = os.path.abspath(args.feature_cache_dir)
+    set_global_seed(seed, deterministic=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     bs = args.batch_size if args else TokenizerConfig.batch_size
@@ -347,6 +471,11 @@ def main(args=None):
     train_feat = _load_or_compute_features(tok_train_stocks, "train", DataConfig.cutoff_date)
     val_feat = _load_or_compute_features(tok_val_stocks, "val", DataConfig.cutoff_date)
     print(f"Feature vectors: train={train_feat.shape}, val={val_feat.shape}")
+    if len(train_feat) == 0 or len(val_feat) == 0:
+        raise RuntimeError("Tokenizer train/validation feature split is empty")
+    if bs > len(train_feat):
+        bs = len(train_feat)
+        print(f"  Adjusted batch_size to {bs} for available training features")
 
     tok = HierarchicalQuantizer(**build_tokenizer_kwargs()).to(device)
 
@@ -388,7 +517,9 @@ def main(args=None):
                                    save_path=save_path, ckpt_path=ckpt_path,
                                    lr=TokenizerConfig.learning_rate,
                                    grad_clip=TokenizerConfig.grad_clip,
-                                   device=device)
+                                   device=device,
+                                   early_stop=early_stop,
+                                   use_scheduler=use_scheduler)
 
     # Mark completed
     if os.path.exists(save_path):
@@ -396,7 +527,7 @@ def main(args=None):
         if not ckpt.get("completed", False):
             ckpt["completed"] = True
             ckpt["total_epochs"] = epochs
-            torch.save(ckpt, save_path)
+            _atomic_torch_save(ckpt, save_path)
 
     print(f"\nSaved tokenizer to {save_path} (best val={best_val:.4f})")
 
@@ -423,6 +554,13 @@ if __name__ == "__main__":
                    help="Override TokenizerConfig.hidden_dim (0=use config default)")
     p.add_argument("--tag", type=str, default="",
                    help="Tag appended to save_path for distinguishing runs")
+    p.add_argument("--seed", type=int, default=TokenizerConfig.random_seed)
+    p.add_argument(
+        "--feature_cache_dir",
+        type=str,
+        default="",
+        help="Isolated tokenizer feature-cache directory",
+    )
     parsed = p.parse_args()
     if parsed.bits_l1 > 0:
         TokenizerConfig.bits_l1 = parsed.bits_l1

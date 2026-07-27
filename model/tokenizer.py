@@ -59,6 +59,32 @@ class BSQQuantizer(nn.Module):
 
         return b, bits_01, indices, ent_loss
 
+    def training_bits(self, z):
+        """Return reconstruction bits and entropy loss without ID round-trips.
+
+        ``HierarchicalQuantizer.forward`` only needs the hard {-1, +1} bits,
+        while the public ``forward`` method also exposes token IDs.  Converting
+        bits to integer IDs and immediately converting them back costs several
+        small CUDA kernels.  The ``logits > 0`` rule exactly matches the old
+        sign -> long -> bit-unpack path, including mapping an exact zero to -1.
+        """
+        z_norm = F.normalize(z, dim=-1)
+        logits = self.project(z_norm)
+        hard_bits = (
+            (logits > 0)
+            .to(dtype=logits.dtype)
+            .mul_(2.0)
+            .sub_(1.0)
+        )
+
+        ent_loss = torch.zeros((), device=z.device, dtype=z.dtype)
+        if self.training:
+            b_soft = torch.tanh(logits)
+            prob = (b_soft * 0.5 + 0.5).mean(0).clamp(1e-10, 1 - 1e-10)
+            ent = -(prob * prob.log() + (1 - prob) * (1 - prob).log()).mean()
+            ent_loss = -ent * self.entropy_weight
+        return hard_bits, ent_loss
+
     def quantize(self, z):
         z_norm = F.normalize(z, dim=-1)
         logits = self.project(z_norm)
@@ -135,8 +161,8 @@ class HierarchicalQuantizer(nn.Module):
         z_q = torch.zeros_like(z)
         total_loss = torch.zeros((), device=z.device, dtype=z.dtype)
         for bsq in self.bsq_quantizers:
-            b, bits_01, idx, q_loss = bsq(residual)
-            z_q_i = bsq.decode_proj(bsq._int_to_bits(idx, bsq.bits))
+            hard_bits, q_loss = bsq.training_bits(residual)
+            z_q_i = bsq.decode_proj(hard_bits)
             residual = residual - z_q_i.detach()
             z_q.add_(z_q_i)
             total_loss.add_(q_loss)

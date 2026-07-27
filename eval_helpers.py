@@ -53,19 +53,37 @@ def load_gpt(path, device, tokenizer=None):
 # ============================================================================
 
 def attach_close_prices(test_stocks):
-    """Attach `close_prices` [T] float64 to each stock by re-reading its CSV."""
-    csv_map = {os.path.basename(f).split(".")[0]: f
-               for f in sorted(glob("dataset/*.csv"))}
+    """Attach date-aligned ``close_prices`` [T] float64 to each stock.
+
+    ``features_raw`` loses the first CSV row when the initial log return is
+    undefined, so copying the raw close column positionally introduces a
+    one-day MAPE shift. Align by date instead. Numeric symbols are indexed both
+    with and without leading zeroes; unresolved/incomplete series fall back to
+    a scale-free close path reconstructed from log returns.
+    """
+    csv_map = {}
+    for f in sorted(glob("dataset/*.csv")):
+        stem = os.path.basename(f).split(".")[0]
+        csv_map[stem] = f
+        if stem.isdigit():
+            csv_map.setdefault(str(int(stem)), f)
     for s in test_stocks:
         fpath = csv_map.get(s["symbol"])
         if fpath:
             df = pd.read_csv(fpath, usecols=["date", "close"])
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = df.dropna(subset=["date", "close"]).sort_values("date")
-            s["close_prices"] = df["close"].values.astype(np.float64)
-        else:
-            lr = s["features_raw"][:, 0]
-            s["close_prices"] = np.exp(np.cumsum(lr)).astype(np.float64)
+            df = (df.dropna(subset=["date", "close"])
+                    .sort_values("date")
+                    .drop_duplicates("date", keep="last"))
+            close_by_date = df.set_index("date")["close"]
+            target_dates = pd.to_datetime(s.get("dates_dt", []), errors="coerce")
+            aligned = close_by_date.reindex(target_dates).to_numpy(dtype=np.float64)
+            if len(aligned) == len(s["features_raw"]) and np.isfinite(aligned).all():
+                s["close_prices"] = aligned
+                continue
+
+        lr = s["features_raw"][:, 0]
+        s["close_prices"] = np.exp(np.cumsum(lr)).astype(np.float64)
 
 
 def build_stock_arrays(stock):
@@ -126,15 +144,15 @@ def build_gpt_eval_inputs(arrays, tokenizer, device):
         torch.tensor([year_list[:-1]], dtype=torch.long),
     ], dim=-1).to(device)
     pos = torch.arange(S - 1, device=device).unsqueeze(0)
-    mask = torch.tril(torch.ones(S - 1, S - 1, dtype=torch.bool, device=device))
-
     va_seq = np.concatenate([
         np.zeros((1, 2), dtype=np.float32),
         arrays["va_normed"][:N - 1],
     ], axis=0)
     va = torch.tensor(va_seq, dtype=torch.float32, device=device).unsqueeze(0)
     return {
-        "inp": inp, "tids": tids, "pos": pos, "mask": mask, "va_values": va,
+        # Right padding is always after every real query.  Passing no explicit
+        # mask lets SDPA use its native causal path without allocating [N, N].
+        "inp": inp, "tids": tids, "pos": pos, "mask": None, "va_values": va,
         "S": S, "token_ids": token_ids,
         "test_start": arrays["ci"], "test_end": T_total - 2,
     }
@@ -193,15 +211,119 @@ def decode_coarse_token(coarse_id, fine_logits_at_pos, tokenizer, device):
 
 def decode_coarse_batch(coarse_ids, fine_logits_batch, tokenizer, device):
     """Batch decode: [B] coarse IDs + [B, V_fine] fine logits -> [B, 4] features."""
-    fine_ids = fine_logits_batch.argmax(dim=-1).cpu().numpy()  # [B]
-    coarse_ids_np = np.array(coarse_ids)
-    B = len(coarse_ids_np)
-    pred_indices = torch.zeros(B, 1, 2, dtype=torch.long, device=device)
-    pred_indices[:, 0, 0] = torch.tensor(np.clip(coarse_ids_np, 0, tokenizer.bsq_coarse.vocab_size - 1), dtype=torch.long)
-    pred_indices[:, 0, 1] = torch.tensor(np.clip(fine_ids, 0, tokenizer.bsq_fine.vocab_size - 1), dtype=torch.long)
-    with torch.no_grad():
-        pred_feat = tokenizer.decode_all(pred_indices)  # [B, 1, 4]
-    return pred_feat[:, 0, :].cpu().numpy()  # [B, 4]
+    fine_logits = torch.as_tensor(fine_logits_batch, device=device)
+    fine_ids = fine_logits.float().argmax(dim=-1)
+    decoded = decode_code_ids_tensor(
+        coarse_ids, fine_ids, tokenizer, device
+    )
+    return decoded.cpu().numpy()
+
+
+@torch.no_grad()
+def decode_code_ids_tensor(coarse_ids, fine_ids, tokenizer, device):
+    """Decode already-selected coarse/fine IDs and keep the result on device."""
+    coarse = torch.as_tensor(
+        coarse_ids, dtype=torch.long, device=device
+    ).clamp(0, tokenizer.bsq_coarse.vocab_size - 1)
+    fine = torch.as_tensor(
+        fine_ids, dtype=torch.long, device=device
+    ).clamp(0, tokenizer.bsq_fine.vocab_size - 1)
+    pred_indices = torch.stack((coarse, fine), dim=-1).unsqueeze(1)
+    return tokenizer.decode_all(pred_indices)[:, 0, :]
+
+
+@torch.no_grad()
+def gather_prediction_ids(
+    coarse_logits,
+    fine_logits,
+    row_indices,
+    positions,
+    tokenizer,
+    device,
+):
+    """Gather selected coarse/fine IDs without copying full logits to CPU.
+
+    ``row_indices`` and ``positions`` are aligned flattened vectors.  The
+    historical final-position behaviour is retained: if no fine logit exists,
+    fine ID zero is used (argmax of the former all-zero fallback vector).
+    """
+    rows = torch.as_tensor(row_indices, dtype=torch.long, device=device)
+    pos = torch.as_tensor(positions, dtype=torch.long, device=device)
+    selected_coarse = coarse_logits[
+        rows, pos, : tokenizer.vocab_coarse
+    ].float()
+    coarse_ids = selected_coarse.argmax(dim=-1)
+
+    valid_fine = pos < fine_logits.shape[1]
+    safe_fine_positions = pos.clamp(max=fine_logits.shape[1] - 1)
+    gathered_fine_ids = (
+        fine_logits[rows, safe_fine_positions]
+        .float()
+        .argmax(dim=-1)
+    )
+    fine_ids = torch.where(
+        valid_fine, gathered_fine_ids, torch.zeros_like(gathered_fine_ids)
+    )
+    return coarse_ids, fine_ids
+
+
+@torch.no_grad()
+def predict_selected_ids(model, input_ids, time_ids, position_ids, va_values,
+                         row_indices, positions, tokenizer, device):
+    """Coarse/fine IDs at selected positions, without projecting every position.
+
+    Same contract and the same outputs as running the full forward and calling
+    ``gather_prediction_ids`` on it, including the rule that a position with no
+    fine logit (the last one) yields fine ID zero.  Models without a selective
+    forward fall back to the full path automatically.
+    """
+    rows = torch.as_tensor(row_indices, dtype=torch.long)
+    pos = torch.as_tensor(positions, dtype=torch.long)
+    selective = getattr(model, "forward_selected", None)
+    if selective is None:
+        with torch.amp.autocast("cuda", dtype=AMP_DTYPE,
+                                enabled=device.type == "cuda"):
+            coarse_logits, fine_logits = model(
+                input_ids, time_ids, position_ids, None, va_values=va_values)
+        return gather_prediction_ids(
+            coarse_logits, fine_logits, rows, pos, tokenizer, device)
+
+    with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=device.type == "cuda"):
+        coarse_logits, fine_logits = selective(
+            input_ids, time_ids, position_ids, rows, pos, va_values=va_values)
+    coarse_ids = coarse_logits[:, : tokenizer.vocab_coarse].float().argmax(dim=-1)
+    # The full forward's fine head spans N-1 positions; the final position has no
+    # fine logit and historically resolves to ID zero.
+    n_positions = input_ids.shape[-1]
+    valid_fine = (pos < n_positions - 1).to(device)
+    fine_ids = fine_logits.float().argmax(dim=-1)
+    return coarse_ids, torch.where(valid_fine, fine_ids, torch.zeros_like(fine_ids))
+
+
+@torch.no_grad()
+def gather_decode_positions(
+    coarse_logits,
+    fine_logits,
+    row_indices,
+    positions,
+    tokenizer,
+    device,
+):
+    """Gather and immediately decode positions with one host transfer."""
+    coarse_ids, fine_ids = gather_prediction_ids(
+        coarse_logits,
+        fine_logits,
+        row_indices,
+        positions,
+        tokenizer,
+        device,
+    )
+    decoded = decode_code_ids_tensor(
+        coarse_ids, fine_ids, tokenizer, device
+    )
+    # Coarse IDs are exactly representable in float32 for all project vocabs.
+    # Packing both outputs produces one device-to-host transfer per batch.
+    return torch.cat((coarse_ids.float().unsqueeze(1), decoded), dim=1)
 
 
 # ============================================================================
@@ -224,8 +346,12 @@ def _prepare_stocks_batch(stocks, tokenizer, device):
     max_T = max(a["T_total"] for a in all_arrays)
     N = len(all_arrays)
 
-    # Pre-allocate output directly (avoids building a list of chunks)
+    # Pre-allocate output directly (avoids building a list of chunks).  Keep
+    # both hierarchy levels: most inference paths only consume coarse IDs, but
+    # capacity experiments need the aligned fine targets to measure use of the
+    # complete joint codebook.
     all_idx_np = np.zeros((N, max_T), dtype=np.int32)
+    all_fine_idx_np = np.zeros((N, max_T), dtype=np.int16)
 
     # Process in chunks to avoid GPU memory spike
     chunk_size = 64  # smaller chunks = less peak memory
@@ -239,9 +365,11 @@ def _prepare_stocks_batch(stocks, tokenizer, device):
             chunk_np[k, :T] = a["price_normed"][:T]
         chunk_t = torch.from_numpy(chunk_np)
         with torch.no_grad():
-            idx, _ = tokenizer.encode(chunk_t.to(device))
-        all_idx_np[i:end, :] = idx.cpu().numpy().astype(np.int32)
-        del chunk_np, chunk_t, idx  # free immediately
+            all_idx = tokenizer.encode_all(chunk_t.to(device))
+        all_idx_host = all_idx.cpu().numpy()
+        all_idx_np[i:end, :] = all_idx_host[..., 0].astype(np.int32)
+        all_fine_idx_np[i:end, :] = all_idx_host[..., 1].astype(np.int16)
+        del chunk_np, chunk_t, all_idx, all_idx_host  # free immediately
 
     vocab = tokenizer.vocab_coarse
     bos_id = vocab
@@ -249,6 +377,7 @@ def _prepare_stocks_batch(stocks, tokenizer, device):
     for j, arrays in enumerate(all_arrays):
         T = arrays["T_total"]
         token_ids = all_idx_np[j, :T]
+        fine_token_ids = all_fine_idx_np[j, :T]
         day, month, year = arrays["day"], arrays["month"], arrays["year"]
 
         inp_ids = [bos_id] + token_ids.tolist()
@@ -272,6 +401,12 @@ def _prepare_stocks_batch(stocks, tokenizer, device):
 
         results.append({
             "inp_ids": inp_ids[:-1],
+            # Raw feature-aligned targets. At selected causal position p both
+            # hierarchy levels target these arrays at p. Keeping coarse targets
+            # explicitly also preserves the final predictable token, which is
+            # intentionally absent from ``inp_ids[:-1]``.
+            "coarse_token_ids": token_ids,
+            "fine_token_ids": fine_token_ids,
             "day": [int(day[0])] + day[:T-1].tolist(),
             "month": [int(month[0])] + month[:T-1].tolist(),
             "year": [int(year[0])] + year[:T-1].tolist(),
@@ -321,9 +456,9 @@ def batched_gpt_eval(gpt, tokenizer, test_stocks, device, batch_size=16, silent=
     if not silent:
         print(f"  {len(buckets)} length buckets, batch_size={batch_size}")
 
-    # Phase 3: batched forward + collect coarse IDs and fine logits
+    # Phase 3: batched forward and compact position-ID gather
     all_coarse_ids = []
-    all_fine_logits = []
+    all_fine_ids = []
     all_meta = []  # p_mean, p_std, feat, close, test_pos
     n_forward = 0
 
@@ -336,50 +471,54 @@ def batched_gpt_eval(gpt, tokenizer, test_stocks, device, batch_size=16, silent=
             inp = torch.zeros(B, max_len, dtype=torch.long, device=device)
             tids = torch.zeros(B, max_len, 3, dtype=torch.long, device=device)
             pos = torch.arange(max_len, device=device).unsqueeze(0).expand(B, -1)
-            mask = torch.zeros(B, max_len, max_len, dtype=torch.bool, device=device)
             va = torch.zeros(B, max_len, 2, dtype=torch.float32, device=device)
 
             for j, s in enumerate(batch):
-                L = s["seq_len"]
-                inp[j, :L] = torch.tensor(s["inp_ids"], dtype=torch.long)
-                tids[j, :L, 0] = torch.tensor(s["day"], dtype=torch.long)
-                tids[j, :L, 1] = torch.tensor(s["month"], dtype=torch.long)
-                tids[j, :L, 2] = torch.tensor(s["year"], dtype=torch.long)
-                va[j, :L] = torch.tensor(s["va"], dtype=torch.float32)
-                mask[j, :L, :L] = torch.tril(torch.ones(L, L, dtype=torch.bool))
-                mask[j, L:, 0] = True  # padded positions attend to BOS (prevents NaN in SDPA)
+                length = s["seq_len"]
+                inp[j, :length] = torch.tensor(
+                    s["inp_ids"][:length], dtype=torch.long
+                )
+                tids[j, :length, 0] = torch.tensor(
+                    s["day"][:length], dtype=torch.long
+                )
+                tids[j, :length, 1] = torch.tensor(
+                    s["month"][:length], dtype=torch.long
+                )
+                tids[j, :length, 2] = torch.tensor(
+                    s["year"][:length], dtype=torch.long
+                )
+                va[j, :length] = torch.tensor(
+                    s["va"][:length], dtype=torch.float32
+                )
 
-            with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-                coarse_logits, fine_logits = gpt(inp, tids, pos, mask, va_values=va)
-            n_forward += 1
-
-            coarse_cpu = coarse_logits.float().cpu()
-            fine_cpu = fine_logits.float().cpu()
-            vocab = tokenizer.vocab_coarse
-
+            selected_rows = []
+            selected_positions = []
             for j, s in enumerate(batch):
                 p = s["test_pos"]
-                if p < coarse_cpu.shape[1]:
-                    cid = int(coarse_cpu[j, p, :vocab].argmax().item())
-                    fl = fine_cpu[j, p] if p < fine_cpu.shape[1] else torch.zeros(tokenizer.bsq_fine.vocab_size)
-                else:
-                    cid = 0
-                    fl = torch.zeros(tokenizer.bsq_fine.vocab_size)
-                all_coarse_ids.append(cid)
-                all_fine_logits.append(fl)
-                all_meta.append({
-                    "p_mean": s["p_mean"], "p_std": s["p_std"],
-                    "feat": s["feat"], "close": s["close"], "test_pos": p,
-                })
+                if p < s["seq_len"]:
+                    selected_rows.append(j)
+                    selected_positions.append(p)
+                    all_meta.append({
+                        "p_mean": s["p_mean"], "p_std": s["p_std"],
+                        "feat": s["feat"], "close": s["close"], "test_pos": p,
+                    })
+            coarse_ids, fine_ids = predict_selected_ids(
+                gpt, inp, tids, pos, va,
+                selected_rows, selected_positions, tokenizer, device,
+            )
+            n_forward += 1
+            id_pairs = torch.stack(
+                (coarse_ids, fine_ids), dim=1
+            ).cpu().tolist()
+            all_coarse_ids.extend(item[0] for item in id_pairs)
+            all_fine_ids.extend(item[1] for item in id_pairs)
 
     if not silent:
         print(f"  {n_forward} forward passes")
 
-    # Phase 4: batch decode all predictions in one GPU call
-    if not silent:
-        print(f"  Batch decoding {len(all_coarse_ids)} predictions...")
-    fine_logits_tensor = torch.stack(all_fine_logits)  # [N, V_fine]
-    decoded = decode_coarse_batch(all_coarse_ids, fine_logits_tensor, tokenizer, device)  # [N, 4]
+    decoded = decode_code_ids_tensor(
+        all_coarse_ids, all_fine_ids, tokenizer, device
+    ).cpu().numpy()
 
     # Assemble results
     results = []
@@ -403,7 +542,8 @@ def batched_gpt_eval(gpt, tokenizer, test_stocks, device, batch_size=16, silent=
 
 @torch.no_grad()
 def batched_gpt_eval_windowed(gpt, tokenizer, test_stocks, device,
-                              batch_size=16, n_days=20, silent=False):
+                              batch_size=16, n_days=20, start_offset=0,
+                              silent=False):
     """Batched GPT evaluation with multi-day sliding window.
 
     For each test stock, predicts up to n_days consecutive positions starting
@@ -412,6 +552,7 @@ def batched_gpt_eval_windowed(gpt, tokenizer, test_stocks, device,
 
     Args:
         n_days: maximum number of consecutive days to predict per stock (default 20)
+        start_offset: begin this many test observations after the cutoff
     """
     # Phase 1: batch tokenize
     if not silent:
@@ -422,7 +563,8 @@ def batched_gpt_eval_windowed(gpt, tokenizer, test_stocks, device,
 
     # Filter stocks that have at least some test data
     min_required = min(n_days, 10)
-    valid = [p for p in prepped if p["test_pos"] + min_required <= p["seq_len"]]
+    valid = [p for p in prepped
+             if p["test_pos"] + start_offset + min_required <= p["seq_len"]]
     if not valid:
         return []
     if not silent:
@@ -433,10 +575,9 @@ def batched_gpt_eval_windowed(gpt, tokenizer, test_stocks, device,
     if not silent:
         print(f"  {len(buckets)} length buckets, batch_size={batch_size}")
 
-    # Phase 3: single forward pass, collect all positions
+    # Phase 3: single forward pass, gather and decode requested positions
     predictions = []  # list of dicts with date_key, meta, etc.
     n_forward = 0
-    vocab = tokenizer.vocab_coarse
 
     for bucket in buckets:
         batch_start = 0
@@ -449,50 +590,68 @@ def batched_gpt_eval_windowed(gpt, tokenizer, test_stocks, device,
                 inp = torch.zeros(B, max_len, dtype=torch.long, device=device)
                 tids = torch.zeros(B, max_len, 3, dtype=torch.long, device=device)
                 pos = torch.arange(max_len, device=device).unsqueeze(0).expand(B, -1)
-                mask = torch.zeros(B, max_len, max_len, dtype=torch.bool, device=device)
                 va = torch.zeros(B, max_len, 2, dtype=torch.float32, device=device)
 
                 for j, s in enumerate(batch):
-                    L = s["seq_len"]
-                    inp[j, :L] = torch.tensor(s["inp_ids"], dtype=torch.long)
-                    tids[j, :L, 0] = torch.tensor(s["day"], dtype=torch.long)
-                    tids[j, :L, 1] = torch.tensor(s["month"], dtype=torch.long)
-                    tids[j, :L, 2] = torch.tensor(s["year"], dtype=torch.long)
-                    va[j, :L] = torch.tensor(s["va"], dtype=torch.float32)
-                    mask[j, :L, :L] = torch.tril(torch.ones(L, L, dtype=torch.bool))
-                    mask[j, L:, 0] = True
+                    length = s["seq_len"]
+                    inp[j, :length] = torch.tensor(
+                        s["inp_ids"][:length], dtype=torch.long
+                    )
+                    tids[j, :length, 0] = torch.tensor(
+                        s["day"][:length], dtype=torch.long
+                    )
+                    tids[j, :length, 1] = torch.tensor(
+                        s["month"][:length], dtype=torch.long
+                    )
+                    tids[j, :length, 2] = torch.tensor(
+                        s["year"][:length], dtype=torch.long
+                    )
+                    va[j, :length] = torch.tensor(
+                        s["va"][:length], dtype=torch.float32
+                    )
 
-                with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-                    coarse_logits, fine_logits = gpt(inp, tids, pos, mask, va_values=va)
-                n_forward += 1
-
-                coarse_cpu = coarse_logits.float().cpu()
-                fine_cpu = fine_logits.float().cpu()
-
+                selected_rows = []
+                selected_positions = []
+                selected_meta = []
                 for j, s in enumerate(batch):
-                    p_start = s["test_pos"]
+                    p_start = s["test_pos"] + start_offset
                     for offset in range(n_days):
                         p = p_start + offset
-                        if p >= coarse_cpu.shape[1]:
-                            break  # out of bounds for this batch item
+                        if p >= s["seq_len"]:
+                            break  # out of bounds for this stock (not padded batch length)
 
-                        cid = int(coarse_cpu[j, p, :vocab].argmax().item())
-                        fl = fine_cpu[j, p] if p < fine_cpu.shape[1] else torch.zeros(tokenizer.bsq_fine.vocab_size)
+                        selected_rows.append(j)
+                        selected_positions.append(p)
+                        selected_meta.append((s, p, offset))
 
-                        # Date for this prediction's target: pred is for feat[p], so true is feat[p, 0]
-                        date_key = s["dates_raw"][p] if p < len(s["dates_raw"]) else "unknown"
+                coarse_ids, fine_ids = predict_selected_ids(
+                    gpt, inp, tids, pos, va,
+                    selected_rows, selected_positions, tokenizer, device,
+                )
+                n_forward += 1
+                id_pairs = torch.stack(
+                    (coarse_ids, fine_ids), dim=1
+                ).cpu().tolist()
+                for ids, (stock, position, day_offset) in zip(
+                    id_pairs, selected_meta
+                ):
+                    predictions.append({
+                        "coarse_id": int(ids[0]),
+                        "fine_id": int(ids[1]),
+                        "test_pos": position,
+                        "date_key": (
+                            stock["dates_raw"][position]
+                            if position < len(stock["dates_raw"])
+                            else "unknown"
+                        ),
+                        "day_offset": day_offset,
+                        "p_mean": stock["p_mean"],
+                        "p_std": stock["p_std"],
+                        "feat": stock["feat"],
+                        "close": stock["close"],
+                    })
 
-                        predictions.append({
-                            "coarse_id": cid,
-                            "fine_logits": fl,
-                            "test_pos": p,
-                            "date_key": date_key,
-                            "day_offset": offset,
-                            "p_mean": s["p_mean"], "p_std": s["p_std"],
-                            "feat": s["feat"], "close": s["close"],
-                        })
-
-                batch_start += batch_size
+                batch_start += B
 
             except torch.cuda.OutOfMemoryError:
                 # OOM fallback: halve batch_size and retry; if already 1, skip this stock
@@ -511,38 +670,41 @@ def batched_gpt_eval_windowed(gpt, tokenizer, test_stocks, device,
     if not silent:
         print(f"  {n_forward} forward passes, {len(predictions)} predictions")
 
-    # Phase 4: decode in batches to avoid OOM (don't stack all 2M+ tensors at once)
-    decode_bs = 10000
-    n_preds = len(predictions)
-    if not silent:
-        print(f"  Decoding {n_preds} predictions in batches of {decode_bs}...")
-
-    for start in range(0, n_preds, decode_bs):
-        end = min(start + decode_bs, n_preds)
+    # Keep the historical 10k decode chunking so the decoder GEMM shape and
+    # therefore every reconstructed float remain exactly comparable.
+    decode_bs = 10_000
+    for start in range(0, len(predictions), decode_bs):
+        end = min(start + decode_bs, len(predictions))
         chunk = predictions[start:end]
-        fine_tensor = torch.stack([p["fine_logits"] for p in chunk])
-        coarse_ids = [p["coarse_id"] for p in chunk]
-        decoded = decode_coarse_batch(coarse_ids, fine_tensor, tokenizer, device)
-
-        for i, pred in enumerate(chunk):
-            pred["decoded_feat"] = decoded[i]
-            pred["pred_logret"] = float(decoded[i][0]) * pred["p_std"][0] + pred["p_mean"][0]
-            tp = pred["test_pos"]
-            feat = pred["feat"]
-            close = pred["close"]
-            n_close = len(close)
-            pred["true_logret"] = float(feat[tp, 0]) if tp < len(feat) else 0.0
-            pred["base_close"] = float(close[tp - 1]) if 0 <= tp - 1 < n_close else float(close[-1])
-            pred["true_close"] = float(close[tp]) if 0 <= tp < n_close else float(close[-1])
-            del pred["fine_logits"], pred["feat"], pred["close"]
-
-        if not silent and end % 500000 == 0:
-            print(f"    decoded {end}/{n_preds}")
+        decoded = decode_code_ids_tensor(
+            [item["coarse_id"] for item in chunk],
+            [item["fine_id"] for item in chunk],
+            tokenizer,
+            device,
+        ).cpu().numpy()
+        for feature, prediction in zip(decoded, chunk):
+            position = prediction["test_pos"]
+            close = prediction["close"]
+            prediction["decoded_feat"] = feature
+            prediction["pred_logret"] = (
+                float(feature[0]) * prediction["p_std"][0]
+                + prediction["p_mean"][0]
+            )
+            prediction["true_logret"] = float(
+                prediction["feat"][position, 0]
+            )
+            prediction["base_close"] = float(close[position - 1])
+            prediction["true_close"] = float(close[position])
+            del (
+                prediction["fine_id"],
+                prediction["feat"],
+                prediction["close"],
+            )
 
     return predictions
 
 
-def compute_windowed_metrics(predictions):
+def compute_windowed_metrics(predictions, min_date_coverage_ratio=0.80):
     """Compute multi-day-averaged metrics from windowed predictions.
 
     Returns dict with per-date DA then cross-date aggregation.
@@ -551,18 +713,175 @@ def compute_windowed_metrics(predictions):
     from scipy.stats import spearmanr
     from collections import defaultdict
 
+    def token_distribution_metrics(pred_tokens, true_tokens):
+        """Compare argmax-token use with the empirical target distribution.
+
+        Raw unique-token counts reward even one-off, potentially wrong tokens.
+        These diagnostics instead report support overlap, effective vocabulary
+        size (exp entropy), collapse alignment, and Jensen-Shannon divergence.
+        JSD uses base-2 logs and is therefore bounded to [0, 1].
+        """
+        pred_tokens = np.asarray(pred_tokens, dtype=np.int64)
+        true_tokens = np.asarray(true_tokens, dtype=np.int64)
+        paired = true_tokens >= 0
+        pred_tokens = pred_tokens[paired]
+        true_tokens = true_tokens[paired]
+        if not len(true_tokens):
+            return {}
+
+        # ``[(tokens == label).sum() for label in labels]`` was acceptable
+        # for the ~175-token daily coarse support but becomes quadratic-like
+        # work for thousands of joint codes.  Unique once, then align both
+        # sparse count vectors onto the same sorted support.
+        pred_labels, pred_nonzero_counts = np.unique(
+            pred_tokens, return_counts=True
+        )
+        true_labels, true_nonzero_counts = np.unique(
+            true_tokens, return_counts=True
+        )
+        labels = np.union1d(pred_labels, true_labels)
+        pred_counts = np.zeros(len(labels), dtype=np.float64)
+        true_counts = np.zeros(len(labels), dtype=np.float64)
+        pred_counts[np.searchsorted(labels, pred_labels)] = (
+            pred_nonzero_counts
+        )
+        true_counts[np.searchsorted(labels, true_labels)] = (
+            true_nonzero_counts
+        )
+        pred_prob = pred_counts / pred_counts.sum()
+        true_prob = true_counts / true_counts.sum()
+        midpoint = 0.5 * (pred_prob + true_prob)
+
+        def entropy_bits(prob):
+            nonzero = prob > 0
+            return float(-np.sum(prob[nonzero] * np.log2(prob[nonzero])))
+
+        def kl_bits(left, right):
+            nonzero = left > 0
+            return float(
+                np.sum(
+                    left[nonzero]
+                    * np.log2(left[nonzero] / right[nonzero])
+                )
+            )
+
+        pred_entropy = entropy_bits(pred_prob)
+        true_entropy = entropy_bits(true_prob)
+        pred_effective = float(2.0 ** pred_entropy)
+        true_effective = float(2.0 ** true_entropy)
+        jsd = float(
+            0.5 * kl_bits(pred_prob, midpoint)
+            + 0.5 * kl_bits(true_prob, midpoint)
+        )
+
+        pred_support = set(pred_labels.tolist())
+        true_support = set(true_labels.tolist())
+        overlap = len(pred_support & true_support)
+        precision = overlap / len(pred_support)
+        recall = overlap / len(true_support)
+        support_f1 = (
+            2.0 * precision * recall / (precision + recall)
+            if precision + recall > 0
+            else 0.0
+        )
+        pred_collapse = float(pred_counts.max() / pred_counts.sum())
+        true_collapse = float(true_counts.max() / true_counts.sum())
+
+        def symmetric_ratio(left, right):
+            if left <= 0 or right <= 0:
+                return 0.0
+            return float(min(left / right, right / left))
+
+        unique_alignment = symmetric_ratio(
+            len(pred_support), len(true_support)
+        )
+        effective_alignment = symmetric_ratio(
+            pred_effective, true_effective
+        )
+        collapse_alignment = symmetric_ratio(
+            pred_collapse, true_collapse
+        )
+        distribution_alignment = max(0.0, 1.0 - jsd)
+        # A diagnostic balance index, not a downstream quality score.  The
+        # geometric mean prevents one strong marginal from hiding a failure in
+        # support, frequency shape, effective use, or collapse behaviour.
+        codebook_balance = float(
+            (
+                support_f1
+                * distribution_alignment
+                * effective_alignment
+                * collapse_alignment
+            )
+            ** 0.25
+        )
+        return {
+            "token_accuracy": float(np.mean(pred_tokens == true_tokens)),
+            "n_unique_tokens": int(len(pred_support)),
+            "collapse_rate": pred_collapse,
+            "target_n_unique_tokens": int(len(true_support)),
+            "target_collapse_rate": true_collapse,
+            "pred_token_entropy_bits": pred_entropy,
+            "target_token_entropy_bits": true_entropy,
+            "pred_effective_tokens": pred_effective,
+            "target_effective_tokens": true_effective,
+            "prediction_support_precision": float(precision),
+            "target_support_recall": float(recall),
+            "token_support_f1": float(support_f1),
+            "token_jsd": jsd,
+            "distribution_alignment": distribution_alignment,
+            "unique_token_alignment": unique_alignment,
+            "effective_token_alignment": effective_alignment,
+            "collapse_alignment": collapse_alignment,
+            "codebook_balance_score": codebook_balance,
+        }
+
+    def named_token_distribution_metrics(
+        pred_tokens, true_tokens, *, level
+    ):
+        """Name one hierarchy level while preserving legacy coarse fields."""
+        metrics = token_distribution_metrics(pred_tokens, true_tokens)
+        if not metrics:
+            return {}
+        if level == "coarse":
+            # collapse_rate/n_unique_tokens already exist as the historical
+            # coarse behaviour fields and are populated below.
+            metrics.pop("collapse_rate")
+            metrics.pop("n_unique_tokens")
+            metrics["coarse_token_accuracy"] = metrics.pop("token_accuracy")
+            return metrics
+        prefix = f"{level}_"
+        return {f"{prefix}{key}": value for key, value in metrics.items()}
+
     if not predictions:
         return {"avg_da_per_date": 0, "da_std": 0, "da_vol": 0,
                 "n_dates": 0, "n_predictions": 0,
                 "avg_da_above_baseline": 0, "signal_score": 0,
                 "collapse_rate": 0, "n_unique_tokens": 0,
-                "rank_ic": 0, "ampratio": 0, "mape": 0, "baseline_mape": 0,
+                "max_daily_collapse_rate": 0, "min_daily_unique_tokens": 0,
+                "rank_ic": 0, "avg_daily_rank_ic": 0,
+                "daily_rank_ic_std": 0, "ampratio": 0,
+                "mape": 0, "baseline_mape": 0,
+                "min_date_coverage_ratio": min_date_coverage_ratio,
+                "max_cross_section_size": 0, "min_cross_section_size": 0,
+                "dropped_sparse_dates": 0,
                 "per_date": {}}
 
     # Group predictions by date
     by_date = defaultdict(list)
     for p in predictions:
         by_date[p["date_key"]].append(p)
+
+    finite_counts = {}
+    for date_key, group in by_date.items():
+        pred_lrs = np.array([g["pred_logret"] for g in group])
+        true_lrs = np.array([g["true_logret"] for g in group])
+        finite_counts[date_key] = int(
+            (np.isfinite(pred_lrs) & np.isfinite(true_lrs)).sum())
+    max_cross_section_size = max(finite_counts.values(), default=0)
+    min_cross_section_size = max(
+        5, int(np.ceil(max_cross_section_size * min_date_coverage_ratio)))
+    dropped_sparse_dates = sum(
+        count < min_cross_section_size for count in finite_counts.values())
 
     per_date = {}
     all_pred_lrs = []
@@ -573,12 +892,43 @@ def compute_windowed_metrics(predictions):
         pred_lrs = np.array([g["pred_logret"] for g in group])
         true_lrs = np.array([g["true_logret"] for g in group])
         pred_toks = np.array([g["coarse_id"] for g in group], dtype=np.int64)
+        true_toks = np.array(
+            [g.get("true_coarse_id", -1) for g in group],
+            dtype=np.int64,
+        )
+        pred_fine_toks = np.array(
+            [g.get("fine_id", -1) for g in group], dtype=np.int64
+        )
+        true_fine_toks = np.array(
+            [g.get("true_fine_id", -1) for g in group], dtype=np.int64
+        )
+        pred_joint_toks = np.array(
+            [g.get("joint_id", -1) for g in group], dtype=np.int64
+        )
+        true_joint_toks = np.array(
+            [g.get("true_joint_id", -1) for g in group], dtype=np.int64
+        )
         eps = 1e-8
 
-        if len(pred_lrs) < 5:
+        valid = np.isfinite(pred_lrs) & np.isfinite(true_lrs)
+        if valid.sum() < min_cross_section_size:
             continue
 
+        pred_lrs = pred_lrs[valid]
+        true_lrs = true_lrs[valid]
+        pred_toks = pred_toks[valid]
+        true_toks = true_toks[valid]
+        pred_fine_toks = pred_fine_toks[valid]
+        true_fine_toks = true_fine_toks[valid]
+        pred_joint_toks = pred_joint_toks[valid]
+        true_joint_toks = true_joint_toks[valid]
         da = float((np.sign(pred_lrs) == np.sign(true_lrs)).mean())
+        daily_rank_ic = float(spearmanr(pred_lrs, true_lrs)[0])
+        if np.isnan(daily_rank_ic):
+            daily_rank_ic = 0.0
+        _, daily_token_counts = np.unique(pred_toks, return_counts=True)
+        daily_collapse_rate = float(daily_token_counts.max() / len(pred_toks))
+        daily_unique_tokens = int(len(daily_token_counts))
 
         # Always-up / always-down baselines for this date
         up_frac = float((true_lrs > 0).mean())
@@ -604,14 +954,48 @@ def compute_windowed_metrics(predictions):
             "da_above_baseline": float(da_above_baseline),
             "majority_dir": float(majority_dir),
             "majority_da": float(majority_da),
+            "rank_ic": daily_rank_ic,
+            "collapse_rate": daily_collapse_rate,
+            "n_unique_tokens": daily_unique_tokens,
         }
+        per_date[date_key].update(
+            named_token_distribution_metrics(
+                pred_toks, true_toks, level="coarse"
+            )
+        )
+        if np.any(true_fine_toks >= 0):
+            per_date[date_key].update(
+                named_token_distribution_metrics(
+                    pred_fine_toks, true_fine_toks, level="fine"
+                )
+            )
+        if np.any(true_joint_toks >= 0):
+            per_date[date_key].update(
+                named_token_distribution_metrics(
+                    pred_joint_toks, true_joint_toks, level="joint"
+                )
+            )
 
         all_pred_lrs.extend(pred_lrs.tolist())
         all_true_lrs.extend(true_lrs.tolist())
         all_pred_toks.extend(pred_toks.tolist())
 
     if not per_date:
-        return {"avg_da_per_date": 0, "n_predictions": 0}
+        return {
+            "avg_da_per_date": 0, "da_std": 0, "da_vol": 0,
+            "n_dates": 0, "n_predictions": 0,
+            "avg_da_above_baseline": 0, "signal_score": 0,
+            "collapse_rate": 0, "n_unique_tokens": 0,
+            "max_daily_collapse_rate": 0, "min_daily_unique_tokens": 0,
+            "rank_ic": 0, "avg_daily_rank_ic": 0,
+            "daily_rank_ic_std": 0, "ampratio": 0,
+            "mape": 0, "baseline_mape": 0,
+            "min_date_coverage_ratio": min_date_coverage_ratio,
+            "max_cross_section_size": max_cross_section_size,
+            "min_cross_section_size": min_cross_section_size,
+            "dropped_sparse_dates": dropped_sparse_dates,
+            "per_date": {},
+        }
 
     # Cross-date aggregation
     das = np.array([v["da"] for v in per_date.values()])
@@ -624,6 +1008,15 @@ def compute_windowed_metrics(predictions):
     # Aggregate baseline-relative metrics
     above_baseline_vals = [v["da_above_baseline"] for v in per_date.values()]
     avg_da_above_baseline = float(np.mean(above_baseline_vals))
+    daily_rank_ics = np.array([v["rank_ic"] for v in per_date.values()],
+                              dtype=np.float64)
+    avg_daily_rank_ic = float(daily_rank_ics.mean())
+    daily_rank_ic_std = (float(daily_rank_ics.std())
+                         if len(daily_rank_ics) > 1 else 0.0)
+    max_daily_collapse_rate = max(
+        value["collapse_rate"] for value in per_date.values())
+    min_daily_unique_tokens = min(
+        value["n_unique_tokens"] for value in per_date.values())
 
     # Overall collapse/unique across ALL predictions
     all_pred_toks_arr = np.array(all_pred_toks)
@@ -642,12 +1035,20 @@ def compute_windowed_metrics(predictions):
     eps = 1e-8
     amp_ratio = float(np.mean(np.abs(all_pred_lrs_arr)) / max(np.mean(np.abs(all_true_lrs_arr)), eps))
 
-    # MAPE (price space): convert log returns to prices, compare
-    all_base_closes = np.array([p.get("base_close", 0) for p in predictions])
-    all_true_closes = np.array([p.get("true_close", 0) for p in predictions])
-    has_close = (all_base_closes > 0) & (all_true_closes > 0)
+    # MAPE (price space), using the same dense dates as DA/RankIC.
+    included_dates = set(per_date)
+    mape_rows = [p for p in predictions if p["date_key"] in included_dates]
+    all_pred_lrs_for_mape = np.array(
+        [p.get("pred_logret", np.nan) for p in mape_rows])
+    all_base_closes = np.array([p.get("base_close", 0) for p in mape_rows])
+    all_true_closes = np.array([p.get("true_close", 0) for p in mape_rows])
+    has_close = (
+        (all_base_closes > 0) & (all_true_closes > 0)
+        & np.isfinite(all_pred_lrs_for_mape)
+        & np.isfinite(all_base_closes) & np.isfinite(all_true_closes)
+    )
     if has_close.sum() > 0:
-        pred_prices = all_base_closes[has_close] * np.exp(all_pred_lrs_arr[has_close].astype(np.float64))
+        pred_prices = all_base_closes[has_close] * np.exp(all_pred_lrs_for_mape[has_close].astype(np.float64))
         true_prices = all_true_closes[has_close]
         mape = float(np.mean(np.abs(pred_prices - true_prices) / np.maximum(np.abs(true_prices), eps))) * 100
         # Baseline MAPE: if we always predict "no change" (pred = base_close)
@@ -662,7 +1063,7 @@ def compute_windowed_metrics(predictions):
 
     # Collapse penalty: reduce signal if diversity is low
     total_days = len(per_date)
-    n_pred = len(predictions)
+    n_pred = len(all_pred_lrs)
 
     return {
         "avg_da_per_date": avg_da,
@@ -670,11 +1071,19 @@ def compute_windowed_metrics(predictions):
         "da_vol": da_vol,
         "n_dates": total_days,
         "n_predictions": n_pred,
+        "min_date_coverage_ratio": min_date_coverage_ratio,
+        "max_cross_section_size": max_cross_section_size,
+        "min_cross_section_size": min_cross_section_size,
+        "dropped_sparse_dates": dropped_sparse_dates,
         "avg_da_above_baseline": avg_da_above_baseline,
         "signal_score": signal_score,
         "collapse_rate": collapse_rate,
         "n_unique_tokens": n_unique_tokens,
+        "max_daily_collapse_rate": max_daily_collapse_rate,
+        "min_daily_unique_tokens": min_daily_unique_tokens,
         "rank_ic": rank_ic,
+        "avg_daily_rank_ic": avg_daily_rank_ic,
+        "daily_rank_ic_std": daily_rank_ic_std,
         "ampratio": amp_ratio,
         "mape": mape,
         "baseline_mape": bl_mape,
@@ -687,7 +1096,9 @@ def compute_windowed_metrics(predictions):
 # ============================================================================
 
 def evaluate_windowed(gpt_ckpt, tokenizer_ckpt, device,
-                      n_stocks=0, n_days=20, batch_size=4, silent=False, seed=42):
+                      n_stocks=0, n_days=20, batch_size=4,
+                      start_offset=0, silent=False, seed=42,
+                      sample_strategy="random"):
     """Run multi-day windowed GPT evaluation. Returns metrics dict.
 
     Args:
@@ -697,8 +1108,10 @@ def evaluate_windowed(gpt_ckpt, tokenizer_ckpt, device,
         n_stocks: number of test stocks to evaluate (0 = all)
         n_days: number of consecutive test days per stock
         batch_size: evaluation batch size
+        start_offset: begin this many test observations after the cutoff
         silent: suppress print output
         seed: random seed for stock sampling
+        sample_strategy: ``random`` (default) or ``shortest`` (smoke tests)
     """
     import time as _time
     ModelConfig = __import__("config", fromlist=["ModelConfig"]).ModelConfig
@@ -710,17 +1123,25 @@ def evaluate_windowed(gpt_ckpt, tokenizer_ckpt, device,
 
     stocks = load_stocks(max_stocks=0)
     _, _, test_stocks = split_stocks(stocks)
-    attach_close_prices(test_stocks)
 
-    rng = np.random.RandomState(seed)
     n_sample = len(test_stocks) if n_stocks <= 0 else min(n_stocks, len(test_stocks))
-    indices = rng.choice(len(test_stocks), n_sample, replace=False)
-    test_sample = [test_stocks[i] for i in sorted(indices)]
+    if sample_strategy == "shortest" and n_stocks > 0:
+        test_sample = sorted(
+            test_stocks, key=lambda stock: len(stock["features_raw"])
+        )[:n_sample]
+    elif sample_strategy == "random":
+        rng = np.random.RandomState(seed)
+        indices = rng.choice(len(test_stocks), n_sample, replace=False)
+        test_sample = [test_stocks[i] for i in sorted(indices)]
+    else:
+        raise ValueError(f"Unknown sample_strategy: {sample_strategy}")
+    attach_close_prices(test_sample)
 
     t0 = _time.time()
     preds = batched_gpt_eval_windowed(
         gpt, tokenizer, test_sample, device,
-        batch_size=batch_size, n_days=n_days, silent=silent)
+        batch_size=batch_size, n_days=n_days,
+        start_offset=start_offset, silent=silent)
 
     elapsed = _time.time() - t0
     metrics = compute_windowed_metrics(preds)
@@ -731,6 +1152,9 @@ def evaluate_windowed(gpt_ckpt, tokenizer_ckpt, device,
         print(f"  Avg DA per date:  {metrics['avg_da_per_date']*100:.2f}%")
         print(f"  DA above baseline: {metrics['avg_da_above_baseline']*100:+.2f}%")
         print(f"  DA std across dates: {metrics.get('da_std', 0)*100:.2f}%")
+        print(f"  Dense-date coverage: >={metrics.get('min_cross_section_size', 0)} stocks "
+              f"({metrics.get('min_date_coverage_ratio', 0)*100:.0f}% of max); "
+              f"dropped dates={metrics.get('dropped_sparse_dates', 0)}")
         print(f"  Collapse: {metrics['collapse_rate']*100:.1f}%  "
               f"Unique: {metrics['n_unique_tokens']}  "
               f"RankIC: {metrics['rank_ic']:.4f}  "

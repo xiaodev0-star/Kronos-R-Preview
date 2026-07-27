@@ -13,7 +13,8 @@ import os
 import time
 import json
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+if os.name != "nt":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
@@ -24,10 +25,16 @@ from config import DataConfig, ModelConfig, TrainingConfig, set_global_seed
 from data_processor import load_stocks, split_stocks, pack_stocks_v2, make_dataloader_v2
 from model import load_tokenizer
 from model.kronos_bert import KronosBert, make_mlm_batch
+from training_utils import clip_grad_norm_
 
 
 def main(args):
-    set_global_seed(TrainingConfig.random_seed)
+    # Off by default for the same reason as train_base.py: the memory-efficient
+    # SDPA backward is non-deterministic and `warn_only=True` lets it through, so
+    # the flags cost step time without making the run reproducible.  Seeding still
+    # fixes init, data order and masking.  --deterministic restores the old flags.
+    set_global_seed(TrainingConfig.random_seed,
+                    deterministic=getattr(args, "deterministic", False))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     save_path = args.save_path
     tok_path = args.tokenizer_path
@@ -190,7 +197,7 @@ def main(args):
                 continue
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
@@ -326,4 +333,8 @@ if __name__ == "__main__":
     parser.add_argument("--ffn_multiplier", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--deterministic", action="store_true", default=False,
+                        help="Restore torch.use_deterministic_algorithms + cuBLAS "
+                             "workspace pinning. Costs step time and does NOT make "
+                             "this trainer reproducible; kept for debugging only.")
     main(parser.parse_args())
