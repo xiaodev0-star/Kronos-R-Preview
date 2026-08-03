@@ -13,6 +13,7 @@ import csv
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -26,7 +27,12 @@ from scipy.stats import spearmanr
 
 SCRIPT_PATH = Path(__file__).resolve()
 EXPERIMENT_DIR = SCRIPT_PATH.parent
-DEFAULT_ROOT = EXPERIMENT_DIR / "rerun_seed42"
+ROOT = SCRIPT_PATH.parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from experiment_io import default_study_roots
+
+_, DEFAULT_ROOT = default_study_roots("01-bitsweep", seed=42)
 
 
 QUALITY_OBJECTIVES = (

@@ -17,6 +17,8 @@ Usage:
     python train_tokenizer.py --scheduler
 """
 import argparse
+import json
+import math
 import os
 import random
 import sys
@@ -97,6 +99,32 @@ def _atomic_torch_save(payload, path):
     """Write a checkpoint without exposing a partially written target."""
     temporary = path + ".tmp"
     torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def _load_training_history(path, start_epoch):
+    history = {"schema": 1, "epochs": []}
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+            history["epochs"] = [
+                row
+                for row in existing.get("epochs", [])
+                if int(row.get("epoch", 0)) <= start_epoch
+            ]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    return history
+
+
+def _write_training_history(path, history):
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(history, handle, indent=2, ensure_ascii=False, allow_nan=False)
     os.replace(temporary, path)
 
 
@@ -188,7 +216,8 @@ def _validate_loader(tok, val_loader, device, use_amp=False,
 
 def _train_cuda_graph(tok, train_feat_gpu, val_feat_gpu, bs, epochs, val_every,
                       save_path, ckpt_path, lr, grad_clip, device,
-                      early_stop=None, use_scheduler=False):
+                      early_stop=None, use_scheduler=False,
+                      metrics_path=""):
     """Native fixed-shape CUDA graph training (including Windows)."""
     N = len(train_feat_gpu)
     n_steps = N // bs
@@ -245,8 +274,10 @@ def _train_cuda_graph(tok, train_feat_gpu, val_feat_gpu, bs, epochs, val_every,
 
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     t0 = time.time()
+    history = _load_training_history(metrics_path, start_epoch)
 
     for epoch in range(start_epoch, epochs):
+        epoch_started = time.time()
         train_loss_acc.zero_()
 
         for step in range(n_steps):
@@ -294,6 +325,29 @@ def _train_cuda_graph(tok, train_feat_gpu, val_feat_gpu, bs, epochs, val_every,
                 },
                 save_path,
             )
+        history["epochs"].append(
+            {
+                "epoch": epoch + 1,
+                "train_loss": float(train_loss),
+                "val_loss": (
+                    float(val_loss) if math.isfinite(val_loss) else None
+                ),
+                "best_val_loss": (
+                    float(best_val) if math.isfinite(best_val) else None
+                ),
+                "validated": bool(do_val),
+                "improved": bool(improved),
+                "learning_rate": float(cur_lr),
+                "optimizer_steps": int(n_steps),
+                "batch_size": int(bs),
+                "train_feature_rows": int(N),
+                "val_feature_rows": int(len(val_feat_gpu)),
+                "epoch_time_s": float(time.time() - epoch_started),
+                "elapsed_time_s": float(time.time() - t0),
+                "cuda_graph": True,
+            }
+        )
+        _write_training_history(metrics_path, history)
 
         log_interval = max(1, epochs // 6)
         if do_val and ((epoch + 1) % log_interval == 0 or epoch == start_epoch or (epoch + 1) == epochs):
@@ -315,7 +369,8 @@ def _train_cuda_graph(tok, train_feat_gpu, val_feat_gpu, bs, epochs, val_every,
 
 def _train_standard(tok, train_loader, val_loader, epochs, val_every,
                     save_path, ckpt_path, lr, grad_clip, device,
-                    early_stop=None, use_scheduler=False):
+                    early_stop=None, use_scheduler=False,
+                    metrics_path=""):
     optimizer = torch.optim.Adam(tok.parameters(), lr=lr)
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
     use_amp = amp_dtype != torch.float32
@@ -342,8 +397,10 @@ def _train_standard(tok, train_loader, val_loader, epochs, val_every,
 
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     raw_tok = tok._orig_mod if hasattr(tok, "_orig_mod") else tok
+    history = _load_training_history(metrics_path, start_epoch)
 
     for epoch in range(start_epoch, epochs):
+        epoch_started = time.time()
         tok.train()
         loss_acc = 0.0
         count = 0
@@ -397,6 +454,29 @@ def _train_standard(tok, train_loader, val_loader, epochs, val_every,
                 },
                 save_path,
             )
+        history["epochs"].append(
+            {
+                "epoch": epoch + 1,
+                "train_loss": float(train_loss),
+                "val_loss": (
+                    float(val_loss) if math.isfinite(val_loss) else None
+                ),
+                "best_val_loss": (
+                    float(best_val) if math.isfinite(best_val) else None
+                ),
+                "validated": bool(do_val),
+                "improved": bool(improved),
+                "learning_rate": float(optimizer_lr(optimizer)),
+                "optimizer_steps": int(count),
+                "batch_size": int(train_loader.batch_size or 0),
+                "train_feature_rows": int(len(train_loader.dataset)),
+                "val_feature_rows": int(len(val_loader.dataset)),
+                "epoch_time_s": float(time.time() - epoch_started),
+                "elapsed_time_s": float(time.time() - t0),
+                "cuda_graph": False,
+            }
+        )
+        _write_training_history(metrics_path, history)
 
         log_interval = max(1, epochs // 6)
         if do_val and ((epoch + 1) % log_interval == 0 or epoch == start_epoch or (epoch + 1) == epochs):
@@ -434,6 +514,11 @@ def main(args=None):
     bs = args.batch_size if args else TokenizerConfig.batch_size
     epochs = args.epochs if args else TokenizerConfig.epochs
     save_path = args.save_path if args else TokenizerConfig.save_path
+    metrics_path = (
+        getattr(args, "metrics_path", "")
+        if args
+        else ""
+    )
     val_every = args.val_every if args else 5
     use_cuda_graph = args.cuda_graph if args else True
     early_stop_patience = getattr(args, "early_stop_patience", 0)
@@ -503,6 +588,7 @@ def main(args=None):
             device=device,
             early_stop=early_stop,
             use_scheduler=use_scheduler,
+            metrics_path=metrics_path,
         )
     else:
         print("  Falling back to standard training loop")
@@ -519,7 +605,8 @@ def main(args=None):
                                    grad_clip=TokenizerConfig.grad_clip,
                                    device=device,
                                    early_stop=early_stop,
-                                   use_scheduler=use_scheduler)
+                                   use_scheduler=use_scheduler,
+                                   metrics_path=metrics_path)
 
     # Mark completed
     if os.path.exists(save_path):
@@ -537,6 +624,12 @@ if __name__ == "__main__":
     p.add_argument("--batch_size", type=int, default=TokenizerConfig.batch_size)
     p.add_argument("--epochs", type=int, default=TokenizerConfig.epochs)
     p.add_argument("--save_path", type=str, default="checkpoints/tokenizer_v2_ohlc.pt")
+    p.add_argument(
+        "--metrics_path",
+        type=str,
+        default="",
+        help="Downloadable per-epoch tokenizer training-history JSON",
+    )
     p.add_argument("--bits_l1", type=int, default=0, help="Coarse layer bits (0=use config)")
     p.add_argument("--bits_l2", type=int, default=0, help="Fine layer bits (0=use config)")
     p.add_argument("--bits_per_quantizer", type=int, default=0, help="Override all layers (0=use config)")

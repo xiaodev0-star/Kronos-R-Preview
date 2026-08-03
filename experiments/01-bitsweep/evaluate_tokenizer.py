@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer", type=Path, required=True)
     parser.add_argument("--features", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--distribution_output",
+        type=Path,
+        default=None,
+        help="Compressed full coarse/fine/joint count vectors",
+    )
     parser.add_argument("--chunk_size", type=int, default=65536)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -78,6 +84,11 @@ def main() -> int:
     tokenizer_path = args.tokenizer.resolve()
     features_path = args.features.resolve()
     output_path = args.output.resolve()
+    distribution_path = (
+        args.distribution_output.resolve()
+        if args.distribution_output is not None
+        else output_path.with_name(output_path.stem + "_distributions.npz")
+    )
     if not tokenizer_path.is_file():
         raise FileNotFoundError(tokenizer_path)
     if not features_path.is_file():
@@ -155,6 +166,48 @@ def main() -> int:
         joint_metrics["n_unique"] / (coarse_vocab * fine_vocab)
     )
 
+    def top_codes(
+        counts: np.ndarray, *, level: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        nonzero = np.flatnonzero(counts)
+        if nonzero.size == 0:
+            return []
+        order = nonzero[
+            np.argsort(counts[nonzero], kind="stable")[::-1][:limit]
+        ]
+        total = max(int(counts.sum()), 1)
+        rows = []
+        for token_id in order.tolist():
+            item: dict[str, Any] = {
+                "token_id": int(token_id),
+                "count": int(counts[token_id]),
+                "frequency": float(counts[token_id] / total),
+            }
+            if level == "joint":
+                item["coarse_id"] = int(token_id // fine_vocab)
+                item["fine_id"] = int(token_id % fine_vocab)
+            rows.append(item)
+        return rows
+
+    distribution_path.parent.mkdir(parents=True, exist_ok=True)
+    distribution_tmp = distribution_path.with_suffix(
+        distribution_path.suffix + ".tmp"
+    )
+    with distribution_tmp.open("wb") as handle:
+        np.savez_compressed(
+            handle,
+            schema=np.asarray([1], dtype=np.int16),
+            coarse_counts=coarse_counts,
+            fine_counts=fine_counts,
+            joint_counts=joint_counts,
+            coarse_vocab=np.asarray([coarse_vocab], dtype=np.int32),
+            fine_vocab=np.asarray([fine_vocab], dtype=np.int32),
+            joint_vocab=np.asarray(
+                [coarse_vocab * fine_vocab], dtype=np.int32
+            ),
+        )
+    os.replace(distribution_tmp, distribution_path)
+
     payload = {
         "status": "completed",
         "seed": args.seed,
@@ -192,6 +245,23 @@ def main() -> int:
         "coarse_codes": coarse_metrics,
         "fine_codes": fine_metrics,
         "joint_codes": joint_metrics,
+        "top_codes": {
+            "coarse": top_codes(coarse_counts, level="coarse"),
+            "fine": top_codes(fine_counts, level="fine"),
+            "joint": top_codes(joint_counts, level="joint"),
+        },
+        "distribution_sidecar": {
+            "schema": 1,
+            "filename": distribution_path.name,
+            "path": str(distribution_path),
+            "size_bytes": distribution_path.stat().st_size,
+            "sha256": file_sha256(distribution_path),
+            "arrays": [
+                "coarse_counts",
+                "fine_counts",
+                "joint_counts",
+            ],
+        },
     }
     atomic_write_json(output_path, payload)
     print(

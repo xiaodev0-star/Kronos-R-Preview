@@ -30,6 +30,135 @@ def _atomic_torch_save(payload, path):
     os.replace(temporary, path)
 
 
+def _distribution_summary(counts):
+    counts = counts.astype(np.int64, copy=False)
+    total = int(counts.sum())
+    used = counts[counts > 0]
+    if total == 0:
+        return {
+            "total": 0,
+            "n_unique": 0,
+            "collapse_rate": 0.0,
+            "entropy_bits": 0.0,
+            "effective_tokens": 0.0,
+        }
+    probabilities = used.astype(np.float64) / total
+    entropy = float(-(probabilities * np.log2(probabilities)).sum())
+    return {
+        "total": total,
+        "n_unique": int(used.size),
+        "collapse_rate": float(used.max() / total),
+        "entropy_bits": entropy,
+        "effective_tokens": float(2.0 ** entropy),
+    }
+
+
+def _write_dataset_token_diagnostics(
+    metrics_dir,
+    train_sequences,
+    val_sequences,
+    vocab_coarse,
+    vocab_fine,
+):
+    """Write exact train/validation target distributions for offline audit."""
+    arrays = {
+        "schema": np.asarray([1], dtype=np.int16),
+        "vocab_coarse": np.asarray([vocab_coarse], dtype=np.int32),
+        "vocab_fine": np.asarray([vocab_fine], dtype=np.int32),
+        "vocab_joint": np.asarray(
+            [vocab_coarse * vocab_fine], dtype=np.int32
+        ),
+    }
+    summary = {"schema": 1, "splits": {}}
+    for split_name, sequences in (
+        ("train", train_sequences),
+        ("validation", val_sequences),
+    ):
+        coarse_counts = np.zeros(vocab_coarse, dtype=np.int64)
+        fine_counts = np.zeros(vocab_fine, dtype=np.int64)
+        joint_counts = np.zeros(vocab_coarse * vocab_fine, dtype=np.int64)
+        lengths = []
+        for sequence in sequences:
+            coarse = sequence["targets"].numpy().astype(
+                np.int64, copy=False
+            )
+            fine = sequence["fine_targets"].numpy().astype(
+                np.int64, copy=False
+            )
+            valid = (
+                (coarse >= 0)
+                & (coarse < vocab_coarse)
+                & (fine >= 0)
+                & (fine < vocab_fine)
+            )
+            coarse = coarse[valid]
+            fine = fine[valid]
+            joint = coarse * vocab_fine + fine
+            coarse_counts += np.bincount(
+                coarse, minlength=vocab_coarse
+            )[:vocab_coarse]
+            fine_counts += np.bincount(
+                fine, minlength=vocab_fine
+            )[:vocab_fine]
+            joint_counts += np.bincount(
+                joint, minlength=vocab_coarse * vocab_fine
+            )[: vocab_coarse * vocab_fine]
+            lengths.append(int(valid.sum()))
+        arrays[f"{split_name}_coarse_counts"] = coarse_counts
+        arrays[f"{split_name}_fine_counts"] = fine_counts
+        arrays[f"{split_name}_joint_counts"] = joint_counts
+        length_array = np.asarray(lengths, dtype=np.int64)
+        summary["splits"][split_name] = {
+            "n_sequences": len(sequences),
+            "sequence_target_length": {
+                "min": int(length_array.min()) if length_array.size else 0,
+                "p10": (
+                    float(np.quantile(length_array, 0.10))
+                    if length_array.size
+                    else 0.0
+                ),
+                "median": (
+                    float(np.median(length_array))
+                    if length_array.size
+                    else 0.0
+                ),
+                "p90": (
+                    float(np.quantile(length_array, 0.90))
+                    if length_array.size
+                    else 0.0
+                ),
+                "max": int(length_array.max()) if length_array.size else 0,
+            },
+            "coarse": _distribution_summary(coarse_counts),
+            "fine": _distribution_summary(fine_counts),
+            "joint": _distribution_summary(joint_counts),
+        }
+
+    distribution_path = os.path.join(
+        metrics_dir, "dataset_token_distributions.npz"
+    )
+    temporary_distribution = distribution_path + ".tmp"
+    with open(temporary_distribution, "wb") as handle:
+        np.savez_compressed(handle, **arrays)
+    os.replace(temporary_distribution, distribution_path)
+    summary["distribution_sidecar"] = {
+        "filename": os.path.basename(distribution_path),
+        "arrays": sorted(arrays),
+        "size_bytes": os.path.getsize(distribution_path),
+    }
+    summary_path = os.path.join(metrics_dir, "dataset_token_summary.json")
+    temporary_summary = summary_path + ".tmp"
+    with open(temporary_summary, "w", encoding="utf-8") as handle:
+        json.dump(
+            summary,
+            handle,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    os.replace(temporary_summary, summary_path)
+
+
 def _cpu_state_dict(module):
     """Snapshot model tensors to CPU once for all per-epoch checkpoint files."""
     return {
@@ -217,9 +346,9 @@ def compute_batched_loss(coarse_logits, target, fine_logits, fine_target,
                          reg_pred, reg_target, args):
     """Sum-of-per-sequence total loss for a right-padded batch.
 
-    Returns (loss_sum, coarse_sum, n_seq) where loss_sum aggregates
-    focal(+fine+het) over all sequences in the batch, exactly matching what the
-    bs=1 loop would accumulate for the same sequences.
+    Returns ``(loss_sum, component_sums, n_seq)``. Component sums are detached
+    unweighted per-sequence losses, making the downloadable training history
+    sufficient to separate coarse, fine, and regression behaviour.
     """
     shift_coarse = coarse_logits[:, :-1, :]
     if args.loss == "focal":
@@ -230,13 +359,20 @@ def compute_batched_loss(coarse_logits, target, fine_logits, fine_target,
         coarse = _per_seq_ce(shift_coarse, target, ignore_index=-100,
                              label_smoothing=args.label_smoothing)
     total = coarse
-    shift_fine = fine_logits[:, 1:, :]
-    fine = _per_seq_ce(shift_fine, fine_target[:, 1:], ignore_index=0)
+    fine = _per_seq_ce(
+        fine_logits, fine_target, ignore_index=-100
+    )
     total = total + args.fine_weight * fine
+    het = torch.zeros_like(coarse)
     if reg_pred is not None and args.heteroscedastic:
         het = _per_seq_het(reg_pred, reg_target[:, 1:])
         total = total + args.het_weight * het
-    return total.sum(), coarse.sum().detach(), total.shape[0]
+    components = {
+        "coarse": coarse.sum().detach(),
+        "fine": fine.sum().detach(),
+        "heteroscedastic": het.sum().detach(),
+    }
+    return total.sum(), components, total.shape[0]
 
 
 def build_wsd_scheduler(optimizer, total_updates, warmup_ratio=0.05, stable_ratio=0.0):
@@ -295,7 +431,9 @@ def _pad_batch(sequences, batch_size):
         B = len(group)
         p_ids = torch.zeros(B, max_len, dtype=torch.long)
         p_tgt = torch.full((B, max_len - 1), -100, dtype=torch.long)
-        p_ftgt = torch.zeros(B, max_len - 1, dtype=torch.long)  # fine targets
+        p_ftgt = torch.full(
+            (B, max_len - 1), -100, dtype=torch.long
+        )
         p_time = torch.zeros(B, max_len, 3, dtype=torch.long)
         p_pos = torch.zeros(B, max_len, dtype=torch.long)
         p_mask = torch.zeros(B, max_len, max_len, dtype=torch.bool)
@@ -418,13 +556,13 @@ def _pad_batch_causal(group):
     With right-padding + causal attention, every REAL query position i attends
     only to real keys 0..i, so its logits are identical to processing the stock
     alone (bs=1). Padded query rows are discarded by the loss (targets = -100 /
-    fine 0 / reg -999), giving numerically identical training to bs=1.
+    fine -100 / reg -999), giving numerically identical training to bs=1.
     """
     Nmax = max(s["input_ids"].shape[0] for s in group)
     B = len(group)
     p_ids = torch.zeros(B, Nmax, dtype=torch.long)
     p_tgt = torch.full((B, Nmax - 1), -100, dtype=torch.long)
-    p_ftgt = torch.zeros(B, Nmax - 1, dtype=torch.long)
+    p_ftgt = torch.full((B, Nmax - 1), -100, dtype=torch.long)
     p_time = torch.zeros(B, Nmax, 3, dtype=torch.long)
     p_pos = torch.zeros(B, Nmax, dtype=torch.long)
     p_va = torch.zeros(B, Nmax, 2, dtype=torch.float32)
@@ -478,6 +616,7 @@ class TokenBudgetLoader:
         self.loader_seed = loader_seed
         self.exact_accumulation = exact_accumulation
         self.accumulation_boundary = 0
+        self.last_iteration_stats = {}
 
     def set_epoch(self, epoch):
         self._epoch = epoch
@@ -609,10 +748,41 @@ class TokenBudgetLoader:
             blocks = [blocks[position] for position in permutation]
         return blocks
 
+    def _reset_iteration_stats(self):
+        self.last_iteration_stats = {
+            "microbatches": 0,
+            "sequences": 0,
+            "real_tokens": 0,
+            "padded_tokens": 0,
+            "max_sequences_per_microbatch": 0,
+            "max_sequence_length": 0,
+        }
+
+    def _record_group(self, group):
+        lengths = [
+            int(self.sequences[index]["input_ids"].shape[0])
+            for index in group
+        ]
+        batch_size = len(lengths)
+        max_length = max(lengths)
+        stats = self.last_iteration_stats
+        stats["microbatches"] += 1
+        stats["sequences"] += batch_size
+        stats["real_tokens"] += sum(lengths)
+        stats["padded_tokens"] += batch_size * max_length
+        stats["max_sequences_per_microbatch"] = max(
+            stats["max_sequences_per_microbatch"], batch_size
+        )
+        stats["max_sequence_length"] = max(
+            stats["max_sequence_length"], max_length
+        )
+
     def __iter__(self):
+        self._reset_iteration_stats()
         if self.exact_accumulation:
             for block in self._build_exact_group_blocks():
                 for group in block:
+                    self._record_group(group)
                     yield _pad_batch_causal(
                         [self.sequences[i] for i in group]
                     )
@@ -623,6 +793,7 @@ class TokenBudgetLoader:
             perm = torch.randperm(len(groups), generator=g).tolist()
             groups = [groups[p] for p in perm]
         for grp in groups:
+            self._record_group(grp)
             yield _pad_batch_causal([self.sequences[i] for i in grp])
 
     def __len__(self):
@@ -682,7 +853,15 @@ def main(args):
     epochs = args.epochs
     ckpt_path = save_path + ".ckpt"
     save_stem, _ = os.path.splitext(save_path)
-    epoch_ckpt_index_path = save_stem + "_checkpoints.json"
+    metrics_dir = os.path.abspath(
+        args.metrics_dir
+        if getattr(args, "metrics_dir", "")
+        else (os.path.dirname(save_path) or ".")
+    )
+    os.makedirs(metrics_dir, exist_ok=True)
+    epoch_ckpt_index_path = os.path.join(
+        metrics_dir, os.path.basename(save_stem) + "_checkpoints.json"
+    )
     effective_lr = args.lr
 
     if args.max_stocks > 0:
@@ -739,6 +918,13 @@ def main(args):
     val_seqs = pack_stocks_v2(val_s, tokenizer, mode="train", cache_dir=cache_dir,
                               max_seq_len=args.max_seq_len)
     print(f"Train seqs: {len(train_seqs)}, Val seqs: {len(val_seqs)}")
+    _write_dataset_token_diagnostics(
+        metrics_dir,
+        train_seqs,
+        val_seqs,
+        ModelConfig.vocab_size,
+        ModelConfig.vocab_fine,
+    )
 
     bs = TrainingConfig.batch_size
     use_curriculum = getattr(args, "curriculum", False)
@@ -926,17 +1112,50 @@ def main(args):
             os.remove(ckpt_path)
 
     os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
-    history = {"train_loss": [], "val_loss": [], "val_het_loss": [], "lr": [],
-               "epoch_time_s": []}
-    history_path = os.path.join(
-        os.path.dirname(save_path) or ".", f"history_{args.tag}.json"
-    )
+    history = {
+        "schema": 4,
+        "epoch": [],
+        "train_loss": [],
+        "train_coarse_loss": [],
+        "train_fine_loss": [],
+        "train_het_loss": [],
+        "val_loss": [],
+        "val_coarse_loss": [],
+        "val_fine_loss": [],
+        "val_het_loss": [],
+        "lr": [],
+        "lr_adam": [],
+        "optimizer_steps_this_epoch": [],
+        "global_step": [],
+        "accumulation_sequences": [],
+        "scheduled_train_sequences": [],
+        "train_microbatches": [],
+        "mean_sequences_per_microbatch": [],
+        "max_sequences_per_microbatch": [],
+        "real_input_tokens": [],
+        "padded_input_tokens": [],
+        "padding_efficiency": [],
+        "max_sequence_length": [],
+        "peak_cuda_memory_allocated_gb": [],
+        "peak_cuda_memory_reserved_gb": [],
+        "epoch_time_s": [],
+        "elapsed_time_s": [],
+    }
+    history_path = os.path.join(metrics_dir, f"history_{args.tag}.json")
     if args.history_per_epoch and os.path.exists(history_path):
         try:
             with open(history_path, "r", encoding="utf-8") as f:
                 stored_history = json.load(f)
             for key in history:
-                history[key] = list(stored_history.get(key, []))[:start_epoch]
+                if key == "schema":
+                    continue
+                stored_values = stored_history.get(key)
+                if stored_values is None and key == "val_coarse_loss":
+                    stored_values = stored_history.get("val_loss", [])
+                if stored_values is None:
+                    history[key] = [None] * start_epoch
+                else:
+                    history[key] = list(stored_values)[:start_epoch]
             for key in ("collapse_rate", "n_unique_tokens"):
                 if key in stored_history:
                     history[key] = list(stored_history[key])[:start_epoch]
@@ -954,6 +1173,8 @@ def main(args):
     for epoch in range(start_epoch, epochs):
         epoch_t0 = time.time()
         epoch_step_start = global_step
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         # Update curriculum epoch for length filtering
         if hasattr(train_loader, "set_epoch"):
             train_loader.set_epoch(epoch)
@@ -987,6 +1208,9 @@ def main(args):
 
         model.train()
         loss_acc = torch.zeros((), device=device)
+        coarse_loss_acc = torch.zeros((), device=device)
+        fine_loss_acc = torch.zeros((), device=device)
+        het_loss_acc = torch.zeros((), device=device)
         n_loss = 0
         optimizer.zero_grad(set_to_none=True)
         if optimizer_adam:
@@ -1025,7 +1249,7 @@ def main(args):
                                 input_ids, time_id, pos_id, mask,
                                 va_values=va_val, fine_targets=fine_target)
                             reg_pred = None
-                        loss_sum, _, n_seq = compute_batched_loss(
+                        loss_sum, component_sums, n_seq = compute_batched_loss(
                             coarse_logits, target, fine_logits, fine_target,
                             reg_pred, reg_target, args)
                     if t_fwd_start > 0:
@@ -1053,6 +1277,9 @@ def main(args):
                         global_step += 1
                         seqs_in_accum = 0
                     loss_acc += loss_sum.detach()
+                    coarse_loss_acc += component_sums["coarse"]
+                    fine_loss_acc += component_sums["fine"]
+                    het_loss_acc += component_sums["heteroscedastic"]
                     n_loss += n_seq
                     if (bi + 1) % 100 == 0:
                         pbar.set_postfix(
@@ -1094,18 +1321,24 @@ def main(args):
                         loss = F.cross_entropy(shift_coarse.view(-1, shift_coarse.size(-1)),
                                                shift_targets.view(-1), ignore_index=-100,
                                                label_smoothing=args.label_smoothing)
+                    coarse_component = loss.detach()
+                    fine_component = torch.zeros((), device=device)
+                    het_component = torch.zeros((), device=device)
 
-                    # Fine loss: f_logits is [B, S-1, V_fine], fine_target is [B, S-1]
-                    shift_fine = fine_logits[:, 1:, :].contiguous()    # [B, S-2, V_fine]
-                    shift_fine_tgt = fine_target[:, 1:].contiguous() # [B, S-2]
-                    fine_mask = (shift_targets != -100)
+                    # Fine head predicts the same next-token positions as the
+                    # coarse head. -100 marks EOS/padding; code 0 is valid.
+                    fine_mask = fine_target != -100
                     if fine_mask.any():
                         fine_loss = F.cross_entropy(
-                            shift_fine.view(-1, shift_fine.size(-1)),
-                            shift_fine_tgt.view(-1), ignore_index=0)
+                            fine_logits.reshape(-1, fine_logits.size(-1)),
+                            fine_target.reshape(-1),
+                            ignore_index=-100,
+                        )
+                        fine_component = fine_loss.detach()
                         loss = loss + args.fine_weight * fine_loss
 
                     if het_loss is not None and args.heteroscedastic:
+                        het_component = het_loss.detach()
                         loss = loss + args.het_weight * het_loss
 
                 if t_fwd_start > 0:
@@ -1138,6 +1371,9 @@ def main(args):
                     global_step += 1
 
                 loss_acc += loss.detach()
+                coarse_loss_acc += coarse_component
+                fine_loss_acc += fine_component
+                het_loss_acc += het_component
                 n_loss += 1
 
             except torch.cuda.OutOfMemoryError as error:
@@ -1191,6 +1427,11 @@ def main(args):
                     f"{epoch + 1}: observed {epoch_optimizer_steps}, "
                     f"expected {expected_epoch_steps}"
                 )
+        batch_stats = (
+            dict(train_loader.last_iteration_stats)
+            if batched
+            else {}
+        )
 
         # Record profiler sub-timings (sampled, not exact per-step)
         if profiler:
@@ -1200,10 +1441,14 @@ def main(args):
                 profiler.record("gpt_backward", t_backward_acc)
 
         avg_train = (loss_acc / max(n_loss, 1)).item()
+        avg_train_coarse = (coarse_loss_acc / max(n_loss, 1)).item()
+        avg_train_fine = (fine_loss_acc / max(n_loss, 1)).item()
+        avg_train_het = (het_loss_acc / max(n_loss, 1)).item()
 
         # Validation (always CE for comparable val_loss)
         model.eval()
         vlosses = []
+        v_fine_losses = []
         v_het_losses = []
         val_pred_tokens = []
         with torch.inference_mode():
@@ -1224,6 +1469,13 @@ def main(args):
                         val_het = None
                     shift_logits = coarse_logits[:, :-1, :].contiguous()
                     shift_targets = target.contiguous()
+                    v_fine_losses.append(
+                        _per_seq_ce(
+                            fine_logits,
+                            fine_target,
+                            ignore_index=-100,
+                        ).detach()
+                    )
                     if batched:
                         # Per-sequence means -> val_loss stays sequence-averaged
                         # (identical metric to the bs=1 loop).
@@ -1252,6 +1504,7 @@ def main(args):
                         val_pred_tokens.append(preds[valid_mask].detach())
 
         avg_val = _mean_metric_chunks(vlosses)
+        avg_val_fine = _mean_metric_chunks(v_fine_losses)
         avg_val_het = _mean_metric_chunks(v_het_losses)
         cur_lr = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - t0
@@ -1267,11 +1520,70 @@ def main(args):
                 collapse_rate = counts.max().item() / total
                 n_unique_tokens = len(unique)
 
+        history["epoch"].append(epoch + 1)
         history["train_loss"].append(avg_train)
+        history["train_coarse_loss"].append(avg_train_coarse)
+        history["train_fine_loss"].append(avg_train_fine)
+        history["train_het_loss"].append(avg_train_het)
         history["val_loss"].append(avg_val)
+        # Keep val_loss for analyzer compatibility and expose the component
+        # name explicitly in the downloadable audit trail.
+        history["val_coarse_loss"].append(avg_val)
+        history["val_fine_loss"].append(avg_val_fine)
         history["val_het_loss"].append(avg_val_het)
         history["lr"].append(cur_lr)
+        history["lr_adam"].append(
+            optimizer_adam.param_groups[0]["lr"]
+            if optimizer_adam
+            else None
+        )
+        history["optimizer_steps_this_epoch"].append(epoch_optimizer_steps)
+        history["global_step"].append(global_step)
+        history["accumulation_sequences"].append(epoch_accum)
+        history["scheduled_train_sequences"].append(
+            sequences_for_epoch(epoch)
+        )
+        train_microbatches = int(batch_stats.get("microbatches", 0))
+        train_sequences = int(batch_stats.get("sequences", 0))
+        real_input_tokens = int(batch_stats.get("real_tokens", 0))
+        padded_input_tokens = int(batch_stats.get("padded_tokens", 0))
+        mean_sequences_per_microbatch = (
+            train_sequences / train_microbatches
+            if train_microbatches
+            else 1.0
+        )
+        padding_efficiency = (
+            real_input_tokens / padded_input_tokens
+            if padded_input_tokens
+            else 1.0
+        )
+        peak_allocated_gb = (
+            torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+            if device.type == "cuda"
+            else 0.0
+        )
+        peak_reserved_gb = (
+            torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+            if device.type == "cuda"
+            else 0.0
+        )
+        history["train_microbatches"].append(train_microbatches)
+        history["mean_sequences_per_microbatch"].append(
+            mean_sequences_per_microbatch
+        )
+        history["max_sequences_per_microbatch"].append(
+            int(batch_stats.get("max_sequences_per_microbatch", 1))
+        )
+        history["real_input_tokens"].append(real_input_tokens)
+        history["padded_input_tokens"].append(padded_input_tokens)
+        history["padding_efficiency"].append(padding_efficiency)
+        history["max_sequence_length"].append(
+            int(batch_stats.get("max_sequence_length", 0))
+        )
+        history["peak_cuda_memory_allocated_gb"].append(peak_allocated_gb)
+        history["peak_cuda_memory_reserved_gb"].append(peak_reserved_gb)
         history["epoch_time_s"].append(time.time() - epoch_t0)
+        history["elapsed_time_s"].append(elapsed)
         if args.light_eval:
             history.setdefault("collapse_rate", []).append(collapse_rate)
             history.setdefault("n_unique_tokens", []).append(n_unique_tokens)
@@ -1348,8 +1660,19 @@ def main(args):
                     "path": os.path.abspath(epoch_ckpt_path),
                     "size_bytes": os.path.getsize(epoch_ckpt_path),
                     "train_loss": avg_train,
+                    "train_coarse_loss": avg_train_coarse,
+                    "train_fine_loss": avg_train_fine,
+                    "train_het_loss": avg_train_het,
                     "val_loss": avg_val,
+                    "val_coarse_loss": avg_val,
+                    "val_fine_loss": avg_val_fine,
+                    "val_het_loss": avg_val_het,
                     "learning_rate": cur_lr,
+                    "learning_rate_adam": (
+                        optimizer_adam.param_groups[0]["lr"]
+                        if optimizer_adam
+                        else None
+                    ),
                     "best_so_far": bool(save_tag),
                     "global_step": global_step,
                     "optimizer_steps_this_epoch": epoch_optimizer_steps,
@@ -1395,6 +1718,10 @@ def main(args):
         print(f"  [{epochs_done}/{epochs - start_epoch}] Epoch {epoch+1}: "
               f"train={avg_train:.4f} val={avg_val:.4f} best={best_val:.4f} "
               f"lr={cur_lr:.2e} elapsed={elapsed:.0f}s ETA={eta:.0f}s step={global_step}"
+              f" microbatch={mean_sequences_per_microbatch:.1f}/"
+              f"{history['max_sequences_per_microbatch'][-1]}"
+              f" pad={padding_efficiency:.1%}"
+              f" peak={peak_allocated_gb:.1f}GiB"
               f"{light_str}{save_tag}", flush=True)
 
         # Early stopping check
@@ -1425,7 +1752,7 @@ def main(args):
         ckpt["completed"] = True
         _atomic_torch_save(ckpt, save_path)
 
-    with open(os.path.join(os.path.dirname(save_path) or ".", f"history_{args.tag}.json"), "w") as f:
+    with open(history_path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
     if profiler:
@@ -1436,21 +1763,20 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Kronos-Preview training. Default: focal γ=4 + heteroscedastic=ON (HPO 2026-06-18 best, phase3_t000: DA 48.12% with V2).",
+        description="Train a Kronos-Preview causal GPT model.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # HPO 2026-06-18 best (phase3_t000) — DA 48.12% with V2 calibration.
-  # Just run with defaults:
+  # Run with configured defaults:
   python train_base.py
 
-  # 15-epoch / lower-dropout variant (phase4_t003) — DA 47.93% with V2, lower collapse (16.8%).
+  # Short lower-dropout run:
   python train_base.py --epochs 15 --dropout 0.05
 
-  # Disable heteroscedastic head (reproduces pre-HPO behavior):
+  # Disable the heteroscedastic head:
   python train_base.py --no-heteroscedastic
 
-  # Standard CE baseline (no focal):
+  # Standard CE baseline:
   python train_base.py --loss ce --weight_decay 0.001
 
   # Reasoning model (two-stage):
@@ -1459,21 +1785,33 @@ Examples:
         """)
     # Core
     parser.add_argument("--save_path", type=str, default=TrainingConfig.base_model_path)
+    parser.add_argument(
+        "--metrics_dir",
+        type=str,
+        default="",
+        help=(
+            "Directory for downloadable history/checkpoint-index JSON; "
+            "defaults to the checkpoint directory"
+        ),
+    )
     parser.add_argument("--tokenizer_path", type=str, default="checkpoints/tokenizer_v2_ohlc.pt")
     parser.add_argument("--epochs", type=int, default=TrainingConfig.epochs)
     parser.add_argument("--tag", type=str, default="default")
-    parser.add_argument("--loss", type=str, default="focal", choices=["ce", "focal"])
+    parser.add_argument("--loss", type=str, default="ce", choices=["ce", "focal"],
+                        help="Token loss; 'ce' is the reviewed Exp 04 line default")
     parser.add_argument("--weight_decay", type=float, default=TrainingConfig.weight_decay)
     parser.add_argument("--lr", type=float, default=TrainingConfig.learning_rate)
-    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"],
-                        help="Optimizer: adamw (default) or muon+adamw (2D→Muon, 1D→AdamW)")
-    parser.add_argument("--lr_muon", type=float, default=0.02,
+    # Defaults follow the reviewed Exp 04-A (muon) and Exp 04-B (lr_muon=0.005)
+    # selections; override per experiment via CLI.
+    parser.add_argument("--optimizer", type=str, default="muon", choices=["adamw", "muon"],
+                        help="Optimizer: AdamW, or Muon for 2D weights plus AdamW for the rest")
+    parser.add_argument("--lr_muon", type=float, default=0.005,
                         help="Muon learning rate (only when --optimizer muon)")
     parser.add_argument("--light_eval", action="store_true",
                         help="Compute collapse_rate/token_diversity during validation (fast HPO proxy)")
     # Focal loss
     parser.add_argument("--gamma", type=float, default=4.0,
-                        help="Focal loss gamma (HPO 2026-06-18 best: 4.0)")
+                        help="Focal loss gamma")
     parser.add_argument("--label_smoothing", type=float, default=0.0)
     parser.add_argument("--entropy_alpha", type=float, default=0.0,
                         help="Entropy regularization weight for focal loss (0.0 = disabled)")
@@ -1481,7 +1819,7 @@ Examples:
     parser.add_argument("--heteroscedastic", dest="heteroscedastic", action="store_true", default=True)
     parser.add_argument("--no-heteroscedastic", dest="heteroscedastic", action="store_false")
     parser.add_argument("--het_weight", type=float, default=0.1,
-                        help="Weight for heteroscedastic NLL loss (HPO 2026-06-18 best: 0.1)")
+                        help="Weight for heteroscedastic NLL loss")
     parser.add_argument("--fine_weight", type=float, default=0.3,
                         help="Weight for fine-token auxiliary loss in dual-head prediction")
     # Reasoning
@@ -1511,7 +1849,7 @@ Examples:
     parser.add_argument("--max_stocks", type=int, default=0,
                         help="Subsample N stocks for fast HPO screening (0=all)")
     parser.add_argument("--max_seq_len", type=int, default=0,
-                        help="Truncate sequences longer than this (0=no limit, recommended 2048 for HPO)")
+                        help="Truncate sequences longer than this (0=no limit)")
     parser.add_argument("--force_repack", action="store_true",
                         help="Force re-tokenization (clear cache)")
     parser.add_argument("--history_per_epoch", action="store_true",
@@ -1531,8 +1869,8 @@ Examples:
         "--controlled_loader_seed",
         type=int,
         default=-1,
-        help="Architecture-independent token-loader seed (-1 preserves the "
-             "historical global-RNG behaviour).",
+        help="Architecture-independent token-loader seed (-1 uses the "
+             "process-global RNG).",
     )
     parser.add_argument(
         "--exact_accumulation_boundaries",
@@ -1552,7 +1890,6 @@ Examples:
         action="store_true",
         default=False,
         help="Keep TrainingConfig.accumulation_steps for every epoch instead of "
-             "doubling it at absolute epoch 15. The historical default is "
-             "preserved unless this flag is passed.",
+             "doubling it at absolute epoch 15.",
     )
     main(parser.parse_args())

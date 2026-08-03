@@ -85,10 +85,15 @@ class Muon(Optimizer):
         return loss
 
 
-def build_muon_optimizers(model, lr_muon=0.02, lr_adam=3e-4,
+def build_muon_optimizers(model, lr_muon=0.005, lr_adam=3e-4,
                            momentum=0.95, weight_decay_muon=0.0,
                            weight_decay_adam=0.01):
-    """Build paired Muon (2D weights) + AdamW (1D params) optimizers."""
+    """Build paired Muon (2D weights) + AdamW (1D params) optimizers.
+
+    Default lr_muon=0.005 follows the reviewed Exp 04-B HPO selection
+    (trial_4c721141ab): token-quality metrics improve monotonically as
+    lr_muon drops from 0.02 to 0.005 on the depth6 architecture.
+    """
     muon_params, adam_params = [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:

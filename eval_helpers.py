@@ -107,6 +107,7 @@ def build_stock_arrays(stock):
     p_std = np.maximum(price_feat[:ci].std(axis=0), 1e-8)
 
     return {
+        "symbol": str(stock.get("symbol", "unknown")),
         "feat": feat, "close": close, "ci": ci, "T_total": T_total,
         "p_mean": p_mean, "p_std": p_std,
         "price_normed": price_normed, "va_normed": va_normed,
@@ -400,6 +401,7 @@ def _prepare_stocks_batch(stocks, tokenizer, device):
         dates_aligned = [dates_full[0]] + dates_full[:T-1]
 
         results.append({
+            "symbol": arrays["symbol"],
             "inp_ids": inp_ids[:-1],
             # Raw feature-aligned targets. At selected causal position p both
             # hierarchy levels target these arrays at p. Keeping coarse targets

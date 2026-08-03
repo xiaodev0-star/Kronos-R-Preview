@@ -1,10 +1,10 @@
-"""Shared runner for the refreshed Exp 04-A/B controlled ablations.
+"""Shared runner for the Exp 04-A controlled optimizer ablation.
 
-The 2026-07-27 refresh inherits the tokenizer selected by Exp 02 and the GPT
-architecture selected by the controlled Exp 03-Sup rerun. Every arm is trained
-on full data with full sequences, retains every epoch checkpoint, and is
-evaluated over the same four pre-holdout windows. The module deliberately keeps
-quality and behaviour metrics separate; it never constructs a weighted score.
+The runner inherits the tokenizer selected by Exp 02 and the GPT architecture
+selected by the controlled Exp 03 sweep. Every arm is trained on full data with
+full sequences, retains every epoch checkpoint, and is evaluated over the same
+pre-holdout windows. The module deliberately keeps quality and behaviour
+metrics separate; it never constructs a weighted score.
 """
 
 from __future__ import annotations
@@ -27,32 +27,87 @@ from typing import Any
 
 SCRIPT_PATH = Path(__file__).resolve()
 ROOT = SCRIPT_PATH.parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from experiment_io import (
+    StudyLayout,
+    default_study_roots,
+    runtime_environment,
+    write_download_manifest,
+)
+
+_, EXP02_RESULTS_ROOT = default_study_roots(
+    "02-tokenizer-tuning", seed=42
+)
+_, EXP03_RESULTS_ROOT = default_study_roots("03-gpt-scaling", seed=42)
 EXP01_PIPELINE_PATH = (
-    ROOT / "experiments" / "01-bitsweep" / "rerun_bits_epochwise.py"
+    ROOT / "experiments" / "01-bitsweep" / "run_bitsweep.py"
 )
 EXP02_SELECTION = (
-    ROOT
-    / "experiments"
-    / "02-tokenizer-tuning"
-    / "rerun_seed42"
-    / "selection.json"
+    EXP02_RESULTS_ROOT / "selection.json"
 )
-EXP03_SUP_SELECTION = (
-    ROOT
-    / "experiments"
-    / "03-gpt-scaling-sup"
-    / "run_seed42"
-    / "selection.json"
+EXP03_SELECTION = (
+    EXP03_RESULTS_ROOT / "selection.json"
 )
 TRAIN_SCRIPT = ROOT / "train_base.py"
 TRAJECTORY_SCRIPT = (
-    ROOT / "experiments" / "04" / "c-hpo" / "evaluate_epoch_trajectory.py"
+    ROOT / "experiments" / "04" / "b-hpo" / "evaluate_epoch_trajectory.py"
 )
 
+# Portable upstream bundle: lets Exp 04 run on a server without copying
+# server_runs/. The bundle (tokenizer.pt + upstream.json) is packaged once on
+# a workstation that holds the reviewed Exp 02/03/04-A selections, then travels
+# with the repo. Output still honours KRONOS_WEIGHTS_ROOT/KRONOS_RESULTS_ROOT,
+# so results remain downloadable into the local server_runs/results tree.
+PORTABLE_DIR = SCRIPT_PATH.parent / "portable_assets"
+PORTABLE_TOKENIZER = PORTABLE_DIR / "tokenizer.pt"
+PORTABLE_MANIFEST = PORTABLE_DIR / "upstream.json"
+
 SEED = 42
-VALIDATION_OFFSETS = (0, 100, 200, 300)
 HOLDOUT_OFFSET = 400
-EXPECTED_PYTHON = Path(r"D:\conda_envs\llm-t\Scripts\python.exe")
+EVAL_DAYS = 1
+# Full-coverage, single-day-resolution evaluation: tile [0, HOLDOUT_OFFSET) with
+# contiguous EVAL_DAYS-day windows (offsets 0, 1, ..., 399) so every pre-holdout
+# trading day is scored as its own window. Offset HOLDOUT_OFFSET+ stays sealed.
+VALIDATION_OFFSETS = tuple(range(0, HOLDOUT_OFFSET, EVAL_DAYS))
+
+# All-epoch summarization policy, mirroring Exp 03's eligible_windows: each arm
+# is summarized over its full 1..N epoch trajectory as a single window. The
+# maturity onset and loss basin are still recorded for audit only and no longer
+# restrict which epochs enter the ranking.
+LOSS_BASIN_RATIO = 1.01
+
+# Downstream quality guardrails. These never participate in ranking; they only
+# gate whether an arm may lead. Tolerance is max(practical floor, 2x reference
+# arm within-window SD). ``envelope_field`` maps the canonical guardrail name to
+# the arm_envelopes summary field holding its all-epoch window median, and
+# ``std_field`` is the matching within-window standard deviation.
+GUARDRAILS = {
+    "avg_da_per_date": {
+        "direction": "higher",
+        "floor": 0.01,
+        "label": "DA",
+        "envelope_field": "late_median_da",
+    },
+    "avg_daily_rank_ic": {
+        "direction": "higher",
+        "floor": 0.01,
+        "label": "daily RankIC",
+        "envelope_field": "late_median_rankic",
+    },
+    "avg_mape": {
+        "direction": "lower",
+        "floor": 0.05,
+        "label": "MAPE",
+        "envelope_field": "late_median_mape",
+    },
+    "ampratio_log_error": {
+        "direction": "lower",
+        "floor": 0.05,
+        "label": "|log AmpRatio|",
+        "envelope_field": "late_median_ampratio_log_error",
+    },
+}
 
 
 def _load_exp01_pipeline():
@@ -118,14 +173,9 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def verify_python_runtime() -> None:
-    actual = Path(sys.executable).resolve()
-    if actual != EXPECTED_PYTHON.resolve():
+    if sys.version_info < (3, 10):
         raise RuntimeError(
-            f"Exp 04 must use {EXPECTED_PYTHON}; current Python is {actual}"
-        )
-    if sys.version_info[:3] != (3, 12, 10):
-        raise RuntimeError(
-            f"Expected Python 3.12.10, got {sys.version.split()[0]}"
+            f"Python >=3.10 is required, got {sys.version.split()[0]}"
         )
 
 
@@ -176,6 +226,11 @@ def resolve_tokenizer(raw: str) -> dict[str, Any]:
                 f"Exp 02 selection is missing: {EXP02_SELECTION}"
             )
         selection = PIPE.load_json(EXP02_SELECTION)
+        if not selection.get("upstream_eligible", False):
+            raise RuntimeError(
+                f"Exp 02 selection has not been recorded after review: "
+                f"{EXP02_SELECTION}"
+            )
         path = Path(selection["selected"]["tokenizer_path"]).resolve()
         source = {
             "source": "exp02_selection",
@@ -195,9 +250,13 @@ def resolve_architecture(selection_path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(
             f"Controlled capacity selection is missing: {path}. "
-            "Complete and analyze Exp 03-Sup before running Exp 04."
+            "Complete and analyze Exp 03 before running Exp 04."
         )
     selection = PIPE.load_json(path)
+    if not selection.get("upstream_eligible", False):
+        raise RuntimeError(
+            f"Capacity selection has not been recorded after review: {path}"
+        )
     selected = dict(selection.get("selected", {}))
     required = {
         "config",
@@ -239,7 +298,10 @@ def load_required_selections(
                 f"{name} selection is not eligible for downstream use: {resolved}. "
                 "Run the complete formal arm set (not smoke/subset mode)."
             )
-        actual = payload.get("selected", {}).get("arm")
+        actual = (
+            payload.get("selected", {}).get("arm")
+            or payload.get("selected", {}).get("config")
+        )
         if actual != expected_arm:
             raise RuntimeError(
                 f"{name} selected {actual!r}; this preregistration expects "
@@ -253,19 +315,207 @@ def load_required_selections(
     return loaded
 
 
-def arm_paths(output_root: Path, name: str) -> dict[str, Path]:
-    directory = output_root / "arms" / name
+_PORTABLE_ARCH_FIELDS = (
+    "config",
+    "dim",
+    "depth",
+    "heads",
+    "kv_heads",
+    "ffn_multiplier",
+    "gradient_checkpointing",
+    "batch_tokens",
+    "eval_batch_size",
+    "parameter_count",
+)
+
+
+def write_portable_bundle(
+    portable_dir: Path,
+    *,
+    tokenizer_path: Path,
+    exp02_selection_path: Path,
+    exp03_selection_path: Path,
+    exp04a_selection_path: Path,
+) -> Path:
+    """Package the reviewed upstream artifacts so Exp 04 can run without server_runs.
+
+    Copies the selected tokenizer and bundles the Exp 02/03/04-A selection JSONs
+    into one ``upstream.json`` manifest under ``portable_dir``. Run this once on a
+    workstation that has the formal ``server_runs/`` selections; the resulting
+    directory then travels with the repo to the server.
+    """
+    portable_dir = portable_dir.resolve()
+    portable_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer_path = tokenizer_path.resolve()
+    if not tokenizer_path.is_file():
+        raise FileNotFoundError(f"Tokenizer is missing: {tokenizer_path}")
+    tok_dest = portable_dir / "tokenizer.pt"
+    if not tok_dest.exists() or (
+        tok_dest.stat().st_size != tokenizer_path.stat().st_size
+    ):
+        shutil.copyfile(tokenizer_path, tok_dest)
+
+    exp02_sel = PIPE.load_json(exp02_selection_path.resolve())
+    exp03_sel = PIPE.load_json(exp03_selection_path.resolve())
+    exp04a_sel = PIPE.load_json(exp04a_selection_path.resolve())
+    for label, sel, path in (
+        ("exp02", exp02_sel, exp02_selection_path),
+        ("exp03", exp03_sel, exp03_selection_path),
+        ("exp04a", exp04a_sel, exp04a_selection_path),
+    ):
+        if not sel.get("upstream_eligible", False):
+            raise RuntimeError(
+                f"{label} selection is not upstream-eligible: {path}"
+            )
+
+    tok_meta = tokenizer_metadata(tok_dest)
+    selected = exp03_sel.get("selected", {})
+    architecture = {
+        field: selected[field]
+        for field in _PORTABLE_ARCH_FIELDS
+        if field in selected
+    }
+    missing = sorted(set(_PORTABLE_ARCH_FIELDS) - set(architecture))
+    if missing:
+        raise RuntimeError(
+            f"Exp 03 selection lacks architecture fields: {missing}"
+        )
+
+    manifest = {
+        "schema": 1,
+        "created_at_utc": utc_now(),
+        "description": (
+            "Portable upstream bundle for Exp 04 server runs. Removes the "
+            "input dependency on server_runs/ for the tokenizer, the Exp 03 "
+            "architecture, and the Exp 04-A optimizer selection. Study output "
+            "still honours KRONOS_WEIGHTS_ROOT/KRONOS_RESULTS_ROOT."
+        ),
+        "tokenizer": {
+            "relative_path": "tokenizer.pt",
+            "sha256": tok_meta["sha256"],
+            "bits_l1": tok_meta["bits_l1"],
+            "bits_l2": tok_meta["bits_l2"],
+            "embedding_dim": tok_meta["embedding_dim"],
+            "hidden_dim": tok_meta["hidden_dim"],
+        },
+        "architecture": architecture,
+        "exp02_selection": exp02_sel,
+        "exp03_selection": exp03_sel,
+        "exp04a_selection": exp04a_sel,
+    }
+    atomic_write_json(PORTABLE_MANIFEST, manifest)
+    return PORTABLE_MANIFEST
+
+
+def load_portable_assets(
+    portable_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Resolve tokenizer/architecture/04-A selection from the portable bundle.
+
+    Returns the same shapes the non-portable path produces
+    (``resolve_tokenizer`` / ``resolve_architecture`` /
+    ``load_required_selections``), so callers can branch without touching the
+    rest of the pipeline.
+    """
+    base = (portable_dir or PORTABLE_DIR).resolve()
+    manifest_path = base / "upstream.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Portable manifest is missing: {manifest_path}. "
+            "Run write_portable_bundle on a workstation that has server_runs/, "
+            "or pass --portable_dir pointing at an existing bundle."
+        )
+    manifest = PIPE.load_json(manifest_path)
+    schema = manifest.get("schema", 1)
+    if schema != 1:
+        raise RuntimeError(
+            f"Unsupported portable manifest schema {schema} at {manifest_path}"
+        )
+
+    tok_rel = manifest["tokenizer"]["relative_path"]
+    tok_path = (base / tok_rel).resolve()
+    tokenizer = tokenizer_metadata(tok_path)
+    tokenizer.update(
+        {
+            "source": "portable_bundle",
+            "portable_dir": str(base),
+            "portable_manifest_path": str(manifest_path),
+            "portable_manifest_sha256": PIPE.file_sha256(manifest_path),
+            "bundled_selection": manifest.get("exp02_selection"),
+        }
+    )
+
+    architecture = dict(manifest["architecture"])
+    architecture.update(
+        {
+            "source": "portable_bundle",
+            "portable_dir": str(base),
+            "portable_manifest_path": str(manifest_path),
+            "bundled_selection": manifest.get("exp03_selection"),
+        }
+    )
+
+    upstream: dict[str, Any] = {}
+    for name, expected in (("exp04a_optimizer", "muon"),):
+        sel = manifest.get("exp04a_selection")
+        if sel is None:
+            raise RuntimeError(
+                f"Portable manifest lacks the {name} selection"
+            )
+        if not sel.get("upstream_eligible", False):
+            raise RuntimeError(
+                f"Portable {name} selection is not upstream-eligible"
+            )
+        actual = (
+            sel.get("selected", {}).get("arm")
+            or sel.get("selected", {}).get("config")
+        )
+        if actual != expected:
+            raise RuntimeError(
+                f"Portable {name} selected {actual!r}; "
+                f"this preregistration expects {expected!r}"
+            )
+        upstream[name] = {
+            "path": str(manifest_path),
+            "sha256": PIPE.file_sha256(manifest_path),
+            "selection": sel,
+            "source": "portable_bundle",
+        }
+
     return {
-        "directory": directory,
-        "override": directory / "override.json",
-        "run": directory / "run.json",
-        "model": directory / "model.pt",
-        "model_resume": directory / "model.pt.ckpt",
-        "checkpoint_index": directory / "model_checkpoints.json",
-        "trajectory": directory / "epoch_trajectory",
-        "logs": directory / "logs",
-        "gpt_log": directory / "logs" / "gpt.log",
-        "trajectory_log": directory / "logs" / "trajectory.log",
+        "tokenizer": tokenizer,
+        "architecture": architecture,
+        "upstream_selections": upstream,
+    }
+
+
+def arm_paths(
+    results_root: Path,
+    name: str,
+    weights_root: Path | None = None,
+) -> dict[str, Path]:
+    if weights_root is None:
+        manifest_path = results_root / "study_manifest.json"
+        if manifest_path.is_file():
+            manifest = PIPE.load_json(manifest_path)
+            raw = manifest.get("artifact_layout", {}).get("weights_root")
+            weights_root = Path(raw) if raw else results_root
+        else:
+            weights_root = results_root
+    results = results_root / "arms" / name
+    weights = weights_root / "arms" / name
+    return {
+        "directory": results,
+        "weights_directory": weights,
+        "override": results / "override.json",
+        "run": results / "run.json",
+        "model": weights / "model.pt",
+        "model_resume": weights / "model.pt.ckpt",
+        "checkpoint_index": results / "model_checkpoints.json",
+        "trajectory": results / "epoch_trajectory",
+        "logs": results / "logs",
+        "gpt_log": results / "logs" / "gpt.log",
+        "trajectory_log": results / "logs" / "trajectory.log",
     }
 
 
@@ -341,12 +591,14 @@ def build_settings(
             "holdout_offset": HOLDOUT_OFFSET,
             "holdout_used": False,
             "selection_policy": (
-                "No weighted score. For each arm, scan all consecutive 5-epoch "
-                "windows after maturity onset, restrict to the 1%-of-best "
-                "validation-loss basin when possible, and choose "
-                "lexicographically by health count, DA, RankIC, MAPE, "
-                "AmpRatio error, collapse, then codebook balance. Quality, calibration, "
-                "and target-relative codebook metrics remain separately visible."
+                "No weighted score. Each arm is summarized over its full epoch "
+                "trajectory as a single window. Primary ranking is by target-relative "
+                "coarse codebook balance (median, p10), token support F1, token JSD, "
+                "effective token alignment, collapse, and unique tokens. Downstream "
+                "DA/RankIC/MAPE/AmpRatio serve only as guardrails (must not regress "
+                "beyond max(practical floor, 2x baseline within-window SD) vs the "
+                "reference arm). Paired moving-block bootstrap diagnostics are "
+                "reported separately and do not affect ranking."
             ),
         },
         "smoke": smoke,
@@ -355,6 +607,7 @@ def build_settings(
 
 def source_hashes(wrapper_path: Path) -> dict[str, str]:
     paths = (
+        ROOT / "experiment_io.py",
         ROOT / "config.py",
         ROOT / "data_processor.py",
         ROOT / "training_utils.py",
@@ -375,9 +628,10 @@ def source_hashes(wrapper_path: Path) -> dict[str, str]:
 
 
 def prepare_manifest(
-    output_root: Path,
+    results_root: Path,
     settings: dict[str, Any],
     wrapper_path: Path,
+    layout: StudyLayout,
 ) -> dict[str, Any]:
     implementation = source_hashes(wrapper_path)
     dataset = PIPE.dataset_signature()
@@ -388,7 +642,7 @@ def prepare_manifest(
             "dataset": dataset,
         }
     )
-    path = output_root / "study_manifest.json"
+    path = results_root / "study_manifest.json"
     if path.exists():
         payload = PIPE.load_json(path)
         if payload.get("study_fingerprint") != fingerprint:
@@ -408,6 +662,8 @@ def prepare_manifest(
         "settings": settings,
         "implementation_sha256": implementation,
         "dataset": dataset,
+        "artifact_layout": layout.metadata(),
+        "runtime_environment": runtime_environment(ROOT),
     }
     atomic_write_json(path, payload)
     return payload
@@ -515,6 +771,8 @@ def build_train_command(
         "--early_stop_patience",
         "0",
         "--history_per_epoch",
+        "--metrics_dir",
+        str(paths["directory"]),
         "--constant_accumulation",
         "--controlled_loader_seed",
         str(gpt["controlled_loader_seed"]),
@@ -561,13 +819,16 @@ def update_arm_run(
 
 
 def run_one_arm(
-    output_root: Path,
+    layout: StudyLayout,
     shared_cache_root: Path,
     settings: dict[str, Any],
     arm: dict[str, Any],
     fixed_recipe: dict[str, Any],
 ) -> None:
-    paths = arm_paths(output_root, arm["name"])
+    paths = arm_paths(
+        layout.results_root, arm["name"], layout.weights_root
+    )
+    paths["weights_directory"].mkdir(parents=True, exist_ok=True)
     paths["logs"].mkdir(parents=True, exist_ok=True)
     recipe = merged_recipe(fixed_recipe, arm)
     write_override(paths["override"], shared_cache_root, settings, recipe)
@@ -725,104 +986,70 @@ def _median_rows(rows: list[dict[str, Any]], field: str) -> float:
     return (values[middle - 1] + values[middle]) / 2.0
 
 
+def _std_rows(rows: list[dict[str, Any]], field: str) -> float:
+    """Sample standard deviation (ddof=1) of a field across the window.
+
+    Used for guardrail tolerance: max(practical floor, 2x reference within-window
+    SD). Returns 0.0 when fewer than two finite values are present.
+    """
+    values = [
+        float(row[field])
+        for row in rows
+        if row.get(field) is not None
+    ]
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / (
+        len(values) - 1
+    )
+    return math.sqrt(variance)
+
+
 def select_mature_window(
     rows: list[dict[str, Any]],
-    window_size: int = 5,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Select a stable mature window without defaulting to final epochs.
+    """Summarize an arm over its full epoch trajectory as a single window.
 
-    Validation loss defines maturity/overfit eligibility but is not the
-    downstream objective.  Within the near-best-loss basin, the ordering is
-    lexicographic and leaves every component visible.
+    Mirrors Exp 03's all-epoch ``eligible_windows`` policy: every epoch 1..N
+    enters the summary as one window. The maturity onset and 1%-of-best
+    validation-loss basin are still recorded for audit, but no longer restrict
+    which epochs enter the ranking. Token-balance metrics dominate downstream
+    ordering; the previous lexicographic health/DA/RankIC/MAPE scan is removed.
     """
     if not rows:
         raise ValueError("No epoch rows")
     ordered = sorted(rows, key=lambda row: int(row["epoch"]))
-    effective_size = min(window_size, len(ordered))
     minimum_loss = min(float(row["val_loss"]) for row in ordered)
-    loss_ceiling = minimum_loss * 1.01
-    maturity_onset = next(
+    loss_ceiling = minimum_loss * LOSS_BASIN_RATIO
+    maturity_onset = min(
         int(row["epoch"])
         for row in ordered
         if float(row["val_loss"]) <= loss_ceiling
     )
-    candidates: list[list[dict[str, Any]]] = []
-    for start in range(0, len(ordered) - effective_size + 1):
-        candidate = ordered[start : start + effective_size]
-        epochs = [int(row["epoch"]) for row in candidate]
-        if epochs[0] < maturity_onset:
-            continue
-        if epochs != list(range(epochs[0], epochs[0] + effective_size)):
-            continue
-        candidates.append(candidate)
-    if not candidates:
-        candidates = [ordered[-effective_size:]]
-    in_basin = [
-        candidate
-        for candidate in candidates
-        if all(float(row["val_loss"]) <= loss_ceiling for row in candidate)
-    ]
-    pool = in_basin or candidates
-
-    def optional_median(
-        candidate: list[dict[str, Any]], field: str, default: float
-    ) -> float:
-        values = [
-            float(row[field])
-            for row in candidate
-            if row.get(field) is not None
-        ]
-        if not values:
-            return default
-        values.sort()
-        middle = len(values) // 2
-        if len(values) % 2:
-            return values[middle]
-        return (values[middle - 1] + values[middle]) / 2.0
-
-    def ranking(candidate: list[dict[str, Any]]) -> tuple[Any, ...]:
-        amp = optional_median(candidate, "avg_ampratio", 0.0)
-        amp_error = abs(math.log(amp)) if amp > 0 else math.inf
-        return (
-            sum(bool(row.get("healthy")) for row in candidate),
-            optional_median(candidate, "avg_da_per_date", -math.inf),
-            optional_median(candidate, "avg_daily_rank_ic", -math.inf),
-            -optional_median(candidate, "avg_mape", math.inf),
-            -amp_error,
-            -optional_median(
-                candidate, "p90_daily_collapse_rate", math.inf
-            ),
-            optional_median(
-                candidate,
-                "median_daily_codebook_balance_score",
-                -math.inf,
-            ),
-            -int(candidate[-1]["epoch"]),
-        )
-
-    selected = max(pool, key=ranking)
     metadata = {
         "window_epochs": [
-            int(selected[0]["epoch"]), int(selected[-1]["epoch"])
+            int(ordered[0]["epoch"]), int(ordered[-1]["epoch"])
         ],
-        "window_size": len(selected),
+        "window_size": len(ordered),
         "maturity_onset_epoch": maturity_onset,
+        "loss_basin_threshold": loss_ceiling,
         "minimum_val_loss": minimum_loss,
         "near_best_loss_ceiling": loss_ceiling,
-        "used_near_best_loss_basin": bool(in_basin),
-        "candidate_windows": len(pool),
+        "used_near_best_loss_basin": False,
+        "candidate_windows": 1,
+        "window_policy": "all_epochs",
         "selection_order": [
-            "more health-passing epochs",
-            "higher median daily DA",
-            "higher median daily RankIC",
-            "lower median MAPE",
-            "lower median AmpRatio log-error",
-            "lower median P90 daily collapse",
-            "higher median target-relative codebook balance",
-            "earlier window on exact ties",
+            "higher median target-relative coarse codebook balance",
+            "higher p10 target-relative coarse codebook balance",
+            "higher median coarse token support F1",
+            "lower median coarse token JSD",
+            "higher median effective token alignment",
+            "lower median daily collapse rate",
+            "higher median daily unique tokens",
         ],
     }
-    return selected, metadata
+    return ordered, metadata
 
 
 def arm_envelopes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -859,70 +1086,227 @@ def arm_envelopes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 return values[middle]
             return (values[middle - 1] + values[middle]) / 2.0
 
-        output.append(
-            {
-                "arm": arm,
-                "description": group[0]["arm_description"],
-                "recipe": group[0]["recipe"],
-                "n_epochs": len(group),
-                "healthy_epochs": sum(bool(row["healthy"]) for row in group),
-                "late_healthy_epochs": sum(
-                    bool(row["healthy"]) for row in mature
-                ),
-                "mature_window_epochs": mature_metadata["window_epochs"],
-                "maturity_onset_epoch": mature_metadata[
-                    "maturity_onset_epoch"
-                ],
-                "minimum_val_loss": mature_metadata["minimum_val_loss"],
-                "near_best_loss_ceiling": mature_metadata[
-                    "near_best_loss_ceiling"
-                ],
-                "best_da": best_da["avg_da_per_date"],
-                "best_da_epoch": best_da["epoch"],
-                "best_rankic": best_rank["avg_daily_rank_ic"],
-                "best_rankic_epoch": best_rank["epoch"],
-                "best_mape": best_mape["avg_mape"],
-                "best_mape_epoch": best_mape["epoch"],
-                "best_p90_collapse": best_collapse[
-                    "p90_daily_collapse_rate"
-                ],
-                "best_p90_collapse_epoch": best_collapse["epoch"],
-                "best_ampratio": best_amp["avg_ampratio"],
-                "best_ampratio_epoch": best_amp["epoch"],
-                "late_median_val_loss": median("val_loss"),
-                "late_median_da": median("avg_da_per_date"),
-                "late_median_rankic": median("avg_daily_rank_ic"),
-                "late_median_mape": median("avg_mape"),
-                "late_median_p90_collapse": median(
-                    "p90_daily_collapse_rate"
-                ),
-                "late_median_worst_collapse": median(
-                    "worst_daily_collapse_rate"
-                ),
-                "late_median_unique": median("median_daily_unique_tokens"),
-                "late_median_min_unique": median("min_daily_unique_tokens"),
-                "late_median_ampratio": median("avg_ampratio"),
-                "late_median_ampratio_log_error": median(
-                    "ampratio_log_error"
-                ),
-                "mature_median_codebook_balance": optional_median(
-                    "median_daily_codebook_balance_score"
-                ),
-                "mature_p10_codebook_balance": optional_median(
-                    "p10_daily_codebook_balance_score"
-                ),
-                "mature_median_target_support_recall": optional_median(
-                    "median_daily_target_support_recall"
-                ),
-                "mature_median_effective_token_alignment": optional_median(
-                    "median_daily_effective_token_alignment"
-                ),
-                "mature_median_token_jsd": optional_median(
-                    "median_daily_token_jsd"
-                ),
-            }
-        )
+        envelope: dict[str, Any] = {
+            "arm": arm,
+            "description": group[0]["arm_description"],
+            "recipe": group[0]["recipe"],
+            "n_epochs": len(group),
+            "healthy_epochs": sum(bool(row["healthy"]) for row in group),
+            "late_healthy_epochs": sum(
+                bool(row["healthy"]) for row in mature
+            ),
+            "mature_window_epochs": mature_metadata["window_epochs"],
+            "window_policy": mature_metadata["window_policy"],
+            "maturity_onset_epoch": mature_metadata[
+                "maturity_onset_epoch"
+            ],
+            "loss_basin_threshold": mature_metadata[
+                "loss_basin_threshold"
+            ],
+            "minimum_val_loss": mature_metadata["minimum_val_loss"],
+            "near_best_loss_ceiling": mature_metadata[
+                "near_best_loss_ceiling"
+            ],
+            "best_da": best_da["avg_da_per_date"],
+            "best_da_epoch": best_da["epoch"],
+            "best_rankic": best_rank["avg_daily_rank_ic"],
+            "best_rankic_epoch": best_rank["epoch"],
+            "best_mape": best_mape["avg_mape"],
+            "best_mape_epoch": best_mape["epoch"],
+            "best_p90_collapse": best_collapse[
+                "p90_daily_collapse_rate"
+            ],
+            "best_p90_collapse_epoch": best_collapse["epoch"],
+            "best_ampratio": best_amp["avg_ampratio"],
+            "best_ampratio_epoch": best_amp["epoch"],
+            "late_median_val_loss": median("val_loss"),
+            "late_median_da": median("avg_da_per_date"),
+            "late_median_rankic": median("avg_daily_rank_ic"),
+            "late_median_mape": median("avg_mape"),
+            "late_median_p90_collapse": median(
+                "p90_daily_collapse_rate"
+            ),
+            "late_median_worst_collapse": median(
+                "worst_daily_collapse_rate"
+            ),
+            "late_median_collapse_rate": median(
+                "median_daily_collapse_rate"
+            ),
+            "late_median_unique": median("median_daily_unique_tokens"),
+            "late_median_min_unique": median("min_daily_unique_tokens"),
+            "late_median_ampratio": median("avg_ampratio"),
+            "late_median_ampratio_log_error": median(
+                "ampratio_log_error"
+            ),
+            # Coarse target-relative token layer (primary ranking).
+            "mature_median_codebook_balance": optional_median(
+                "median_daily_codebook_balance_score"
+            ),
+            "mature_p10_codebook_balance": optional_median(
+                "p10_daily_codebook_balance_score"
+            ),
+            "mature_median_token_support_f1": optional_median(
+                "median_daily_token_support_f1"
+            ),
+            "mature_median_token_jsd": optional_median(
+                "median_daily_token_jsd"
+            ),
+            "mature_median_effective_token_alignment": optional_median(
+                "median_daily_effective_token_alignment"
+            ),
+            "mature_median_collapse_alignment": optional_median(
+                "median_daily_collapse_alignment"
+            ),
+            "mature_median_distribution_alignment": optional_median(
+                "median_daily_distribution_alignment"
+            ),
+            "mature_median_target_support_recall": optional_median(
+                "median_daily_target_support_recall"
+            ),
+            "mature_median_prediction_support_precision": optional_median(
+                "median_daily_prediction_support_precision"
+            ),
+            "mature_median_coarse_token_accuracy": optional_median(
+                "median_daily_coarse_token_accuracy"
+            ),
+            # Fine target-relative token layer (diagnostic).
+            "mature_median_fine_codebook_balance": optional_median(
+                "median_daily_fine_codebook_balance_score"
+            ),
+            "mature_median_fine_token_support_f1": optional_median(
+                "median_daily_fine_token_support_f1"
+            ),
+            "mature_median_fine_token_jsd": optional_median(
+                "median_daily_fine_token_jsd"
+            ),
+            "mature_median_fine_effective_token_alignment": optional_median(
+                "median_daily_fine_effective_token_alignment"
+            ),
+            "mature_median_fine_collapse_alignment": optional_median(
+                "median_daily_fine_collapse_alignment"
+            ),
+            "mature_median_fine_n_unique_tokens": optional_median(
+                "median_daily_fine_n_unique_tokens"
+            ),
+            # Joint target-relative token layer (diagnostic).
+            "mature_median_joint_codebook_balance": optional_median(
+                "median_daily_joint_codebook_balance_score"
+            ),
+            "mature_median_joint_token_support_f1": optional_median(
+                "median_daily_joint_token_support_f1"
+            ),
+            "mature_median_joint_token_jsd": optional_median(
+                "median_daily_joint_token_jsd"
+            ),
+            "mature_median_joint_effective_token_alignment": optional_median(
+                "median_daily_joint_effective_token_alignment"
+            ),
+            "mature_median_joint_collapse_alignment": optional_median(
+                "median_daily_joint_collapse_alignment"
+            ),
+            "mature_median_joint_n_unique_tokens": optional_median(
+                "median_daily_joint_n_unique_tokens"
+            ),
+        }
+        # Within-window standard deviations for the downstream guardrails.
+        # Tolerance = max(practical floor, 2x reference-arm SD).
+        for field in GUARDRAILS:
+            envelope[f"window_std_{field}"] = _std_rows(mature, field)
+        output.append(envelope)
     return output
+
+
+def _envelope_value(row: dict[str, Any], field: str, default: float) -> float:
+    """Robust float accessor for primary_key over envelope dicts."""
+    value = row.get(field)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def primary_key(row: dict[str, Any]) -> tuple[float, ...]:
+    """Token-balance-dominated ranking key, mirroring Exp 03.
+
+    Downstream DA/RankIC/MAPE/AmpRatio are deliberately absent: they are
+    guardrails, not ranking signals. Lower-is-better fields are negated so
+    that ``max`` / ``reverse=True`` always means "better".
+    """
+    return (
+        _envelope_value(row, "mature_median_codebook_balance", -math.inf),
+        _envelope_value(row, "mature_p10_codebook_balance", -math.inf),
+        _envelope_value(
+            row, "mature_median_token_support_f1", -math.inf
+        ),
+        -_envelope_value(row, "mature_median_token_jsd", math.inf),
+        _envelope_value(
+            row, "mature_median_effective_token_alignment", -math.inf
+        ),
+        -_envelope_value(row, "late_median_collapse_rate", math.inf),
+        _envelope_value(row, "late_median_unique", -math.inf),
+    )
+
+
+def guardrail_reference(
+    baseline_envelope: dict[str, Any],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Reference values and tolerances drawn from the reference arm.
+
+    The reference arm is the first arm (adamw in Exp 04-A), analogous to Exp
+    03's ``deep`` config. Tolerance is max(practical floor, 2x the reference
+    arm's within-window standard deviation).
+    """
+    reference = {
+        field: _envelope_value(
+            baseline_envelope, spec["envelope_field"], 0.0
+        )
+        for field, spec in GUARDRAILS.items()
+    }
+    tolerances = {
+        field: max(
+            float(spec["floor"]),
+            2.0
+            * _envelope_value(
+                baseline_envelope, f"window_std_{field}", 0.0
+            ),
+        )
+        for field, spec in GUARDRAILS.items()
+    }
+    return reference, tolerances
+
+
+def apply_guardrails(
+    envelope: dict[str, Any],
+    reference: dict[str, float],
+    tolerances: dict[str, float],
+) -> dict[str, Any]:
+    """Annotate an envelope with per-guardrail delta/pass/fail status.
+
+    Guardrails never reorder arms; they only flag whether an arm is allowed to
+    lead. Returns a copy of ``envelope`` with ``guardrail_delta_<field>``,
+    ``guardrail_tolerance_<field>``, ``guardrail_pass``, and
+    ``guardrail_failures`` added.
+    """
+    result = dict(envelope)
+    failures: list[str] = []
+    for field, spec in GUARDRAILS.items():
+        value = _envelope_value(result, spec["envelope_field"], 0.0)
+        baseline = reference[field]
+        tolerance = tolerances[field]
+        delta = value - baseline
+        result[f"guardrail_delta_{field}"] = delta
+        result[f"guardrail_tolerance_{field}"] = tolerance
+        if spec["direction"] == "higher":
+            failed = value < baseline - tolerance
+        else:
+            failed = value > baseline + tolerance
+        if failed:
+            failures.append(str(spec["label"]))
+    result["guardrail_pass"] = not failures
+    result["guardrail_failures"] = ",".join(failures)
+    return result
 
 
 DAILY_DIAGNOSTIC_FIELDS = {
@@ -962,21 +1346,9 @@ def _mature_daily_values(
         epoch_paths.append(path)
     payloads = [PIPE.load_json(path) for path in sorted(epoch_paths)]
     payloads.sort(key=lambda payload: int(payload["epoch"]))
-    selection_rows = []
-    for payload in payloads:
-        row = {
-            "epoch": payload["epoch"],
-            "val_loss": payload["training"]["val_loss"],
-            **payload["aggregate"],
-        }
-        selection_rows.append(row)
-    _, mature_metadata = select_mature_window(selection_rows)
-    mature_start, mature_end = mature_metadata["window_epochs"]
-    payloads = [
-        payload
-        for payload in payloads
-        if mature_start <= int(payload["epoch"]) <= mature_end
-    ]
+    # All-epoch policy: the paired bootstrap now consumes per-date records from
+    # every epoch (select_mature_window returns the full trajectory), not just
+    # a narrow 5-epoch mature plateau.
     collected: dict[str, dict[int, dict[str, list[float]]]] = {
         name: {} for name in DAILY_DIAGNOSTIC_FIELDS
     }
@@ -1010,7 +1382,7 @@ def _mature_daily_values(
     }
 
 
-def paired_mature_diagnostics(
+def paired_epoch_diagnostics(
     output_root: Path,
     arms: list[str],
     selected_arm: str,
@@ -1018,7 +1390,12 @@ def paired_mature_diagnostics(
     replicates: int = 10_000,
     block_length: int = 5,
 ) -> list[dict[str, Any]]:
-    """Paired date diagnostics; not an estimate of multi-seed uncertainty."""
+    """All-epoch paired diagnostics; not an estimate of multi-seed uncertainty.
+
+    Per-date means are pooled across the full epoch trajectory (one window per
+    arm) and a circular moving-block bootstrap runs inside each validation
+    window. Diagnostic only; it never affects ranking or selection.
+    """
     if len(arms) < 2:
         return []
     by_arm = {
@@ -1044,27 +1421,28 @@ def paired_mature_diagnostics(
                         selected_dates[date] - comparator_dates[date]
                         for date in common_dates
                     ]
+            # Pool all per-date differences into a single time series and
+            # resample with circular moving blocks. Resampling within each
+            # offset separately degenerates when an offset has only one date
+            # (rng.randrange(1) is always 0), producing zero-variance CIs.
             flat = [value for values in differences.values() for value in values]
             if not flat:
                 continue
-            point = sum(flat) / len(flat)
+            n_flat = len(flat)
+            point = sum(flat) / n_flat
             rng = random.Random(
                 SEED * 10_000 + comparator_index * 100 + metric_index
             )
             bootstrap: list[float] = []
             for _ in range(replicates):
                 sampled: list[float] = []
-                for values in differences.values():
-                    n_values = len(values)
-                    window_sample: list[float] = []
-                    while len(window_sample) < n_values:
-                        start = rng.randrange(n_values)
-                        window_sample.extend(
-                            values[(start + step) % n_values]
-                            for step in range(block_length)
-                        )
-                    sampled.extend(window_sample[:n_values])
-                bootstrap.append(sum(sampled) / len(sampled))
+                while len(sampled) < n_flat:
+                    start = rng.randrange(n_flat)
+                    sampled.extend(
+                        flat[(start + step) % n_flat]
+                        for step in range(block_length)
+                    )
+                bootstrap.append(sum(sampled[:n_flat]) / n_flat)
             output.append(
                 {
                     "selected_arm": selected_arm,
@@ -1107,9 +1485,35 @@ def make_comparison_plots(
             ("median_daily_unique_tokens", "Median daily Unique", 1.0),
             ("avg_ampratio", "AmpRatio", 1.0),
         ),
+        "token_quality_trajectories.png": (
+            (
+                "median_daily_codebook_balance_score",
+                "Median daily codebook balance",
+                1.0,
+            ),
+            (
+                "median_daily_token_support_f1",
+                "Median daily token support F1",
+                1.0,
+            ),
+            ("median_daily_token_jsd", "Median daily token JSD", 1.0),
+            (
+                "median_daily_effective_token_alignment",
+                "Median daily effective token alignment",
+                1.0,
+            ),
+        ),
     }
     for filename, metrics in definitions.items():
-        figure, axes = plt.subplots(3, 1, figsize=(11, 12), sharex=True)
+        n_panels = len(metrics)
+        figure, axes = plt.subplots(
+            n_panels,
+            1,
+            figsize=(11, 4 * n_panels),
+            sharex=True,
+        )
+        if n_panels == 1:
+            axes = (axes,)
         for arm in arms:
             group = sorted(
                 [row for row in rows if row["arm"] == arm],
@@ -1140,16 +1544,30 @@ def analyze(
     *,
     selected_arm: str,
     selection_rationale: str,
+    record_selection: bool,
 ) -> dict[str, Any]:
     if not rows:
         raise RuntimeError("No completed epoch rows to analyze")
     summary = arm_envelopes(rows)
+    # Downstream guardrails: reference arm = first arm (adamw in Exp 04-A),
+    # analogous to Exp 03's ``deep`` config. Guardrails gate leadership but
+    # never reorder arms.
+    baseline_envelope = summary[0]
+    reference, tolerances = guardrail_reference(baseline_envelope)
+    summary = [
+        apply_guardrails(envelope, reference, tolerances)
+        for envelope in summary
+    ]
+    # Primary ranking is purely target-relative token balance.
+    ranked = sorted(summary, key=primary_key, reverse=True)
+    for rank, envelope in enumerate(ranked, start=1):
+        envelope["primary_rank"] = rank
     by_arm = {row["arm"]: row for row in summary}
     if selected_arm not in by_arm:
         raise ValueError(
             f"Selected arm {selected_arm!r} is absent; available={sorted(by_arm)}"
         )
-    paired = paired_mature_diagnostics(
+    paired = paired_epoch_diagnostics(
         output_root,
         [row["arm"] for row in summary],
         selected_arm,
@@ -1161,12 +1579,22 @@ def analyze(
         "n_checkpoints": len(rows),
         "n_healthy": sum(bool(row["healthy"]) for row in rows),
         "arm_envelopes": summary,
-        "paired_mature_diagnostics": paired,
+        "primary_rank_order": [row["arm"] for row in ranked],
+        "guardrail_reference": {
+            "reference_arm": baseline_envelope["arm"],
+            "values": reference,
+            "tolerances": tolerances,
+            "rule": (
+                "adverse delta larger than max(practical floor, 2x "
+                "reference-arm within-window epoch SD)"
+            ),
+        },
+        "paired_epoch_diagnostics": paired,
         "paired_diagnostic_scope": (
-            "Selected stable 5-epoch mature-window per-date means with a "
-            "5-day circular moving-block bootstrap inside each validation "
-            "window. Diagnostic only; it does not capture training-seed "
-            "uncertainty."
+            "All-epoch per-date means pooled across each arm's full "
+            "trajectory, with a 5-day circular moving-block bootstrap "
+            "inside each validation window. Diagnostic only; it does not "
+            "capture training-seed uncertainty and does not affect ranking."
         ),
         "selection_policy": settings["evaluation"]["selection_policy"],
     }
@@ -1179,15 +1607,20 @@ def analyze(
         },
         "selection_rule": settings["evaluation"]["selection_policy"],
         "rationale": selection_rationale,
-        "paired_mature_diagnostics": paired,
+        "paired_epoch_diagnostics": paired,
         "upstream_eligible": (
-            not settings.get("smoke", False)
+            record_selection
+            and not settings.get("smoke", False)
             and not settings.get("subset_run", False)
         ),
+        "human_review_recorded": record_selection,
         "holdout_used": False,
         "study_manifest": str((output_root / "study_manifest.json").resolve()),
     }
-    existing_selection_path = output_root / "selection.json"
+    selection_filename = (
+        "selection.json" if record_selection else "selection_proposal.json"
+    )
+    existing_selection_path = output_root / selection_filename
     if existing_selection_path.is_file():
         existing_selection = PIPE.load_json(existing_selection_path)
         if (
@@ -1199,9 +1632,12 @@ def analyze(
                 "created_at_utc", selection["created_at_utc"]
             )
     atomic_write_json(output_root / "analysis.json", analysis)
-    atomic_write_json(output_root / "selection.json", selection)
+    atomic_write_json(output_root / selection_filename, selection)
     write_csv(output_root / "arm_envelopes.csv", summary)
     make_comparison_plots(output_root, rows, settings["experiment_label"])
+
+    def fmt_opt(value: float | None, spec: str) -> str:
+        return "n/a" if value is None else format(value, spec)
 
     lines = [
         f"# {settings['experiment_label']}",
@@ -1216,13 +1652,21 @@ def analyze(
         f"{settings['tokenizer_dependency']['bits_l2']} bits**",
         f"- Evaluated checkpoints: **{len(rows)}**",
         f"- Health-passing checkpoints: **{analysis['n_healthy']}**",
-        f"- Working selection: **{selected_arm}**",
+        f"- Reference (guardrail) arm: **{baseline_envelope['arm']}**",
+        f"- Primary rank order: **{', '.join(analysis['primary_rank_order'])}**",
+        f"- {'Reviewed' if record_selection else 'Provisional'} selection: "
+        f"**{selected_arm}**",
         "",
-        "## Selected mature 5-epoch envelopes",
+        "## Full-trajectory envelopes",
+        "",
+        "Each arm is summarized over its full epoch trajectory as a single "
+        "window (policy `all_epochs`). Primary ranking is target-relative "
+        "token balance; downstream DA/RankIC/MAPE/AmpRatio are guardrails only.",
         "",
         "| Arm | Window | Best DA | Mature loss | Mature DA | Mature RankIC | "
-        "Mature MAPE | P90 collapse | Unique | Amp | CB balance |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "Mature MAPE | P90 collapse | CB balance | Support F1 | Token JSD | "
+        "Eff. align | Collapse | Unique | Amp |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summary:
         lines.append(
@@ -1234,26 +1678,34 @@ def analyze(
             f"{row['late_median_rankic']:.4f} | "
             f"{row['late_median_mape']:.3f} | "
             f"{row['late_median_p90_collapse'] * 100:.1f}% | "
+            f"{fmt_opt(row['mature_median_codebook_balance'], '.3f')} | "
+            f"{fmt_opt(row['mature_median_token_support_f1'], '.3f')} | "
+            f"{fmt_opt(row['mature_median_token_jsd'], '.4f')} | "
+            f"{fmt_opt(row['mature_median_effective_token_alignment'], '.3f')} | "
+            f"{row['late_median_collapse_rate'] * 100:.1f}% | "
             f"{row['late_median_unique']:.1f} | "
-            f"{row['late_median_ampratio']:.3f} | "
-            f"{row['mature_median_codebook_balance']:.3f} |"
+            f"{row['late_median_ampratio']:.3f} |"
         )
     lines.extend(
         [
             "",
-            "No weighted score is used. The working selection is published for "
-            "the downstream experiment dependency; inspect both metric groups "
-            "and the health-gate count before treating it as a production model.",
+            "Selection order: coarse codebook balance (median, p10) → token "
+            "support F1 → token JSD (lower) → effective token alignment → "
+            "collapse rate (lower) → unique tokens. DA/RankIC/MAPE/AmpRatio "
+            "only gate leadership via max(practical floor, 2x reference-arm "
+            "within-window SD). A proposal is not eligible downstream until "
+            "explicitly recorded after review.",
             "",
         ]
     )
     if paired:
         lines.extend(
             [
-                "## Paired selected-mature-window diagnostics",
+                "## Paired all-epoch diagnostics",
                 "",
-                f"Differences are {selected_arm} minus comparator. Intervals use "
-                "a 5-day circular moving-block bootstrap within each validation "
+                f"Differences are {selected_arm} minus comparator. Per-date "
+                "means are pooled across each arm's full epoch trajectory, with "
+                "a 5-day circular moving-block bootstrap inside each validation "
                 "window; they do not measure training-seed uncertainty.",
                 "",
                 "| Comparator | Metric | Difference | 95% interval | Better when |",
@@ -1273,10 +1725,19 @@ def analyze(
 
 
 def build_parser(
-    *, default_output_root: Path, arm_names: list[str], default_epochs: int
+    *,
+    default_weights_root: Path,
+    default_results_root: Path,
+    arm_names: list[str],
+    default_epochs: int,
 ) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output_root", type=Path, default=default_output_root)
+    parser.add_argument(
+        "--weights_root", type=Path, default=default_weights_root
+    )
+    parser.add_argument(
+        "--results_root", type=Path, default=default_results_root
+    )
     parser.add_argument(
         "--arms",
         default="",
@@ -1285,13 +1746,13 @@ def build_parser(
     parser.add_argument(
         "--tokenizer",
         default="",
-        help="Default reads Exp 02 run_seed42 selection.json",
+        help="Default reads the reviewed Exp 02 results selection.json",
     )
     parser.add_argument(
         "--architecture_selection",
         type=Path,
-        default=EXP03_SUP_SELECTION,
-        help="Exp 03-Sup selection.json (required before formal Exp 04)",
+        default=EXP03_SELECTION,
+        help="Exp 03 selection.json (required before formal Exp 04)",
     )
     parser.add_argument("--epochs", type=int, default=default_epochs)
     parser.add_argument(
@@ -1299,12 +1760,12 @@ def build_parser(
         type=parse_offsets,
         default=VALIDATION_OFFSETS,
     )
-    parser.add_argument("--eval_days", type=int, default=20)
+    parser.add_argument("--eval_days", type=int, default=EVAL_DAYS)
     parser.add_argument(
         "--batch_tokens",
         type=int,
         default=0,
-        help="0 inherits the Exp 03-Sup architecture setting",
+        help="0 inherits the Exp 03 architecture setting",
     )
     parser.add_argument(
         "--eval_batch_size",
@@ -1314,6 +1775,16 @@ def build_parser(
     )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--analyze_only", action="store_true")
+    parser.add_argument(
+        "--record_selection",
+        action="store_true",
+        help=(
+            "Write downstream-eligible selection.json after human review; "
+            "requires --select_arm and --selection_rationale"
+        ),
+    )
+    parser.add_argument("--select_arm", default="")
+    parser.add_argument("--selection_rationale", default="")
     return parser
 
 
@@ -1337,14 +1808,16 @@ def run_ablation(
     experiment_label: str,
     arm_definitions: list[dict[str, Any]],
     fixed_recipe: dict[str, Any],
-    default_output_root: Path,
+    default_weights_root: Path,
+    default_results_root: Path,
     selected_arm: str,
     selection_rationale: str,
     required_selections: dict[str, tuple[Path, str]] | None = None,
     default_epochs: int = 30,
 ) -> int:
     parser = build_parser(
-        default_output_root=default_output_root,
+        default_weights_root=default_weights_root,
+        default_results_root=default_results_root,
         arm_names=[arm["name"] for arm in arm_definitions],
         default_epochs=default_epochs,
     )
@@ -1358,24 +1831,41 @@ def run_ablation(
         parser.error("batch sizes must be non-negative")
     if any(offset + args.eval_days > HOLDOUT_OFFSET for offset in args.eval_offsets):
         parser.error("evaluation windows may not enter the sealed holdout")
+    if args.record_selection and (
+        not args.select_arm.strip() or not args.selection_rationale.strip()
+    ):
+        parser.error(
+            "--record_selection requires --select_arm and "
+            "--selection_rationale"
+        )
 
     arms = select_arms(args.arms, arm_definitions)
     protocol_arm_names = [arm["name"] for arm in arm_definitions]
     if (
         len(arms) != len(arm_definitions)
         and not args.smoke
-        and args.output_root.resolve() == default_output_root.resolve()
+        and args.results_root.resolve() == default_results_root.resolve()
     ):
         parser.error(
-            "A formal --arms subset must use a separate --output_root; the "
-            "default run_seed42 directory is reserved for the complete arm set"
+            "A formal --arms subset must use separate --weights_root and "
+            "--results_root paths; the defaults are reserved for the complete "
+            "arm set"
+        )
+    requested_selected_arm = args.select_arm.strip() or selected_arm
+    if requested_selected_arm not in {arm["name"] for arm in arms}:
+        parser.error(
+            f"--select_arm {requested_selected_arm!r} is not in the active arms"
         )
     effective_selected_arm = (
-        selected_arm
-        if selected_arm in {arm["name"] for arm in arms}
+        requested_selected_arm
+        if requested_selected_arm in {arm["name"] for arm in arms}
         else arms[0]["name"]
     )
-    effective_rationale = selection_rationale
+    effective_rationale = (
+        args.selection_rationale.strip()
+        if args.record_selection
+        else selection_rationale
+    )
     if effective_selected_arm != selected_arm:
         effective_rationale = (
             f"Subset run excludes preregistered arm {selected_arm!r}; "
@@ -1428,11 +1918,20 @@ def run_ablation(
         temporary_root = Path(
             tempfile.mkdtemp(prefix=f"kronos_{experiment_key}_smoke_")
         ).resolve()
-        output_root = temporary_root
+        layout = StudyLayout.create(
+            temporary_root / "weights", temporary_root / "results"
+        )
     else:
-        output_root = args.output_root.resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
-    shared_cache_root = output_root / "shared"
+        layout = (
+            StudyLayout(
+                args.weights_root.expanduser().resolve(),
+                args.results_root.expanduser().resolve(),
+            )
+            if args.analyze_only
+            else StudyLayout.create(args.weights_root, args.results_root)
+        )
+    output_root = layout.results_root
+    shared_cache_root = layout.weights_root / "shared"
 
     if args.analyze_only:
         manifest_path = output_root / "study_manifest.json"
@@ -1445,17 +1944,18 @@ def run_ablation(
             rows,
             selected_arm=effective_selected_arm,
             selection_rationale=effective_rationale,
+            record_selection=args.record_selection,
         )
         return 0
 
     PIPE.verify_runtime()
     if not smoke:
-        free_gib = shutil.disk_usage(output_root.parent).free / (1024**3)
+        free_gib = shutil.disk_usage(layout.weights_root).free / (1024**3)
         if free_gib < 5:
             raise RuntimeError(
                 f"At least 5 GiB free is required; {free_gib:.1f} GiB remains"
             )
-    prepare_manifest(output_root, settings, wrapper_path)
+    prepare_manifest(output_root, settings, wrapper_path, layout)
     update_manifest(
         output_root,
         status="running",
@@ -1472,7 +1972,7 @@ def run_ablation(
                 flush=True,
             )
             run_one_arm(
-                output_root,
+                layout,
                 shared_cache_root,
                 settings,
                 arm,
@@ -1502,6 +2002,7 @@ def run_ablation(
             rows,
             selected_arm=effective_selected_arm,
             selection_rationale=effective_rationale,
+            record_selection=args.record_selection,
         )
         update_manifest(
             output_root,
@@ -1509,6 +2010,7 @@ def run_ablation(
             analysis_completed_at_utc=utc_now(),
             health_passing_checkpoints=analysis["n_healthy"],
         )
+        write_download_manifest(layout)
         succeeded = True
         print(f"Completed {experiment_label}: {output_root}")
         return 0

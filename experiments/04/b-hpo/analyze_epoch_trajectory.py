@@ -1,4 +1,4 @@
-"""Reproducible, non-composite analysis of an Exp 04-C epoch trajectory."""
+"""Reproducible, non-composite analysis of an Exp 04-B epoch trajectory."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import csv
 import json
 import math
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -15,7 +16,13 @@ import numpy as np
 from scipy.stats import spearmanr
 
 
-DEFAULT_STUDY_ROOT = Path(__file__).resolve().parent / "run_seed42"
+SCRIPT_PATH = Path(__file__).resolve()
+ROOT = SCRIPT_PATH.parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from experiment_io import default_study_roots
+
+_, DEFAULT_STUDY_ROOT = default_study_roots("04b-hpo", seed=42)
 
 
 def parse_args() -> argparse.Namespace:

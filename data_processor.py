@@ -329,9 +329,10 @@ def pack_stocks_v2(stocks, tokenizer, mode="train", cutoff_date=DataConfig.cutof
         rt_list = enc["reg_target"].tolist()
         d_list, m_list, y_list = enc["day"].tolist(), enc["month"].tolist(), enc["year"].tolist()
 
-        # BOS/EOS use 0 as placeholder for fine (never used in loss)
+        # BOS has no fine target. EOS uses the same ignore sentinel as padded
+        # fine targets so valid fine code 0 remains trainable.
         ids = torch.tensor([bos_id] + ids_list + [eos_id], dtype=torch.long)
-        fine = torch.tensor([0] + fine_list + [0], dtype=torch.long)
+        fine = torch.tensor([0] + fine_list + [-100], dtype=torch.long)
         d = torch.tensor([d_list[0]] + d_list + [d_list[-1]], dtype=torch.long)
         m = torch.tensor([m_list[0]] + m_list + [m_list[-1]], dtype=torch.long)
         y = torch.tensor([y_list[0]] + y_list + [y_list[-1]], dtype=torch.long)
@@ -386,7 +387,10 @@ def make_dataloader_v2(sequences, batch_size=1, shuffle=True, num_workers=0):
         return (
             s["input_ids"],
             s["targets"],
-            s.get("fine_targets", torch.zeros_like(s["targets"])),
+            s.get(
+                "fine_targets",
+                torch.full_like(s["targets"], -100),
+            ),
             s["time_ids"],
             s["position_ids"],
             None,  # mask: let SDPA handle causal attention via is_causal=True

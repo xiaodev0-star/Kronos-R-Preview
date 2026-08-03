@@ -1,19 +1,16 @@
-"""Exp 03: full-data, full-sequence, epoch-wise GPT architecture scaling.
+"""Shared full-data, full-sequence GPT capacity experiment pipeline.
 
-Clean run (2026-07-27).  The tokenizer is inherited from the Exp 02 rerun
-selection (64x192 @ bits 9+7).  Five GPT architectures share one seed, the
-CE+AdamW recipe, the full stock set, complete sequences, 50 epochs, and
-four pre-holdout evaluation windows.  Every epoch checkpoint is retained and
-evaluated.  Outputs are isolated under ``run_seed42``.
+The tokenizer is inherited from the Exp 02 selection. Capacity configurations
+share one seed, the CE+AdamW recipe, the full stock set, complete sequences,
+and four pre-holdout evaluation windows. Every epoch checkpoint is retained
+and evaluated. Checkpoints/caches and downloadable diagnostics use separate
+roots.
 
-Differences from the retired 2026-07-12 sweep (and from the first draft of
-this script):
+Protocol guarantees:
 
-- CE + AdamW instead of focal + Muon; no early stopping; epoch-wise
-  multi-window evaluation instead of a single final-checkpoint pass.
-- ``xlarge`` trains on full sequences via gradient checkpointing (the old
-  sweep silently used max_seq_len=4096 for it, an unfair comparison).
-- All architectures share ONE token cache (identical tokenizer; the cache is
+- CE + AdamW, no early stopping, and epoch-wise multi-window evaluation.
+- Large configurations train on full sequences via gradient checkpointing.
+- All architectures share one token cache (identical tokenizer; the cache is
   validated by a hash of tokenizer weights in ``data_processor.pack_stocks_v2``),
   instead of building five identical per-config caches.
 - Every JSON state write retries on Windows ``PermissionError`` file locks —
@@ -26,14 +23,11 @@ experiment line.
 
 from __future__ import annotations
 
-import argparse
 import csv
 import importlib.util
 import json
 import os
-import shutil
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,85 +39,28 @@ EXPERIMENT_DIR = SCRIPT_PATH.parent
 ROOT = EXPERIMENT_DIR.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from experiment_io import (
+    StudyLayout,
+    default_study_roots,
+    runtime_environment,
+)
 
 EXP01_PIPELINE_PATH = (
-    ROOT / "experiments" / "01-bitsweep" / "rerun_bits_epochwise.py"
+    ROOT / "experiments" / "01-bitsweep" / "run_bitsweep.py"
 )
-EXP02_ROOT = ROOT / "experiments" / "02-tokenizer-tuning" / "rerun_seed42"
+_, EXP02_ROOT = default_study_roots("02-tokenizer-tuning", seed=42)
 EXP02_SELECTION = EXP02_ROOT / "selection.json"
 GPT_SCRIPT = ROOT / "train_base.py"
 TRAJECTORY_SCRIPT = (
-    ROOT / "experiments" / "04" / "c-hpo" / "evaluate_epoch_trajectory.py"
+    ROOT / "experiments" / "04" / "b-hpo" / "evaluate_epoch_trajectory.py"
 )
-ANALYSIS_SCRIPT = EXPERIMENT_DIR / "analyze_gpt_scaling_epochwise.py"
-DEFAULT_OUTPUT_ROOT = EXPERIMENT_DIR / "run_seed42"
-
 SEED = 42
-VALIDATION_OFFSETS = (0, 100, 200, 300)
 HOLDOUT_OFFSET = 400
-ARCH_CONFIGS = (
-    {
-        "name": "baseline",
-        "dim": 256,
-        "depth": 2,
-        "heads": 4,
-        "kv_heads": 1,
-        "ffn_multiplier": 4,
-        "gradient_checkpointing": False,
-        "batch_tokens": 12288,
-        "eval_batch_size": 4,
-        "description": "dim-256 production baseline (~2.6M at 9+7 vocab)",
-    },
-    {
-        "name": "wide",
-        "dim": 384,
-        "depth": 2,
-        "heads": 6,
-        "kv_heads": 1,
-        "ffn_multiplier": 4,
-        "gradient_checkpointing": False,
-        "batch_tokens": 10240,
-        "eval_batch_size": 3,
-        "description": "pure width scaling",
-    },
-    {
-        "name": "deep",
-        "dim": 256,
-        "depth": 4,
-        "heads": 4,
-        "kv_heads": 1,
-        "ffn_multiplier": 4,
-        "gradient_checkpointing": True,
-        "batch_tokens": 10240,
-        "eval_batch_size": 3,
-        "description": "pure depth scaling",
-    },
-    {
-        "name": "large",
-        "dim": 384,
-        "depth": 3,
-        "heads": 6,
-        "kv_heads": 1,
-        "ffn_multiplier": 4,
-        "gradient_checkpointing": True,
-        "batch_tokens": 8192,
-        "eval_batch_size": 2,
-        "description": "width and depth scaling",
-    },
-    {
-        "name": "xlarge",
-        "dim": 512,
-        "depth": 4,
-        "heads": 8,
-        "kv_heads": 2,
-        "ffn_multiplier": 4,
-        "gradient_checkpointing": True,
-        "batch_tokens": 6144,
-        "eval_batch_size": 1,
-        "description": "largest architecture, full sequences via grad ckpt",
-    },
-)
-CONFIG_MAP = {item["name"]: item for item in ARCH_CONFIGS}
+EVAL_DAYS = 1
+# Full-coverage, single-day-resolution evaluation: tile [0, HOLDOUT_OFFSET) with
+# contiguous EVAL_DAYS-day windows (offsets 0, 1, ..., 399) so every pre-holdout
+# trading day is scored as its own window. Offset HOLDOUT_OFFSET+ stays sealed.
+VALIDATION_OFFSETS = tuple(range(0, HOLDOUT_OFFSET, EVAL_DAYS))
 
 
 def _load_exp01_pipeline():
@@ -166,16 +103,6 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     raise last_error  # type: ignore[misc]
 
 
-def parse_configs(raw: str) -> list[dict[str, Any]]:
-    if not raw.strip():
-        return [dict(value) for value in ARCH_CONFIGS]
-    names = [item.strip() for item in raw.split(",") if item.strip()]
-    unknown = [name for name in names if name not in CONFIG_MAP]
-    if unknown:
-        raise ValueError(f"Unknown architecture configs: {unknown}")
-    return [dict(CONFIG_MAP[name]) for name in names]
-
-
 def parse_offsets(raw: str) -> tuple[int, ...]:
     values = tuple(int(item.strip()) for item in raw.split(",") if item.strip())
     if not values or any(value < 0 for value in values):
@@ -214,6 +141,11 @@ def resolve_tokenizer(raw: str) -> dict[str, Any]:
                 "Complete and analyze Exp 02 first, or pass --tokenizer."
             )
         selection = PIPE.load_json(EXP02_SELECTION)
+        if not selection.get("upstream_eligible", False):
+            raise RuntimeError(
+                f"Exp 02 selection has not been recorded after review: "
+                f"{EXP02_SELECTION}"
+            )
         selected = selection.get("selected", selection)
         path = Path(selected["tokenizer_path"]).resolve()
         source = {
@@ -229,19 +161,24 @@ def resolve_tokenizer(raw: str) -> dict[str, Any]:
     return metadata
 
 
-def config_paths(output_root: Path, name: str) -> dict[str, Path]:
-    directory = output_root / "configs" / name
+def config_paths(
+    weights_root: Path, results_root: Path, name: str
+) -> dict[str, Path]:
+    weights = weights_root / "configs" / name
+    results = results_root / "configs" / name
     return {
-        "directory": directory,
-        "override": directory / "override.json",
-        "run": directory / "run.json",
-        "model": directory / "model.pt",
-        "model_resume": directory / "model.pt.ckpt",
-        "checkpoint_index": directory / "model_checkpoints.json",
-        "trajectory": directory / "epoch_trajectory",
-        "logs": directory / "logs",
-        "gpt_log": directory / "logs" / "gpt.log",
-        "trajectory_log": directory / "logs" / "trajectory.log",
+        "directory": results,
+        "weights_directory": weights,
+        "override": results / "override.json",
+        "run": results / "run.json",
+        "model": weights / "model.pt",
+        "model_resume": weights / "model.pt.ckpt",
+        "checkpoint_index": results / "model_checkpoints.json",
+        "history": results / f"history_arch_{name}.json",
+        "trajectory": results / "epoch_trajectory",
+        "logs": results / "logs",
+        "gpt_log": results / "logs" / "gpt.log",
+        "trajectory_log": results / "logs" / "trajectory.log",
     }
 
 
@@ -307,6 +244,7 @@ def build_settings(
 
 def source_hashes() -> dict[str, str]:
     files = (
+        "experiment_io.py",
         "config.py",
         "data_processor.py",
         "training_utils.py",
@@ -314,11 +252,11 @@ def source_hashes() -> dict[str, str]:
         "eval_helpers.py",
         "model/kronos_preview.py",
         "model/layers.py",
-        "experiments/01-bitsweep/rerun_bits_epochwise.py",
+        "experiments/01-bitsweep/run_bitsweep.py",
         "experiments/02-tokenizer-tuning/analyze_tokenizer_epochwise.py",
-        "experiments/03-gpt-scaling/gpt_scaling_epochwise.py",
-        "experiments/03-gpt-scaling/analyze_gpt_scaling_epochwise.py",
-        "experiments/04/c-hpo/evaluate_epoch_trajectory.py",
+        "experiments/03-gpt-scaling/_pipeline.py",
+        "experiments/03-gpt-scaling/analyze_gpt_capacity.py",
+        "experiments/04/b-hpo/evaluate_epoch_trajectory.py",
     )
     return {
         relative: PIPE.file_sha256(ROOT / relative)
@@ -328,7 +266,9 @@ def source_hashes() -> dict[str, str]:
 
 
 def prepare_manifest(
-    output_root: Path, settings: dict[str, Any]
+    results_root: Path,
+    settings: dict[str, Any],
+    layout: StudyLayout,
 ) -> dict[str, Any]:
     implementation = source_hashes()
     dataset = PIPE.dataset_signature()
@@ -339,7 +279,7 @@ def prepare_manifest(
             "dataset": dataset,
         }
     )
-    path = output_root / "study_manifest.json"
+    path = results_root / "study_manifest.json"
     if path.exists():
         payload = PIPE.load_json(path)
         if payload.get("study_fingerprint") != fingerprint:
@@ -359,13 +299,15 @@ def prepare_manifest(
         "settings": settings,
         "implementation_sha256": implementation,
         "dataset": dataset,
+        "artifact_layout": layout.metadata(),
+        "runtime_environment": runtime_environment(ROOT),
     }
     atomic_write_json(path, payload)
     return payload
 
 
-def update_manifest(output_root: Path, **updates: Any) -> dict[str, Any]:
-    path = output_root / "study_manifest.json"
+def update_manifest(results_root: Path, **updates: Any) -> dict[str, Any]:
+    path = results_root / "study_manifest.json"
     payload = PIPE.load_json(path)
     payload.update(updates)
     atomic_write_json(path, payload)
@@ -439,14 +381,17 @@ def write_override(
 
 
 def run_one_config(
-    output_root: Path,
+    layout: StudyLayout,
     shared_cache_root: Path,
     settings: dict[str, Any],
     config: dict[str, Any],
 ) -> None:
     name = str(config["name"])
-    paths = config_paths(output_root, name)
+    paths = config_paths(
+        layout.weights_root, layout.results_root, name
+    )
     paths["directory"].mkdir(parents=True, exist_ok=True)
+    paths["weights_directory"].mkdir(parents=True, exist_ok=True)
     paths["logs"].mkdir(parents=True, exist_ok=True)
     write_override(paths["override"], shared_cache_root, config, settings)
     run_state = update_config_run(
@@ -504,6 +449,8 @@ def run_one_config(
             "--early_stop_patience",
             "0",
             "--history_per_epoch",
+            "--metrics_dir",
+            str(paths["directory"]),
             "--dim",
             str(config["dim"]),
             "--depth",
@@ -555,6 +502,14 @@ def run_one_config(
                 list(
                     paths["trajectory"].glob(
                         "token_distributions_epoch_*.npz"
+                    )
+                )
+            )
+            == expected_epochs
+            and len(
+                list(
+                    paths["trajectory"].glob(
+                        "prediction_records_epoch_*.npz"
                     )
                 )
             )
@@ -644,13 +599,17 @@ def parameter_count(model_path: Path) -> int:
 
 
 def write_combined_summary(
-    output_root: Path,
+    layout: StudyLayout,
     configs: list[dict[str, Any]],
     settings: dict[str, Any],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for config in configs:
-        paths = config_paths(output_root, str(config["name"]))
+        paths = config_paths(
+            layout.weights_root,
+            layout.results_root,
+            str(config["name"]),
+        )
         summary_path = paths["trajectory"] / "epoch_summary.json"
         if not summary_path.is_file() or not paths["model"].is_file():
             continue
@@ -674,171 +633,21 @@ def write_combined_summary(
             rows.append(row)
     order = {config["name"]: index for index, config in enumerate(configs)}
     rows.sort(key=lambda row: (order[row["config"]], row["epoch"]))
-    atomic_write_json(output_root / "combined_epoch_summary.json", rows)
+    atomic_write_json(
+        layout.results_root / "combined_epoch_summary.json", rows
+    )
     if rows:
         fields: list[str] = []
         for row in rows:
             for key in row:
                 if key not in fields:
                     fields.append(key)
-        temporary = output_root / "combined_epoch_summary.csv.tmp"
+        temporary = layout.results_root / "combined_epoch_summary.csv.tmp"
         with temporary.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)
-        os.replace(temporary, output_root / "combined_epoch_summary.csv")
+        os.replace(
+            temporary, layout.results_root / "combined_epoch_summary.csv"
+        )
     return rows
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run the epoch-wise GPT architecture scaling sweep"
-    )
-    parser.add_argument("--output_root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument(
-        "--configs",
-        default="",
-        help="Comma-separated subset of: "
-        + ",".join(item["name"] for item in ARCH_CONFIGS),
-    )
-    parser.add_argument(
-        "--tokenizer",
-        default="",
-        help="Default reads Exp 02 rerun selection.json",
-    )
-    parser.add_argument("--gpt_epochs", type=int, default=50)
-    parser.add_argument(
-        "--eval_offsets",
-        default=",".join(str(value) for value in VALIDATION_OFFSETS),
-    )
-    parser.add_argument("--eval_days", type=int, default=20)
-    parser.add_argument("--smoke", action="store_true")
-    return parser.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
-    PIPE.verify_runtime()
-    configs = parse_configs(args.configs)
-    offsets = parse_offsets(args.eval_offsets)
-    tokenizer = resolve_tokenizer(args.tokenizer)
-    if args.smoke:
-        configs = [configs[0]]
-        args.gpt_epochs = 1
-        args.eval_days = 2
-        offsets = (3,)
-    if args.gpt_epochs <= 0:
-        raise ValueError("GPT epochs must be positive")
-    if any(offset + args.eval_days > HOLDOUT_OFFSET for offset in offsets):
-        raise ValueError("Evaluation may not enter the sealed holdout")
-
-    temporary_root: Path | None = None
-    if args.smoke:
-        temporary_root = Path(
-            tempfile.mkdtemp(prefix="kronos_exp03_smoke_")
-        ).resolve()
-        output_root = temporary_root
-    else:
-        output_root = args.output_root.resolve()
-        free_gb = shutil.disk_usage(output_root.parent).free / (1024**3)
-        if free_gb < 12:
-            raise RuntimeError(
-                f"At least 12 GiB free is required; {free_gb:.1f} GiB remains"
-            )
-    output_root.mkdir(parents=True, exist_ok=True)
-    shared_cache_root = output_root / "shared"
-    settings = build_settings(
-        configs=configs,
-        tokenizer=tokenizer,
-        gpt_epochs=args.gpt_epochs,
-        eval_offsets=offsets,
-        eval_days=args.eval_days,
-        smoke=args.smoke,
-    )
-    prepare_manifest(output_root, settings)
-    update_manifest(
-        output_root,
-        status="running",
-        started_at_utc=utc_now(),
-        completed_configs=[],
-    )
-    print(f"Output: {output_root}", flush=True)
-    print(f"Tokenizer: {tokenizer['path']}", flush=True)
-    print(
-        f"Architectures: {[config['name'] for config in configs]}",
-        flush=True,
-    )
-
-    completed: list[str] = []
-    succeeded = False
-    try:
-        for index, config in enumerate(configs, start=1):
-            print(
-                f"\n{'=' * 72}\n"
-                f"[{index}/{len(configs)}] Architecture {config['name']}: "
-                f"{config['description']}\n"
-                f"{'=' * 72}",
-                flush=True,
-            )
-            run_one_config(output_root, shared_cache_root, settings, config)
-            completed.append(str(config["name"]))
-            rows = write_combined_summary(output_root, configs, settings)
-            update_manifest(
-                output_root,
-                status="running",
-                completed_configs=completed,
-                combined_rows=len(rows),
-                last_progress_at_utc=utc_now(),
-            )
-        # Finalize the study before analysis so generated reports do not retain
-        # the stale "running" state that the first completed run exposed.
-        update_manifest(
-            output_root,
-            status="completed",
-            completed_at_utc=utc_now(),
-            completed_configs=completed,
-            combined_rows=len(
-                PIPE.load_json(output_root / "combined_epoch_summary.json")
-            ),
-        )
-        if ANALYSIS_SCRIPT.is_file() and not args.smoke:
-            analysis_env = os.environ.copy()
-            analysis_env.pop("KRONOS_PREVIEW_OVERRIDE_JSON", None)
-            PIPE.run_command(
-                [
-                    sys.executable,
-                    str(ANALYSIS_SCRIPT),
-                    "--root",
-                    str(output_root),
-                ],
-                env=analysis_env,
-                log_path=output_root / "analysis.log",
-                label="Exp 03 analysis",
-            )
-            update_manifest(
-                output_root,
-                status="completed",
-                analysis_completed_at_utc=utc_now(),
-            )
-        succeeded = True
-        print(f"Completed Exp 03: {output_root}", flush=True)
-        return 0
-    except BaseException as exc:
-        update_manifest(
-            output_root,
-            status="failed",
-            failed_at_utc=utc_now(),
-            error=f"{type(exc).__name__}: {exc}",
-            completed_configs=completed,
-        )
-        raise
-    finally:
-        if temporary_root is not None:
-            if succeeded:
-                shutil.rmtree(temporary_root, ignore_errors=False)
-            else:
-                print(f"Smoke artifacts retained at {temporary_root}")
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

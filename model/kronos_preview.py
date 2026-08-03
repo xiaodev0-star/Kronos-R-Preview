@@ -88,7 +88,12 @@ class KronosPreview(_BaseTransformer):
 
         # Fine logits: conditioned on coarse embedding
         if fine_targets is not None:
-            coarse_emb = self._fine_emb(input_ids[:, :fine_targets.shape[1]])
+            # Teacher-condition on the current target coarse token. This
+            # exactly matches inference, where the current predicted coarse
+            # token conditions the fine head.
+            target_length = fine_targets.shape[1]
+            coarse_targets = input_ids[:, 1 : target_length + 1]
+            coarse_emb = self._fine_emb(coarse_targets)
         else:
             coarse_pred = coarse_logits[:, :-1, :self._vocab_l1].argmax(dim=-1)
             coarse_emb = self._fine_emb(coarse_pred)

@@ -1,25 +1,32 @@
-checkpoint/
-dataset/
-TEMP/
+# Local environments and editor state
+.venv/
+venv/
+.vscode/
+.idea/
 .claude/
 .qoder/
-.workbuddy/
-.uploads/
-.trae-html-share-packages/
+
+# Python caches and tooling
 __pycache__/
-*.json
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Data and generated training artifacts
+dataset/
+checkpoints/
+server_runs/
+experiments/**/run_seed*/
+experiments/**/smoke*/
 *.pt
-*.npz
-*.png
+*.pth
 *.ckpt
-*.db
+*.npz
 *.log
-*.txt
-CLAUDE.md
-AGENTS.md
-Abilition.md
-Difussion-GPTNBERT.md
-gen*.py
-rerun*/
-run*/
+*.tmp
+.workbuddy/
+ContinuePreTrain-ToDo.md
+# Generated reports and plots inside output directories are covered above.
+# JSON/CSV/PNG are intentionally not ignored globally so static configs and
+# documentation can be tracked when needed.

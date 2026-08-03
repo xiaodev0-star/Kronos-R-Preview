@@ -1,8 +1,7 @@
-"""Exp 01 BitSweep rerun with checkpoint-level, multi-window evaluation.
+"""Exp 01 BitSweep with checkpoint-level, multi-window evaluation.
 
-The historical sweep is kept intact for provenance.  This orchestrator runs a
-new isolated study using the current production tokenizer architecture and the
-controlled CE+AdamW recipe selected by Exp 04-A/B.
+This orchestrator runs a clean study using one tokenizer architecture and a
+controlled CE+AdamW downstream recipe.
 
 Formal protocol:
   * seed=42 only
@@ -13,8 +12,8 @@ Formal protocol:
   * every saved epoch is evaluated on offsets 0/100/200/300, 20 days each
   * offset 400+ is a sealed holdout and is never used here
 
-All stages are resumable and all formal outputs live below ``rerun_seed42`` so
-the 2026-07-11 historical report cannot be overwritten.
+All stages are resumable. Checkpoints/caches and downloadable diagnostics are
+written to independent roots.
 """
 
 from __future__ import annotations
@@ -24,6 +23,7 @@ import csv
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -38,7 +38,16 @@ from typing import Any
 SCRIPT_PATH = Path(__file__).resolve()
 EXPERIMENT_DIR = SCRIPT_PATH.parent
 ROOT = SCRIPT_PATH.parents[2]
-EXPECTED_PYTHON = Path(r"D:\conda_envs\llm-t\Scripts\python.exe")
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from experiment_io import (
+    StudyLayout,
+    default_study_roots,
+    runtime_environment,
+    write_download_manifest,
+)
+
 TOKENIZER_SCRIPT = ROOT / "train_tokenizer.py"
 GPT_SCRIPT = ROOT / "train_base.py"
 TOKENIZER_EVAL_SCRIPT = EXPERIMENT_DIR / "evaluate_tokenizer.py"
@@ -46,7 +55,9 @@ ANALYSIS_SCRIPT = EXPERIMENT_DIR / "analyze_bitsweep_epochwise.py"
 TRAJECTORY_SCRIPT = (
     ROOT / "experiments" / "04" / "c-hpo" / "evaluate_epoch_trajectory.py"
 )
-DEFAULT_OUTPUT_ROOT = EXPERIMENT_DIR / "rerun_seed42"
+DEFAULT_WEIGHTS_ROOT, DEFAULT_RESULTS_ROOT = default_study_roots(
+    "01-bitsweep", seed=42
+)
 
 SEED = 42
 ALL_CONFIGS = (
@@ -61,10 +72,17 @@ ALL_CONFIGS = (
     (9, 8),
     (9, 9),
 )
-VALIDATION_OFFSETS = (0, 100, 200, 300)
 HOLDOUT_OFFSET = 400
+EVAL_DAYS = 1
+# Full-coverage, single-day-resolution evaluation. The pre-holdout region
+# [0, HOLDOUT_OFFSET) is tiled with contiguous EVAL_DAYS-day windows (offsets
+# 0, 1, ..., 399), so every pre-holdout trading day is scored as its own window
+# for the finest robustness granularity. Offset HOLDOUT_OFFSET and beyond remain
+# the sealed holdout.
+VALIDATION_OFFSETS = tuple(range(0, HOLDOUT_OFFSET, EVAL_DAYS))
 
 IMPLEMENTATION_FILES = (
+    "experiment_io.py",
     "config.py",
     "data_processor.py",
     "training_utils.py",
@@ -77,7 +95,7 @@ IMPLEMENTATION_FILES = (
     "model/layers.py",
     "experiments/01-bitsweep/evaluate_tokenizer.py",
     "experiments/01-bitsweep/analyze_bitsweep_epochwise.py",
-    "experiments/01-bitsweep/rerun_bits_epochwise.py",
+    "experiments/01-bitsweep/run_bitsweep.py",
     "experiments/04/c-hpo/evaluate_epoch_trajectory.py",
 )
 
@@ -159,19 +177,14 @@ def parse_offsets(specification: str) -> tuple[int, ...]:
 
 
 def verify_runtime() -> None:
-    actual = Path(sys.executable).resolve()
-    if actual != EXPECTED_PYTHON.resolve():
+    if sys.version_info < (3, 10):
         raise RuntimeError(
-            f"This study must use {EXPECTED_PYTHON}; current Python is {actual}"
-        )
-    if sys.version_info[:3] != (3, 12, 10):
-        raise RuntimeError(
-            f"Expected Python 3.12.10, got {sys.version.split()[0]}"
+            f"Python >=3.10 is required, got {sys.version.split()[0]}"
         )
     import torch
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for the formal BitSweep rerun")
+        raise RuntimeError("CUDA is required for the formal BitSweep")
 
 
 def config_key(l1: int, l2: int) -> str:
@@ -182,24 +195,36 @@ def config_directory_name(l1: int, l2: int) -> str:
     return f"bits_{l1:02d}_{l2:02d}"
 
 
-def config_paths(output_root: Path, l1: int, l2: int) -> dict[str, Path]:
-    directory = output_root / "configs" / config_directory_name(l1, l2)
+def config_paths(
+    weights_root: Path,
+    results_root: Path,
+    l1: int,
+    l2: int,
+) -> dict[str, Path]:
+    name = config_directory_name(l1, l2)
+    weights = weights_root / "configs" / name
+    results = results_root / "configs" / name
     return {
-        "directory": directory,
-        "override": directory / "override.json",
-        "run": directory / "run.json",
-        "tokenizer": directory / "tokenizer.pt",
-        "tokenizer_resume": directory / "tokenizer.pt.ckpt",
-        "tokenizer_metrics": directory / "tokenizer_metrics.json",
-        "model": directory / "model.pt",
-        "model_resume": directory / "model.pt.ckpt",
-        "checkpoint_index": directory / "model_checkpoints.json",
-        "trajectory": directory / "epoch_trajectory",
-        "logs": directory / "logs",
-        "tokenizer_log": directory / "logs" / "tokenizer.log",
-        "tokenizer_eval_log": directory / "logs" / "tokenizer_eval.log",
-        "gpt_log": directory / "logs" / "gpt.log",
-        "trajectory_log": directory / "logs" / "trajectory.log",
+        "directory": results,
+        "weights_directory": weights,
+        "override": results / "override.json",
+        "run": results / "run.json",
+        "tokenizer": weights / "tokenizer.pt",
+        "tokenizer_resume": weights / "tokenizer.pt.ckpt",
+        "tokenizer_metrics": results / "tokenizer_metrics.json",
+        "tokenizer_history": results / "tokenizer_training_history.json",
+        "tokenizer_distributions": results / "tokenizer_distributions.npz",
+        "model": weights / "model.pt",
+        "model_resume": weights / "model.pt.ckpt",
+        "checkpoint_index": results / "model_checkpoints.json",
+        "history": results / f"history_bitsweep_{l1}_{l2}.json",
+        "trajectory": results / "epoch_trajectory",
+        "cache": weights / "cache",
+        "logs": results / "logs",
+        "tokenizer_log": results / "logs" / "tokenizer.log",
+        "tokenizer_eval_log": results / "logs" / "tokenizer_eval.log",
+        "gpt_log": results / "logs" / "gpt.log",
+        "trajectory_log": results / "logs" / "trajectory.log",
     }
 
 
@@ -245,6 +270,9 @@ def build_settings(
             "max_seq_len": 256 if smoke else 0,
             "batch_tokens": 2048 if smoke else batch_tokens,
             "batch_cap": 64,
+            "accumulation_steps": 8 if smoke else 32,
+            "controlled_loader_seed": SEED,
+            "exact_accumulation_boundaries": True,
             "curriculum": False,
             "early_stop_patience": 0,
             "retain_every_epoch": True,
@@ -279,8 +307,9 @@ def source_hashes() -> dict[str, str]:
 
 
 def prepare_manifest(
-    output_root: Path,
+    results_root: Path,
     settings: dict[str, Any],
+    layout: StudyLayout,
 ) -> dict[str, Any]:
     implementation = source_hashes()
     data = dataset_signature()
@@ -291,7 +320,7 @@ def prepare_manifest(
             "dataset": data,
         }
     )
-    path = output_root / "study_manifest.json"
+    path = results_root / "study_manifest.json"
     if path.exists():
         manifest = load_json(path)
         if manifest.get("study_fingerprint") != fingerprint:
@@ -302,7 +331,7 @@ def prepare_manifest(
         return manifest
 
     manifest = {
-        "experiment": "Exp 01 BitSweep rerun",
+        "experiment": "Exp 01 BitSweep",
         "design": "full-data epoch-wise bit-width sweep",
         "status": "planned",
         "created_at_utc": utc_now(),
@@ -312,14 +341,16 @@ def prepare_manifest(
         "settings": settings,
         "implementation_sha256": implementation,
         "dataset": data,
-        "historical_outputs_overwritten": False,
+        "artifact_layout": layout.metadata(),
+        "runtime_environment": runtime_environment(ROOT),
+        "clean_results_root": True,
     }
     atomic_write_json(path, manifest)
     return manifest
 
 
-def update_manifest(output_root: Path, **updates: Any) -> dict[str, Any]:
-    path = output_root / "study_manifest.json"
+def update_manifest(results_root: Path, **updates: Any) -> dict[str, Any]:
+    path = results_root / "study_manifest.json"
     manifest = load_json(path)
     manifest.update(updates)
     atomic_write_json(path, manifest)
@@ -352,7 +383,7 @@ def update_config_run(
 
 def write_override(
     path: Path,
-    directory: Path,
+    cache_directory: Path,
     l1: int,
     l2: int,
     settings: dict[str, Any],
@@ -374,8 +405,8 @@ def write_override(
             "random_seed": SEED,
             "warmup_ratio": settings["gpt"]["warmup_ratio"],
             "batch_size": 1,
-            "accumulation_steps": 32,
-            "save_dir": str((directory / "cache").resolve()),
+            "accumulation_steps": settings["gpt"]["accumulation_steps"],
+            "save_dir": str(cache_directory.resolve()),
         },
     }
     if path.exists() and load_json(path) != payload:
@@ -392,7 +423,11 @@ def run_command(
     label: str,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    rendered = subprocess.list2cmdline(command)
+    rendered = (
+        subprocess.list2cmdline(command)
+        if os.name == "nt"
+        else shlex.join(command)
+    )
     print(f"\n[{label}] {rendered}", flush=True)
     child_env = env.copy()
     child_env["PYTHONUTF8"] = "1"
@@ -438,7 +473,11 @@ def tokenizer_is_complete(
     embedding_dim: int,
     hidden_dim: int,
 ) -> bool:
-    if not paths["tokenizer"].is_file() or not paths["tokenizer_resume"].is_file():
+    if (
+        not paths["tokenizer"].is_file()
+        or not paths["tokenizer_resume"].is_file()
+        or not paths["tokenizer_history"].is_file()
+    ):
         return False
     try:
         import torch
@@ -449,6 +488,7 @@ def tokenizer_is_complete(
         resume = torch.load(
             paths["tokenizer_resume"], map_location="cpu", weights_only=False
         )
+        history = load_json(paths["tokenizer_history"])
         config = model.get("config", {})
         bits = config.get("bits_per_quantizer")
         return bool(
@@ -458,13 +498,17 @@ def tokenizer_is_complete(
             and int(config.get("embedding_dim", -1)) == embedding_dim
             and int(config.get("hidden_dim", -1)) == hidden_dim
             and int(resume.get("epoch", -1)) + 1 >= epochs
+            and len(history.get("epochs", [])) >= epochs
         )
     except (OSError, RuntimeError, ValueError, TypeError, KeyError):
         return False
 
 
 def tokenizer_metrics_are_current(paths: dict[str, Path]) -> bool:
-    if not paths["tokenizer_metrics"].is_file():
+    if (
+        not paths["tokenizer_metrics"].is_file()
+        or not paths["tokenizer_distributions"].is_file()
+    ):
         return False
     try:
         payload = load_json(paths["tokenizer_metrics"])
@@ -473,6 +517,8 @@ def tokenizer_metrics_are_current(paths: dict[str, Path]) -> bool:
             and payload.get("tokenizer_sha256")
             == file_sha256(paths["tokenizer"])
             and payload.get("n_rows", 0) > 0
+            and payload.get("distribution_sidecar", {}).get("sha256")
+            == file_sha256(paths["tokenizer_distributions"])
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
@@ -483,6 +529,10 @@ def gpt_is_complete(paths: dict[str, Path], epochs: int) -> bool:
         paths["model"].is_file()
         and paths["model_resume"].is_file()
         and paths["checkpoint_index"].is_file()
+        and (
+            "history" not in paths
+            or paths["history"].is_file()
+        )
     )
     if not required:
         return False
@@ -526,22 +576,37 @@ def trajectory_is_complete(paths: dict[str, Path], epochs: int) -> bool:
                 (paths["trajectory"] / f"epoch_{epoch:03d}.json").is_file()
                 for epoch in range(1, epochs + 1)
             )
+            and all(
+                (
+                    paths["trajectory"]
+                    / f"token_distributions_epoch_{epoch:03d}.npz"
+                ).is_file()
+                and (
+                    paths["trajectory"]
+                    / f"prediction_records_epoch_{epoch:03d}.npz"
+                ).is_file()
+                for epoch in range(1, epochs + 1)
+            )
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
 
 
 def run_one_config(
-    output_root: Path,
+    layout: StudyLayout,
     shared_feature_cache: Path,
+    shared_eval_cache: Path,
     settings: dict[str, Any],
     l1: int,
     l2: int,
 ) -> None:
-    paths = config_paths(output_root, l1, l2)
+    paths = config_paths(
+        layout.weights_root, layout.results_root, l1, l2
+    )
     paths["directory"].mkdir(parents=True, exist_ok=True)
+    paths["weights_directory"].mkdir(parents=True, exist_ok=True)
     paths["logs"].mkdir(parents=True, exist_ok=True)
-    write_override(paths["override"], paths["directory"], l1, l2, settings)
+    write_override(paths["override"], paths["cache"], l1, l2, settings)
     run_state = update_config_run(
         paths, l1, l2, status="running", started_at_utc=utc_now()
     )
@@ -567,6 +632,8 @@ def run_one_config(
             str(TOKENIZER_SCRIPT),
             "--save_path",
             str(paths["tokenizer"]),
+            "--metrics_path",
+            str(paths["tokenizer_history"]),
             "--bits_l1",
             str(l1),
             "--bits_l2",
@@ -628,6 +695,8 @@ def run_one_config(
             str(validation_features),
             "--output",
             str(paths["tokenizer_metrics"]),
+            "--distribution_output",
+            str(paths["tokenizer_distributions"]),
             "--seed",
             str(SEED),
             "--chunk_size",
@@ -695,9 +764,14 @@ def run_one_config(
             str(settings["gpt"]["batch_tokens"]),
             "--batch_cap",
             str(settings["gpt"]["batch_cap"]),
+            "--controlled_loader_seed",
+            str(settings["gpt"]["controlled_loader_seed"]),
+            "--exact_accumulation_boundaries",
             "--early_stop_patience",
             "0",
             "--history_per_epoch",
+            "--metrics_dir",
+            str(paths["directory"]),
         ]
         run_command(
             command,
@@ -736,6 +810,8 @@ def run_one_config(
             str(paths["tokenizer"]),
             "--output_dir",
             str(paths["trajectory"]),
+            "--prepared_cache_dir",
+            str(shared_eval_cache),
             "--epochs",
             f"1-{settings['gpt']['epochs']}",
             "--offsets",
@@ -787,12 +863,14 @@ def run_one_config(
 
 
 def write_combined_summary(
-    output_root: Path,
+    layout: StudyLayout,
     configs: list[tuple[int, int]],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for l1, l2 in configs:
-        paths = config_paths(output_root, l1, l2)
+        paths = config_paths(
+            layout.weights_root, layout.results_root, l1, l2
+        )
         summary_path = paths["trajectory"] / "epoch_summary.json"
         if not summary_path.is_file() or not paths["tokenizer_metrics"].is_file():
             continue
@@ -823,14 +901,16 @@ def write_combined_summary(
             )
             rows.append(row)
     rows.sort(key=lambda row: (row["bits_l1"], row["bits_l2"], row["epoch"]))
-    atomic_write_json(output_root / "combined_epoch_summary.json", rows)
+    atomic_write_json(
+        layout.results_root / "combined_epoch_summary.json", rows
+    )
     if rows:
         fields: list[str] = []
         for row in rows:
             for key in row:
                 if key not in fields:
                     fields.append(key)
-        csv_path = output_root / "combined_epoch_summary.csv"
+        csv_path = layout.results_root / "combined_epoch_summary.csv"
         temporary = csv_path.with_suffix(".csv.tmp")
         with temporary.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
@@ -844,19 +924,47 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the current, epoch-wise BitSweep protocol"
     )
-    parser.add_argument("--output_root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--weights_root",
+        type=Path,
+        default=DEFAULT_WEIGHTS_ROOT,
+        help="Server-only checkpoints and caches",
+    )
+    parser.add_argument(
+        "--results_root",
+        type=Path,
+        default=DEFAULT_RESULTS_ROOT,
+        help="Downloadable JSON/CSV/NPZ/plots/logs",
+    )
     parser.add_argument("--configs", default="")
     parser.add_argument("--tok_epochs", type=int, default=100)
     parser.add_argument("--gpt_epochs", type=int, default=50)
     parser.add_argument("--embedding_dim", type=int, default=64)
     parser.add_argument("--hidden_dim", type=int, default=192)
-    parser.add_argument("--batch_tokens", type=int, default=12288)
+    parser.add_argument(
+        "--batch_tokens",
+        type=int,
+        default=65536,
+        help=(
+            "Adaptive GPT microbatch token budget. The 65536 default targets "
+            "24 GiB RTX 4090-class GPUs while preserving the fixed "
+            "sequence-level accumulation schedule."
+        ),
+    )
     parser.add_argument(
         "--eval_offsets",
         default=",".join(str(value) for value in VALIDATION_OFFSETS),
     )
-    parser.add_argument("--eval_days", type=int, default=20)
-    parser.add_argument("--eval_batch_size", type=int, default=4)
+    parser.add_argument("--eval_days", type=int, default=EVAL_DAYS)
+    parser.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=32,
+        help=(
+            "Length-bucketed inference batch size. Evaluation automatically "
+            "halves this value and retries if CUDA memory is exhausted."
+        ),
+    )
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -891,16 +999,16 @@ def main() -> int:
         temporary_root = Path(
             tempfile.mkdtemp(prefix="kronos_bitsweep_smoke_")
         ).resolve()
-        output_root = temporary_root
+        layout = StudyLayout.create(
+            temporary_root / "weights", temporary_root / "results"
+        )
     else:
-        output_root = args.output_root.resolve()
-        free_gb = shutil.disk_usage(output_root.parent).free / (1024 ** 3)
+        layout = StudyLayout.create(args.weights_root, args.results_root)
+        free_gb = shutil.disk_usage(layout.weights_root).free / (1024 ** 3)
         if free_gb < 12:
             raise RuntimeError(
                 f"At least 12 GiB free is required; only {free_gb:.1f} GiB remains"
             )
-    output_root.mkdir(parents=True, exist_ok=True)
-
     settings = build_settings(
         configs=configs,
         tok_epochs=args.tok_epochs,
@@ -913,16 +1021,21 @@ def main() -> int:
         eval_batch_size=args.eval_batch_size,
         smoke=args.smoke,
     )
-    prepare_manifest(output_root, settings)
+    prepare_manifest(layout.results_root, settings, layout)
     update_manifest(
-        output_root,
+        layout.results_root,
         status="running",
         started_at_utc=utc_now(),
         completed_configs=[],
     )
-    shared_feature_cache = output_root / "shared" / "tokenizer_features"
+    shared_feature_cache = (
+        layout.weights_root / "shared" / "tokenizer_features"
+    )
+    shared_eval_cache = layout.weights_root / "shared" / "eval_cache"
     shared_feature_cache.mkdir(parents=True, exist_ok=True)
-    print(f"Output: {output_root}", flush=True)
+    shared_eval_cache.mkdir(parents=True, exist_ok=True)
+    print(f"Weights/cache: {layout.weights_root}", flush=True)
+    print(f"Downloadable results: {layout.results_root}", flush=True)
     print(f"Configs: {[config_key(*value) for value in configs]}", flush=True)
     print(
         f"Protocol: tokenizer={args.tok_epochs}ep, GPT={args.gpt_epochs}ep, "
@@ -941,12 +1054,17 @@ def main() -> int:
                 flush=True,
             )
             run_one_config(
-                output_root, shared_feature_cache, settings, l1, l2
+                layout,
+                shared_feature_cache,
+                shared_eval_cache,
+                settings,
+                l1,
+                l2,
             )
             completed.append(config_key(l1, l2))
-            rows = write_combined_summary(output_root, configs)
+            rows = write_combined_summary(layout, configs)
             update_manifest(
-                output_root,
+                layout.results_root,
                 status="running",
                 completed_configs=completed,
                 combined_rows=len(rows),
@@ -959,15 +1077,16 @@ def main() -> int:
                 flush=True,
             )
             run_one_config(
-                output_root,
+                layout,
                 shared_feature_cache,
+                shared_eval_cache,
                 settings,
                 configs[0][0],
                 configs[0][1],
             )
-        rows = write_combined_summary(output_root, configs)
+        rows = write_combined_summary(layout, configs)
         update_manifest(
-            output_root,
+            layout.results_root,
             status="completed",
             completed_at_utc=utc_now(),
             completed_configs=completed,
@@ -981,17 +1100,18 @@ def main() -> int:
                 sys.executable,
                 str(ANALYSIS_SCRIPT),
                 "--root",
-                str(output_root),
+                str(layout.results_root),
             ],
             env=analysis_env,
-            log_path=output_root / "analysis.log",
+            log_path=layout.results_root / "analysis.log",
             label="BitSweep non-composite analysis",
         )
         update_manifest(
-            output_root,
+            layout.results_root,
             analysis_status="completed",
             analysis_completed_at_utc=utc_now(),
         )
+        write_download_manifest(layout)
         print(
             f"\nBitSweep completed: {len(completed)} configs, "
             f"{len(rows)} config-epoch rows.",
@@ -1000,7 +1120,7 @@ def main() -> int:
         succeeded = True
     except BaseException as exc:
         update_manifest(
-            output_root,
+            layout.results_root,
             status="failed",
             failed_at_utc=utc_now(),
             completed_configs=completed,

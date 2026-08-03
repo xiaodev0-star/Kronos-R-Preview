@@ -1,4 +1,4 @@
-"""Analyze Exp 03-Sup with mature target-relative codebook diagnostics.
+"""Analyze Exp 03 with mature target-relative codebook diagnostics.
 
 Selection is deliberately separated into three layers:
 
@@ -14,11 +14,9 @@ The raw primary leader and the parameter-efficiency knee are reported
 separately, so the heuristic remains auditable and can be replaced after
 multi-seed confirmation.
 
-Fine and joint distributions remain mandatory diagnostics, but do not rank
-capacity because the inherited training recipe teacher-conditions the fine
-head on the previous coarse token while inference conditions on the currently
-predicted coarse token.  Fixing that mismatch requires a separate retraining
-study covering the complete controlled grid.
+Fine and joint distributions are mandatory secondary diagnostics. The new
+experiment line aligns training and inference conditioning at the current
+coarse token and keeps valid fine code zero trainable.
 """
 
 from __future__ import annotations
@@ -28,6 +26,7 @@ import csv
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +39,11 @@ import numpy as np
 
 SCRIPT_PATH = Path(__file__).resolve()
 ROOT = SCRIPT_PATH.parents[2]
-DEFAULT_ROOT = SCRIPT_PATH.parent / "run_seed42"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from experiment_io import default_study_roots
+
+_, DEFAULT_ROOT = default_study_roots("03-gpt-scaling", seed=42)
 WINDOW_SIZE = 5
 LOSS_BASIN_RATIO = 1.01
 EXPECTED_CONFIGS = (
@@ -230,7 +233,7 @@ def summarize_window(
         "eval_batch_size": int(first["eval_batch_size"]),
         "window_start": int(rows[0]["epoch"]),
         "window_end": int(rows[-1]["epoch"]),
-        "representative_epoch": int(rows[WINDOW_SIZE // 2]["epoch"]),
+        "representative_epoch": int(rows[len(rows) // 2]["epoch"]),
         "maturity_onset": maturity_onset,
         "loss_basin_threshold": loss_threshold,
         "strict_loss_basin": strict_loss_basin,
@@ -249,6 +252,12 @@ def summarize_window(
 
 
 def eligible_windows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    # All-epoch policy: every config is summarized over its full 1..50 epoch
+    # range as a single window. The maturity onset and loss basin are still
+    # recorded for audit, but no longer restrict which epochs enter the
+    # ranking. This lets the selection reflect the whole training trajectory
+    # instead of a narrow mature plateau.
+    ordered = sorted(rows, key=lambda row: int(row["epoch"]))
     min_loss = min(float(row["val_loss"]) for row in rows)
     threshold = min_loss * LOSS_BASIN_RATIO
     onset = min(
@@ -256,36 +265,19 @@ def eligible_windows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
         for row in rows
         if float(row["val_loss"]) <= threshold
     )
-    all_windows = [
-        window
-        for window in consecutive_windows(rows)
-        if int(window[0]["epoch"]) >= onset
-    ]
-    strict = [
-        window
-        for window in all_windows
-        if all(float(row["val_loss"]) <= threshold for row in window)
-    ]
-    selected_pool = strict if strict else all_windows
-    if not selected_pool:
-        raise RuntimeError(
-            f"No mature five-epoch window for {rows[0]['config']}"
-        )
-    summaries = [
-        summarize_window(
-            window,
-            maturity_onset=onset,
-            loss_threshold=threshold,
-            strict_loss_basin=bool(strict),
-        )
-        for window in selected_pool
-    ]
-    return summaries, {
+    summary = summarize_window(
+        ordered,
+        maturity_onset=onset,
+        loss_threshold=threshold,
+        strict_loss_basin=False,
+    )
+    return [summary], {
         "min_val_loss": min_loss,
         "loss_threshold": threshold,
         "maturity_onset": onset,
-        "strict_windows": len(strict),
-        "fallback_used": not bool(strict),
+        "strict_windows": 0,
+        "fallback_used": False,
+        "window_policy": "all_epochs_1_to_50",
     }
 
 
@@ -587,7 +579,11 @@ def inspect_representative_distributions(
             raise FileNotFoundError(path)
         with np.load(path, allow_pickle=False) as payload:
             schema = int(payload["schema"][0])
-            if schema != 2:
+            # Sidecar schema 2 (coarse/fine/joint counts) and 3 (same layout,
+            # written by the current evaluate_epoch_trajectory.py) are both
+            # compatible with the count-vector audit below. Reject only older
+            # or unknown layouts.
+            if schema not in (2, 3):
                 raise RuntimeError(f"Unexpected distribution schema in {path}")
             vocab_fine = int(payload["vocab_fine"][0])
             levels: dict[str, Any] = {}
@@ -693,8 +689,8 @@ def make_plot(root: Path, ranked: list[dict[str, Any]], selection: dict[str, Any
     )
     axis.set_xscale("log")
     axis.set_xlabel("Parameters (million, log scale)")
-    axis.set_ylabel("Mature 5-epoch coarse codebook balance")
-    axis.set_title("Exp 03-Sup: capacity vs target-relative coarse-code use")
+    axis.set_ylabel("Coarse codebook balance (all 50 epochs, median)")
+    axis.set_title("Exp 03: capacity vs target-relative coarse-code use")
     axis.grid(alpha=0.25)
     axis.legend()
     figure.tight_layout()
@@ -716,24 +712,24 @@ def render_report(
     leader = selection["primary_coarse_balance_leader"]
     knee = selection["parameter_efficiency_knee"]
     lines = [
-        "# Exp 03-Sup 分析报告",
+        "# Exp 03 分析报告",
         "",
         "> 状态：单 seed（42）探索性结论；holdout offset 400 未开启。",
         f"> 临时选型：`{selected['config']}@{selected['representative_epoch']}`，"
-        f"成熟窗口 epoch {selected['window_start']}–{selected['window_end']}。",
+        f"统计窗口 epoch {selected['window_start']}–{selected['window_end']}（全 epoch）。",
         f"> Coarse target-relative 指标原始领先者：`{leader['config']}`；"
         f"参数效率拐点：`{knee['config']}`。",
         "",
         "## 选择规则",
         "",
-        "- 成熟起点为首次进入 `val_loss <= 1.01 × min(val_loss)`；只比较连续 5 epoch 窗口。",
+        "- 每个 config 取全部 50 个 epoch（ep1–50）作为单一统计窗口，中位数与标准差均跨全轨迹计算。",
         "- 主排名是 target-relative coarse codebook balance；同时公开 support F1、JSD、有效 token 对齐和 collapse 对齐。",
-        "- Fine/joint 是强制审计轨道，不参与容量主排名：当前训练与推理的 fine coarse-conditioning 存在一位错配，修复需另立全网格重训实验。",
+        "- Fine/joint 是完整的二级诊断轨道；新实验中训练与推理都按当前 coarse token 条件化，合法 fine code 0 也参与训练。",
         "- DA、逐日 RankIC、MAPE、AmpRatio 只作 guardrail，不进入码本得分。",
         "- 在 guardrail 通过的参数—coarse-score Pareto 前沿上，选取距离“guardrail 通过者中的领先点”不超过其窗口内 1 个标准差的最小模型。",
         "- 该规则只产生单-seed 临时选型；入围点必须补 multi-seed。",
         "",
-        "## 成熟窗口主排名",
+        "## 全 epoch 主排名",
         "",
         "| Rank | Config@ep | Params | Window | Coarse balance | P10 | Support F1 | JSD | Eff align | Collapse align | Fine balance | Joint balance | DA | RankIC | MAPE | Amp | Guardrail |",
         "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
@@ -771,8 +767,8 @@ def render_report(
             "每个 epoch 都有压缩 NPZ sidecar，保存四个验证窗口下 coarse、fine、joint 的完整 true/pred count vector；"
             "分析器验证所有配置的 true counts 完全一致，且每层 pred/true 总数一致。",
             "",
-            "注意：fine/joint 数值描述的是当前已训练实现的实际行为。由于 fine head 的训练 teacher condition 与推理 condition 错位，"
-            "它们不能单独归因于模型尺寸，也不能作为本轮容量主排名；但必须保留，防止用 coarse 结果外推完整 65,536 码本。",
+            "Fine/joint 数值来自已经对齐的层级预测头，可用于解释模型尺寸对完整码本的影响；"
+            "主选型仍以 coarse 为主目标，同时必须检查 fine/joint 是否出现退化。",
             "",
             "| Config@ep | Fine unique (pred/true) | Fine effective (pred/true) | Fine collapse (pred/true) | Joint unique (pred/true) | Joint effective (pred/true) | Joint collapse (pred/true) |",
             "|---|---:|---:|---:|---:|---:|---:|",
@@ -797,7 +793,7 @@ def render_report(
             "完整 65,536 维计数不嵌入 Markdown；其路径、hash 和 top-code 摘要记录在 "
             "`representative_distribution_summary.json`，原始向量保存在各 epoch sidecar。",
             "",
-            "## 成熟性与限制",
+            "## 轨迹信息与限制",
             "",
         ]
     )
@@ -805,14 +801,12 @@ def render_report(
         item = maturity[config]
         lines.append(
             f"- `{config}`：min val loss={item['min_val_loss']:.4f}，"
-            f"成熟起点 ep{item['maturity_onset']}，"
-            f"严格 5-epoch 窗口={item['strict_windows']}，"
-            f"fallback={'是' if item['fallback_used'] else '否'}。"
+            f"成熟起点 ep{item['maturity_onset']}（仅作参考，选型用全部 50 epoch）。"
         )
     lines.extend(
         [
-            "- 5 个相邻 epoch 不是独立重复；窗口标准差只用于抑制 checkpoint 偶然峰值，不是跨 seed 置信区间。",
-            "- guardrail 是相对 `deep` 成熟窗口的退化筛查，并不证明下游指标显著改善。",
+            "- 全 epoch 标准差跨越欠训练到成熟的整个轨迹，比窄窗口 SD 大得多；作为 near-best margin 会更宽松。",
+            "- guardrail 是相对 `deep` 全 epoch 统计的退化筛查，并不证明下游指标显著改善。",
             "- 单 seed 只能确定下一轮复现实验的入围尺寸，不能宣称全局最优。",
             "- holdout 保持封存，直到多 seed 容量选型与后续 HPO 均冻结。",
             "",
@@ -823,14 +817,26 @@ def render_report(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze Exp 03-Sup mature target-relative capacity"
+        description="Analyze Exp 03 mature target-relative capacity"
     )
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument(
+        "--record_selection",
+        action="store_true",
+        help="Promote the reviewed proposal to downstream selection.json",
+    )
+    parser.add_argument(
+        "--rationale",
+        default="",
+        help="Required review note with --record_selection",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.record_selection and not args.rationale.strip():
+        raise ValueError("--rationale is required with --record_selection")
     root = args.root.resolve()
     manifest_path = root / "study_manifest.json"
     manifest = load_json(manifest_path)
@@ -843,15 +849,19 @@ def main() -> int:
 
     selection.update(
         {
-            "experiment": "Exp 03-Sup",
+            "experiment": "Exp 03",
             "seed": 42,
             "window_size": WINDOW_SIZE,
+            "window_policy": "all_epochs_1_to_50",
             "loss_basin_ratio": LOSS_BASIN_RATIO,
             "selection_metric": (
-                "median_daily_codebook_balance_score over a mature "
-                "five-epoch window"
+                "median_daily_codebook_balance_score over all 50 epochs "
+                "(ep1-50, full trajectory)"
             ),
             "distribution_levels": ["coarse", "fine", "joint"],
+            "human_review_recorded": bool(args.record_selection),
+            "review_rationale": args.rationale.strip() or None,
+            "upstream_eligible": bool(args.record_selection),
         }
     )
     analysis = {
@@ -870,7 +880,15 @@ def main() -> int:
         "holdout_used": False,
         "single_seed": True,
     }
-    atomic_write_json(root / "selection.json", selection)
+    atomic_write_json(
+        root
+        / (
+            "selection.json"
+            if args.record_selection
+            else "selection_proposal.json"
+        ),
+        selection,
+    )
     atomic_write_json(root / "analysis.json", analysis)
     atomic_write_json(
         root / "representative_distribution_summary.json",
@@ -885,7 +903,7 @@ def main() -> int:
     )
     make_plot(root, ranked, selection)
     print(
-        "Exp 03-Sup provisional selection: "
+        "Exp 03 provisional selection: "
         f"{selection['selected']['config']}@"
         f"{selection['selected']['representative_epoch']}"
     )

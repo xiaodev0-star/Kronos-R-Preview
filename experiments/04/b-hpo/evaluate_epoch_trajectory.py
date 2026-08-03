@@ -28,10 +28,17 @@ from typing import Any
 
 SCRIPT_PATH = Path(__file__).resolve()
 ROOT = SCRIPT_PATH.parents[3]
-DEFAULT_STUDY_ROOT = SCRIPT_PATH.parent / "run_seed42"
-DEFAULT_OFFSETS = (0, 100, 200, 300)
-PREPARED_CACHE_SCHEMA = 5
-TOKEN_DISTRIBUTION_SCHEMA = 2
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from experiment_io import default_study_roots
+
+_, DEFAULT_STUDY_ROOT = default_study_roots("04b-hpo", seed=42)
+# Standalone default: full-coverage single-day tiling of the pre-holdout region
+# [0, 400). Runners pass --offsets explicitly.
+DEFAULT_OFFSETS = tuple(range(0, 400, 1))
+PREPARED_CACHE_SCHEMA = 6
+TOKEN_DISTRIBUTION_SCHEMA = 3
+PREDICTION_RECORD_SCHEMA = 1
 
 
 def parse_int_spec(value: str) -> list[int]:
@@ -87,7 +94,7 @@ def parse_args() -> argparse.Namespace:
         "--offsets",
         default=",".join(str(value) for value in DEFAULT_OFFSETS),
     )
-    parser.add_argument("--n_days", type=int, default=20)
+    parser.add_argument("--n_days", type=int, default=1)
     parser.add_argument("--n_stocks", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
@@ -116,7 +123,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--experiment_label",
-        default="Exp 04-C",
+        default="Exp 04-B",
         help="Label used in generated plot titles.",
     )
     return parser.parse_args()
@@ -205,6 +212,7 @@ def make_settings(
         "min_unique_tokens": args.min_unique_tokens,
         "evaluator_schema": 5,
         "token_distribution_schema": TOKEN_DISTRIBUTION_SCHEMA,
+        "prediction_record_schema": PREDICTION_RECORD_SCHEMA,
         "holdout_used": False,
     }
 
@@ -218,6 +226,9 @@ def cache_matches(
     checkpoint_meta = payload.get("checkpoint", {})
     distribution_meta = payload.get("token_distributions", {})
     distribution_path = distribution_meta.get("path")
+    records_meta = payload.get("prediction_records", {})
+    records_path = records_meta.get("path")
+    targets_path = records_meta.get("target_table", {}).get("path")
     return (
         payload.get("status") == "completed"
         and payload.get("epoch") == epoch
@@ -228,6 +239,11 @@ def cache_matches(
         and distribution_meta.get("schema") == TOKEN_DISTRIBUTION_SCHEMA
         and isinstance(distribution_path, str)
         and Path(distribution_path).is_file()
+        and records_meta.get("schema") == PREDICTION_RECORD_SCHEMA
+        and isinstance(records_path, str)
+        and Path(records_path).is_file()
+        and isinstance(targets_path, str)
+        and Path(targets_path).is_file()
     )
 
 
@@ -252,7 +268,16 @@ def prepare_stocks(
         attach_close_prices,
     )
 
-    stocks = load_stocks(max_stocks=0)
+    # Smoke evaluations request the shortest few stocks only to exercise the
+    # pipeline. Loading and parsing all 4695 CSVs first adds several minutes
+    # without improving that check. Formal/random evaluations still sample
+    # from the complete universe.
+    load_limit = (
+        max(24, n_stocks * 4)
+        if sample_strategy == "shortest" and n_stocks > 0
+        else 0
+    )
+    stocks = load_stocks(max_stocks=load_limit)
     _, _, test_stocks = split_stocks(stocks)
     n_sample = (
         len(test_stocks)
@@ -320,6 +345,7 @@ def prepare_stocks(
         )
         valid.append(
             {
+                "symbol": stock["symbol"],
                 "seq_len": required_length,
                 "input_ids": torch.as_tensor(
                     stock["inp_ids"][:required_length], dtype=torch.long
@@ -385,6 +411,7 @@ def prepare_stocks(
             selection_positions = []
             window_starts = []
             date_keys: list[str] = []
+            symbols: list[str] = []
             p_means = []
             p_stds = []
             true_logrets = []
@@ -406,6 +433,7 @@ def prepare_stocks(
                 selection_positions.append(stock["selection_positions"])
                 window_starts.append(stock["window_starts"])
                 date_keys.extend(stock["date_keys"])
+                symbols.extend([stock["symbol"]] * count)
                 p_means.append(
                     torch.full(
                         (count,), stock["p_mean_0"], dtype=torch.float64
@@ -436,6 +464,7 @@ def prepare_stocks(
                     "selection_positions": torch.cat(selection_positions),
                     "window_starts": torch.cat(window_starts),
                     "date_keys": date_keys,
+                    "symbols": symbols,
                     "p_means": torch.cat(p_means),
                     "p_stds": torch.cat(p_stds),
                     "true_logrets": torch.cat(true_logrets),
@@ -561,6 +590,44 @@ def token_distribution_path(output_dir: Path, epoch: int) -> Path:
     return output_dir / f"token_distributions_epoch_{epoch:03d}.npz"
 
 
+def prediction_records_path(output_dir: Path, epoch: int) -> Path:
+    return output_dir / f"prediction_records_epoch_{epoch:03d}.npz"
+
+
+def evaluation_targets_path(output_dir: Path) -> Path:
+    return output_dir / "evaluation_targets.npz"
+
+
+def _top_count_rows(
+    counts: Any,
+    *,
+    level: str,
+    vocab_fine: int,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    import numpy as np
+
+    nonzero = np.flatnonzero(counts)
+    if nonzero.size == 0:
+        return []
+    ordered = nonzero[
+        np.argsort(counts[nonzero], kind="stable")[::-1][:limit]
+    ]
+    total = max(int(counts.sum()), 1)
+    output: list[dict[str, Any]] = []
+    for raw_id in ordered.tolist():
+        row: dict[str, Any] = {
+            "token_id": int(raw_id),
+            "count": int(counts[raw_id]),
+            "frequency": float(counts[raw_id] / total),
+        }
+        if level == "joint":
+            row["coarse_id"] = int(raw_id // vocab_fine)
+            row["fine_id"] = int(raw_id % vocab_fine)
+        output.append(row)
+    return output
+
+
 def write_token_distributions(
     path: Path,
     predictions: dict[int, list[dict[str, Any]]],
@@ -586,6 +653,7 @@ def write_token_distributions(
         "vocab_fine": np.asarray([vocab_fine], dtype=np.int32),
         "vocab_joint": np.asarray([vocab_joint], dtype=np.int32),
     }
+    preview: dict[str, Any] = {}
     for level, vocab in (
         ("coarse", vocab_coarse),
         ("fine", vocab_fine),
@@ -626,6 +694,35 @@ def write_token_distributions(
             )
         arrays[f"{level}_pred_counts"] = np.stack(pred_counts)
         arrays[f"{level}_true_counts"] = np.stack(true_counts)
+        preview[level] = {
+            "overall": {
+                "pred": _top_count_rows(
+                    arrays[f"{level}_pred_counts"].sum(axis=0),
+                    level=level,
+                    vocab_fine=vocab_fine,
+                ),
+                "true": _top_count_rows(
+                    arrays[f"{level}_true_counts"].sum(axis=0),
+                    level=level,
+                    vocab_fine=vocab_fine,
+                ),
+            },
+            "by_offset": {
+                str(offset): {
+                    "pred": _top_count_rows(
+                        arrays[f"{level}_pred_counts"][index],
+                        level=level,
+                        vocab_fine=vocab_fine,
+                    ),
+                    "true": _top_count_rows(
+                        arrays[f"{level}_true_counts"][index],
+                        level=level,
+                        vocab_fine=vocab_fine,
+                    ),
+                }
+                for index, offset in enumerate(offsets.tolist())
+            },
+        }
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -647,6 +744,116 @@ def write_token_distributions(
             key for key in arrays if key.endswith("_counts")
         ),
         "count_semantics": "paired predictions with an available true ID",
+        "top_50_preview": preview,
+    }
+
+
+def write_prediction_records(
+    path: Path,
+    targets_path: Path,
+    predictions: dict[int, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Persist every evaluated stock/date prediction in a compact table.
+
+    This sidecar is sufficient to reconstruct per-stock, per-date, per-window,
+    coarse/fine/joint distributions and sparse confusion matrices offline.
+    """
+    import numpy as np
+
+    rows = [
+        row
+        for offset in sorted(predictions)
+        for row in predictions[offset]
+    ]
+    symbols = sorted({str(row["symbol"]) for row in rows})
+    dates = sorted({str(row["date_key"]) for row in rows})
+    symbol_index = {value: index for index, value in enumerate(symbols)}
+    date_index = {value: index for index, value in enumerate(dates)}
+
+    def integer_array(key: str, dtype: Any, default: int = -1) -> Any:
+        return np.asarray(
+            [int(row.get(key, default)) for row in rows], dtype=dtype
+        )
+
+    target_arrays: dict[str, Any] = {
+        "schema": np.asarray([PREDICTION_RECORD_SCHEMA], dtype=np.int16),
+        "symbols": np.asarray(symbols),
+        "dates": np.asarray(dates),
+        "symbol_index": np.asarray(
+            [symbol_index[str(row["symbol"])] for row in rows],
+            dtype=np.int32,
+        ),
+        "date_index": np.asarray(
+            [date_index[str(row["date_key"])] for row in rows],
+            dtype=np.int16,
+        ),
+        "position": integer_array("position", np.int32),
+        "true_coarse_id": integer_array("true_coarse_id", np.int32),
+        "true_fine_id": integer_array("true_fine_id", np.int32),
+        "true_joint_id": integer_array("true_joint_id", np.int32),
+        "true_logret": np.asarray(
+            [float(row["true_logret"]) for row in rows], dtype=np.float64
+        ),
+        "base_close": np.asarray(
+            [float(row["base_close"]) for row in rows], dtype=np.float64
+        ),
+        "true_close": np.asarray(
+            [float(row["true_close"]) for row in rows], dtype=np.float64
+        ),
+    }
+    # The offset is the dictionary key rather than a field in each in-memory
+    # row; fill it in deterministically without bloating those row dictionaries.
+    target_arrays["window_offset"] = np.concatenate(
+        [
+            np.full(len(predictions[offset]), offset, dtype=np.int16)
+            for offset in sorted(predictions)
+        ]
+    )
+    prediction_arrays: dict[str, Any] = {
+        "schema": np.asarray([PREDICTION_RECORD_SCHEMA], dtype=np.int16),
+        "pred_coarse_id": integer_array("coarse_id", np.int32),
+        "pred_fine_id": integer_array("fine_id", np.int32),
+        "pred_joint_id": integer_array("joint_id", np.int32),
+        "pred_logret": np.asarray(
+            [float(row["pred_logret"]) for row in rows], dtype=np.float64
+        ),
+    }
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    targets_temporary = targets_path.with_suffix(
+        targets_path.suffix + ".tmp"
+    )
+    with targets_temporary.open("wb") as handle:
+        np.savez_compressed(handle, **target_arrays)
+    replace_with_retry(targets_temporary, targets_path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(handle, **prediction_arrays)
+    replace_with_retry(temporary, path)
+    return {
+        "schema": PREDICTION_RECORD_SCHEMA,
+        "path": str(path.resolve()),
+        "filename": path.name,
+        "size_bytes": path.stat().st_size,
+        "sha256": file_sha256(path),
+        "n_records": len(rows),
+        "n_symbols": len(symbols),
+        "n_dates": len(dates),
+        "prediction_columns": sorted(prediction_arrays),
+        "target_table": {
+            "path": str(targets_path.resolve()),
+            "filename": targets_path.name,
+            "size_bytes": targets_path.stat().st_size,
+            "sha256": file_sha256(targets_path),
+            "columns": sorted(target_arrays),
+        },
+        "reconstructable_views": [
+            "per-stock predictions",
+            "per-date predictions",
+            "per-window predictions",
+            "coarse/fine/joint distributions",
+            "coarse/fine/joint sparse confusion matrices",
+        ],
     }
 
 
@@ -688,6 +895,8 @@ def _flush_pending_ids(
         )
         window_starts = item["window_starts"]
         date_keys = item["date_keys"]
+        symbols = item["symbols"]
+        positions = item["positions"]
         true_logrets = item["true_logrets"]
         base_closes = item["base_closes"]
         true_closes = item["true_closes"]
@@ -701,6 +910,8 @@ def _flush_pending_ids(
                 "fine_id": fine_id,
                 "joint_id": coarse_id * vocab_fine + fine_id,
                 "date_key": date_keys[offset],
+                "symbol": symbols[offset],
+                "position": int(positions[offset]),
                 "pred_logret": float(pred_logret[offset]),
                 "true_logret": float(true_logrets[offset]),
                 "base_close": float(base_closes[offset]),
@@ -831,6 +1042,10 @@ def evaluate_prepared(
                                 ][span].numpy(),
                                 "window_starts": prepared["window_starts"][span].numpy(),
                                 "date_keys": prepared["date_keys"][span],
+                                "symbols": prepared["symbols"][span],
+                                "positions": prepared[
+                                    "selection_positions"
+                                ][span].numpy(),
                                 "p_means": prepared["p_means"][span].numpy(),
                                 "p_stds": prepared["p_stds"][span].numpy(),
                                 "true_logrets": prepared["true_logrets"][span].numpy(),
@@ -1150,8 +1365,17 @@ def validate_reference(
 _SUMMARY_PREFIX_FIELDS = (
     "epoch",
     "train_loss",
+    "train_coarse_loss",
+    "train_fine_loss",
+    "train_het_loss",
     "val_loss",
+    "val_coarse_loss",
+    "val_fine_loss",
+    "val_het_loss",
     "learning_rate",
+    "learning_rate_adam",
+    "optimizer_steps_this_epoch",
+    "global_step",
     "avg_da_per_date",
     "avg_da_above_baseline",
     "min_window_da",
@@ -1198,11 +1422,25 @@ SUMMARY_FIELDS = (
 
 
 def flatten_result(payload: dict[str, Any]) -> dict[str, Any]:
+    training = payload["training"]
     row = {
         "epoch": payload["epoch"],
-        "train_loss": payload["training"]["train_loss"],
-        "val_loss": payload["training"]["val_loss"],
-        "learning_rate": payload["training"]["learning_rate"],
+        "train_loss": training["train_loss"],
+        "train_coarse_loss": training.get("train_coarse_loss"),
+        "train_fine_loss": training.get("train_fine_loss"),
+        "train_het_loss": training.get("train_het_loss"),
+        "val_loss": training["val_loss"],
+        "val_coarse_loss": training.get(
+            "val_coarse_loss", training["val_loss"]
+        ),
+        "val_fine_loss": training.get("val_fine_loss"),
+        "val_het_loss": training.get("val_het_loss"),
+        "learning_rate": training["learning_rate"],
+        "learning_rate_adam": training.get("learning_rate_adam"),
+        "optimizer_steps_this_epoch": training.get(
+            "optimizer_steps_this_epoch"
+        ),
+        "global_step": training.get("global_step"),
         "elapsed_sec": payload["elapsed_sec"],
     }
     row.update(payload["aggregate"])
@@ -1223,7 +1461,7 @@ def write_summary(output_dir: Path, results: list[dict[str, Any]]) -> None:
 def make_plots(
     output_dir: Path,
     results: list[dict[str, Any]],
-    experiment_label: str = "Exp 04-C",
+    experiment_label: str = "Exp 04-B",
 ) -> None:
     import matplotlib
 
@@ -1576,6 +1814,11 @@ def main() -> int:
             raw_predictions,
             tokenizer,
         )
+        prediction_record_metadata = write_prediction_records(
+            prediction_records_path(output_dir, epoch),
+            evaluation_targets_path(output_dir),
+            raw_predictions,
+        )
         reference_validation = None
         if epoch == reference_epoch and not args.no_reference_check:
             references_exist = all(
@@ -1606,14 +1849,50 @@ def main() -> int:
             },
             "training": {
                 "train_loss": float(index_row["train_loss"]),
+                "train_coarse_loss": float(
+                    index_row.get(
+                        "train_coarse_loss", index_row["train_loss"]
+                    )
+                ),
+                "train_fine_loss": (
+                    float(index_row["train_fine_loss"])
+                    if index_row.get("train_fine_loss") is not None
+                    else None
+                ),
+                "train_het_loss": (
+                    float(index_row["train_het_loss"])
+                    if index_row.get("train_het_loss") is not None
+                    else None
+                ),
                 "val_loss": float(index_row["val_loss"]),
+                "val_coarse_loss": float(
+                    index_row.get("val_coarse_loss", index_row["val_loss"])
+                ),
+                "val_fine_loss": (
+                    float(index_row["val_fine_loss"])
+                    if index_row.get("val_fine_loss") is not None
+                    else None
+                ),
+                "val_het_loss": (
+                    float(index_row["val_het_loss"])
+                    if index_row.get("val_het_loss") is not None
+                    else None
+                ),
                 "learning_rate": float(index_row["learning_rate"]),
+                "learning_rate_adam": index_row.get(
+                    "learning_rate_adam"
+                ),
+                "optimizer_steps_this_epoch": int(
+                    index_row.get("optimizer_steps_this_epoch", 0)
+                ),
+                "global_step": int(index_row.get("global_step", 0)),
                 "best_so_far": bool(index_row["best_so_far"]),
             },
             "settings": settings,
             "aggregate": aggregate,
             "windows": {str(key): value for key, value in windows.items()},
             "token_distributions": distribution_metadata,
+            "prediction_records": prediction_record_metadata,
             "reference_validation": reference_validation,
             "n_forward_passes": n_forward,
             "elapsed_sec": elapsed_sec,

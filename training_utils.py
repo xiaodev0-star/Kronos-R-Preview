@@ -1,7 +1,7 @@
-"""Shared, numerically conservative training-runtime helpers.
+"""Shared, numerically conservative CUDA training helpers.
 
-The project runs primarily on Windows, where ``torch.compile``/Triton is not
-available.  These helpers use native PyTorch CUDA paths only:
+These paths work with standard PyTorch CUDA builds on Ubuntu and Windows and
+do not require Triton or a separately compiled extension:
 
 * foreach gradient clipping (same reduction/update semantics);
 * a manually captured fixed-shape forward/backward/clip step;

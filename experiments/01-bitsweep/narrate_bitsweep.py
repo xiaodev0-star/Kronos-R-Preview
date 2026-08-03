@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,14 @@ import numpy as np
 
 SCRIPT_PATH = Path(__file__).resolve()
 EXPERIMENT_DIR = SCRIPT_PATH.parent
-DEFAULT_ROOT = EXPERIMENT_DIR / "rerun_seed42"
+ROOT = SCRIPT_PATH.parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from experiment_io import default_study_roots
+
+DEFAULT_WEIGHTS_ROOT, DEFAULT_ROOT = default_study_roots(
+    "01-bitsweep", seed=42
+)
 ANALYSIS_PATH = EXPERIMENT_DIR / "analyze_bitsweep_epochwise.py"
 
 
@@ -303,6 +311,9 @@ def render_narrative(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument(
+        "--weights_root", type=Path, default=DEFAULT_WEIGHTS_ROOT
+    )
     parser.add_argument("--select_config", default="")
     parser.add_argument("--rationale", default="")
     return parser.parse_args()
@@ -311,6 +322,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     root = args.root.resolve()
+    weights_root = args.weights_root.resolve()
     manifest = load_json(root / "study_manifest.json")
     rows = load_json(root / "combined_epoch_summary.json")
     expected = len(manifest["settings"]["configs"]) * int(
@@ -339,7 +351,7 @@ def main() -> int:
     if selected is not None:
         chosen = next(row for row in summary if row["config"] == selected)
         config_dir = (
-            root
+            weights_root
             / "configs"
             / f"bits_{chosen['bits_l1']:02d}_{chosen['bits_l2']:02d}"
         )
@@ -353,12 +365,17 @@ def main() -> int:
                 "tokenizer_path": str(
                     (config_dir / "tokenizer.pt").resolve()
                 ),
+                "tokenizer_weight_relative_path": (
+                    config_dir / "tokenizer.pt"
+                ).relative_to(weights_root).as_posix(),
             },
             "selection_rule": (
                 "Staged non-composite judgment over mature quality, mature "
                 "behaviour, tokenizer sufficiency, and codebook complexity."
             ),
             "rationale": rationale,
+            "human_review_recorded": True,
+            "upstream_eligible": True,
             "holdout_used": False,
         }
         atomic_write_json(root / "selection.json", selection)

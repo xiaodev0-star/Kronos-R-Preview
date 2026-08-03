@@ -25,8 +25,14 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, position_ids):
-        freqs = torch.einsum("bi,d->bid", position_ids.float(), self.inv_freq)
-        return torch.sin(freqs), torch.cos(freqs)
+        # RoPE angles must be constructed in fp32. CUDA autocast treats einsum
+        # as a low-precision op and otherwise rounds integer positions to bf16
+        # before the angles are formed (positions 3000 and 3001 then collide).
+        with torch.amp.autocast(position_ids.device.type, enabled=False):
+            freqs = torch.einsum(
+                "bi,d->bid", position_ids.float(), self.inv_freq.float()
+            )
+            return torch.sin(freqs), torch.cos(freqs)
 
 
 def _rotate_half(x):
@@ -36,8 +42,10 @@ def _rotate_half(x):
 
 def _apply_rope(q, k, sin, cos):
     # sin, cos: [B, N, d//2] -> [B, 1, N, d//2]
-    sin = sin.unsqueeze(1)
-    cos = cos.unsqueeze(1)
+    # Keep angle generation accurate, then match Q/K precision for the rotary
+    # multiply so mixed-precision attention retains its original memory cost.
+    sin = sin.to(dtype=q.dtype).unsqueeze(1)
+    cos = cos.to(dtype=q.dtype).unsqueeze(1)
     q1, q2 = q.chunk(2, dim=-1)
     k1, k2 = k.chunk(2, dim=-1)
     # Algebraically and bitwise identical to concatenating sin/cos to head_dim,

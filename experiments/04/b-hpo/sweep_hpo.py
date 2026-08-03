@@ -1,17 +1,28 @@
-r"""Exp 04-C: one-stage, full-data GPT hyperparameter search.
+r"""Exp 04-B: one-stage, full-data GPT hyperparameter search (Muon recipe).
 
 The study deliberately uses the final training distribution for every trial.
 There is no small-stock screening phase.  The baseline is always trial 1, the
 search seed and training seed are fixed at 42, and the final holdout is only
 opened by the explicit ``--holdout`` command after all planned trials finish.
 
-Normal search:
-    D:\conda_envs\llm-t\Scripts\python.exe \
-        experiments\04\c-hpo\sweep_hpo.py
+The 2026-07-28 revision follows the Exp 04-A data-driven selection: the fixed
+optimizer is Muon (2D weights) + AdamW (1D/embeddings) and the primary search
+axis is ``lr_muon``. The default epoch budget is 50 so each trial's full
+trajectory feeds the all-epoch token-quality ranking (matching Exp 03/04-A);
+the cosine schedule rescales with the epoch budget, so a 50-epoch run anneals
+completely.
+
+Normal search (reads reviewed Exp 02/03/04-A selections from server_runs/):
+    python experiments/04/b-hpo/sweep_hpo.py
+
+Server run without server_runs/ (portable bundle carries the tokenizer,
+the Exp 03 architecture, and the Exp 04-A muon selection; output still goes
+to KRONOS_WEIGHTS_ROOT/KRONOS_RESULTS_ROOT, defaulting to server_runs/):
+    python experiments/04/b-hpo/sweep_hpo.py --portable
 
 Temporary end-to-end smoke test:
-    D:\conda_envs\llm-t\Scripts\python.exe \
-        experiments\04\c-hpo\sweep_hpo.py --smoke
+    python experiments/04/b-hpo/sweep_hpo.py --smoke
+    python experiments/04/b-hpo/sweep_hpo.py --smoke --portable
 """
 
 from __future__ import annotations
@@ -22,6 +33,7 @@ import json
 import math
 import os
 import random
+import shlex
 import shutil
 import subprocess
 import sys
@@ -37,40 +49,48 @@ EXP_DIR = Path(__file__).resolve().parent
 EXP04_DIR = EXP_DIR.parent
 if str(EXP04_DIR) not in sys.path:
     sys.path.insert(0, str(EXP04_DIR))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import ablation_common as AB_COMMON
+from experiment_io import (
+    StudyLayout,
+    default_study_roots,
+    runtime_environment,
+    write_download_manifest,
+)
 
 TRAIN_SCRIPT = ROOT / "train_base.py"
 EVAL_SCRIPT = ROOT / "eval.py"
 TRAJECTORY_SCRIPT = EXP_DIR / "evaluate_epoch_trajectory.py"
-DEFAULT_OUTPUT_ROOT = EXP_DIR / "run_seed42"
-DEFAULT_ARCH_SELECTION = (
-    ROOT
-    / "experiments"
-    / "03-gpt-scaling-sup"
-    / "run_seed42"
-    / "selection.json"
+DEFAULT_WEIGHTS_ROOT, DEFAULT_RESULTS_ROOT = default_study_roots(
+    "04b-hpo", seed=42
 )
-EXP04A_SELECTION = (
-    EXP04_DIR / "a-loss-ablation" / "run_seed42" / "selection.json"
+_, EXP03_RESULTS_ROOT = default_study_roots("03-gpt-scaling", seed=42)
+_, EXP04A_RESULTS_ROOT = default_study_roots(
+    "04a-optimizer-ablation", seed=42
 )
-EXP04B_SELECTION = (
-    EXP04_DIR / "b-optimizer-ablation" / "run_seed42" / "selection.json"
-)
-EXPECTED_PYTHON = Path(r"D:\conda_envs\llm-t\Scripts\python.exe")
-
+DEFAULT_ARCH_SELECTION = EXP03_RESULTS_ROOT / "selection.json"
+EXP04A_SELECTION = EXP04A_RESULTS_ROOT / "selection.json"
 SEED = 42
-DEFAULT_VALIDATION_OFFSETS = (0, 100, 200, 300)
 HOLDOUT_OFFSET = 400
+EVAL_DAYS = 1
+# Full-coverage, single-day-resolution screening: tile the pre-holdout region
+# [0, HOLDOUT_OFFSET) with contiguous EVAL_DAYS-day windows (offsets
+# 0, 1, ..., 399) so every pre-holdout trading day is scored as its own window.
+DEFAULT_VALIDATION_OFFSETS = tuple(range(0, HOLDOUT_OFFSET, EVAL_DAYS))
+# The final sealed holdout is a separate, once-only gate at offset
+# HOLDOUT_OFFSET and is intentionally a single fixed window.
 HOLDOUT_DAYS = 80
 DEFAULT_TIME_BUDGET_HOURS = 10.0
 REFERENCE_EPOCHS = 50
-# Conservative xlarge reference cost; if Exp 03-Sup selects a smaller model,
-# this deliberately under-promises the number of HPO trials within the budget.
-ESTIMATED_TRAIN_MINUTES = 137.3
-ESTIMATED_VALIDATION_MINUTES = 139.6
+# Measured Exp 04-A deep-architecture cost (2026-07-28): training ~96 s/epoch
+# and trajectory evaluation ~40 s/epoch, normalized to the 50-epoch reference.
+ESTIMATED_TRAIN_MINUTES = 82.0
+ESTIMATED_VALIDATION_MINUTES = 35.0
 BUDGET_RESERVE_MINUTES = 30.0
 IMPLEMENTATION_FILES = (
+    "experiment_io.py",
     "train_base.py",
     "eval.py",
     "eval_helpers.py",
@@ -79,15 +99,18 @@ IMPLEMENTATION_FILES = (
     "model/layers.py",
     "model/kronos_preview.py",
     "model/tokenizer.py",
-    "experiments/04/c-hpo/sweep_hpo.py",
-    "experiments/04/c-hpo/evaluate_epoch_trajectory.py",
+    "experiments/04/b-hpo/sweep_hpo.py",
+    "experiments/04/b-hpo/evaluate_epoch_trajectory.py",
     "experiments/04/ablation_common.py",
 )
 
-# Exp 04-A/B fix CE + AdamW.  C uses a deterministic, interpretable sequence
-# of full-data trials rather than a confounded random draw from a large grid.
+# Exp 04-A selected Muon (CE was fixed without a separate loss ablation).  B
+# uses a deterministic, interpretable sequence of full-data trials rather than
+# a confounded random draw from a large grid.  lr_muon is the primary axis; the
+# AdamW-side lr only covers embeddings/1D parameters under Muon.
 SEARCH_SPACE: dict[str, list[float]] = {
-    "lr": [5e-5, 7.5e-5, 1e-4, 1.5e-4, 2e-4, 3e-4],
+    "lr_muon": [0.005, 0.01, 0.02, 0.03, 0.04],
+    "lr": [1e-4, 3e-4, 6e-4],
     "dropout": [0.0, 0.05, 0.10, 0.15, 0.20],
     "weight_decay": [0.001, 0.01, 0.05, 0.10],
     "fine_weight": [0.0, 0.10, 0.20, 0.30, 0.50],
@@ -98,6 +121,7 @@ SEARCH_SPACE: dict[str, list[float]] = {
 
 BASELINE: dict[str, float] = {
     "lr": 3e-4,
+    "lr_muon": 0.02,
     "dropout": 0.10,
     "weight_decay": 0.01,
     "fine_weight": 0.30,
@@ -113,29 +137,33 @@ def _candidate(**overrides: float) -> dict[str, float]:
     return params
 
 
-# Prefixes are meaningful: the default 10-hour budget covers the low-LR screen
-# and the first regularization probes.  Every trial remains full-data/full-seq.
+# Prefixes are meaningful: the default budget covers the lr_muon screen, the
+# AdamW-side lr probes, then the regularization probes at the baseline
+# lr_muon.  Every trial remains full-data/full-seq.
 CANDIDATE_PLAN: tuple[dict[str, float], ...] = (
     dict(BASELINE),
+    _candidate(lr_muon=0.01),
+    _candidate(lr_muon=0.04),
+    _candidate(lr_muon=0.005),
+    _candidate(lr_muon=0.03),
     _candidate(lr=1e-4),
-    _candidate(lr=5e-5),
-    _candidate(lr=7.5e-5),
-    _candidate(lr=1.5e-4),
-    _candidate(lr=2e-4),
-    _candidate(lr=1e-4, dropout=0.0),
-    _candidate(lr=1e-4, dropout=0.05),
-    _candidate(lr=1e-4, label_smoothing=0.03),
-    _candidate(lr=1e-4, label_smoothing=0.05),
-    _candidate(lr=1e-4, dropout=0.15),
-    _candidate(lr=1e-4, dropout=0.20),
-    _candidate(lr=1e-4, label_smoothing=0.10),
-    _candidate(lr=1e-4, fine_weight=0.10),
-    _candidate(lr=1e-4, fine_weight=0.50),
-    _candidate(lr=1e-4, het_weight=0.0),
-    _candidate(lr=1e-4, het_weight=0.20),
-    _candidate(lr=1e-4, weight_decay=0.05),
-    _candidate(lr=1e-4, warmup_ratio=0.10),
-    _candidate(lr=1e-4, weight_decay=0.001),
+    _candidate(lr=6e-4),
+    _candidate(dropout=0.05),
+    _candidate(dropout=0.20),
+    _candidate(weight_decay=0.05),
+    _candidate(label_smoothing=0.05),
+    _candidate(fine_weight=0.10),
+    _candidate(het_weight=0.0),
+    _candidate(warmup_ratio=0.10),
+    _candidate(dropout=0.0),
+    _candidate(weight_decay=0.001),
+    # Extended probes (trials 17-20) for the server run at epochs=50: each
+    # pushes one regularizer further from the baseline so the full-trajectory
+    # token-quality ranking sees the edges of the grid, not just its centre.
+    _candidate(label_smoothing=0.10),
+    _candidate(warmup_ratio=0.02),
+    _candidate(fine_weight=0.50),
+    _candidate(het_weight=0.20),
 )
 
 
@@ -181,20 +209,11 @@ def sha256_file(path: Path) -> str:
 
 
 def ensure_runtime() -> None:
-    if sys.version_info[:3] != (3, 12, 10):
+    if sys.version_info < (3, 10):
         raise RuntimeError(
-            f"Exp 04-C requires Python 3.12.10, got {sys.version.split()[0]} "
+            f"Exp 04-B requires Python >=3.10, got {sys.version.split()[0]} "
             f"at {sys.executable}"
         )
-    if EXPECTED_PYTHON.exists():
-        actual = Path(sys.executable).resolve()
-        expected = EXPECTED_PYTHON.resolve()
-        if actual != expected:
-            raise RuntimeError(
-                "Use the project environment: "
-                rf"D:\conda_envs\llm-t\Scripts\python.exe "
-                f"(current: {actual})"
-            )
     if (
         not TRAIN_SCRIPT.is_file()
         or not EVAL_SCRIPT.is_file()
@@ -221,7 +240,7 @@ def estimated_trial_minutes(epochs: int) -> float:
     return train_minutes + validation_minutes
 
 
-def recommended_trial_count(time_budget_hours: float, epochs: int = 30) -> int:
+def recommended_trial_count(time_budget_hours: float, epochs: int = 50) -> int:
     available_minutes = time_budget_hours * 60.0 - BUDGET_RESERVE_MINUTES
     return min(
         len(CANDIDATE_PLAN),
@@ -264,6 +283,7 @@ def study_settings(
     validation_offsets: tuple[int, ...],
     eval_days: int,
     batch_tokens: int,
+    accumulation_steps: int,
     eval_batch_size: int,
     max_collapse_rate: float,
     min_unique_tokens: int,
@@ -277,6 +297,7 @@ def study_settings(
     effective_batch_tokens = (
         2048 if smoke else batch_tokens or int(architecture["batch_tokens"])
     )
+    effective_accumulation = 8 if smoke else accumulation_steps
     effective_eval_batch_size = (
         1 if smoke else eval_batch_size or int(architecture["eval_batch_size"])
     )
@@ -287,16 +308,17 @@ def study_settings(
         "tokenizer": tokenizer,
         "architecture": architecture,
         "upstream_selections": upstream_selections,
+        "dataset": AB_COMMON.PIPE.dataset_signature(),
         "implementation_sha256": {
             relative: sha256_file(ROOT / relative)
             for relative in IMPLEMENTATION_FILES
         },
         "loss": "ce",
-        "optimizer": "adamw",
+        "optimizer": "muon",
         "max_stocks": 24 if smoke else 0,
         "max_seq_len": 256 if smoke else 0,
         "batch_tokens": effective_batch_tokens,
-        "accumulation_steps": 8 if smoke else 32,
+        "accumulation_steps": effective_accumulation,
         "constant_accumulation": True,
         "controlled_loader_seed": SEED,
         "exact_accumulation_boundaries": True,
@@ -323,10 +345,11 @@ def study_settings(
         },
         "retain_epoch_checkpoints": True,
         "evaluate_every_epoch": True,
-        "mature_window_epochs": min(5, epochs),
+        "mature_window_epochs": epochs,
         "mature_window_policy": (
-            "Best stable 5-epoch window after maturity onset, restricted to "
-            "the 1%-of-best validation-loss basin when available."
+            "Full epoch trajectory as a single window; the maturity onset and "
+            "1%-of-best validation-loss basin are recorded for audit but no "
+            "longer restrict which epochs enter the ranking."
         ),
         "smoke": smoke,
     }
@@ -342,12 +365,13 @@ def study_fingerprint(settings: dict[str, Any], plan: list[dict[str, Any]]) -> s
 
 
 def prepare_manifest(
-    output_root: Path,
+    results_root: Path,
     settings: dict[str, Any],
     plan: list[dict[str, Any]],
+    layout: StudyLayout,
 ) -> dict[str, Any]:
     fingerprint = study_fingerprint(settings, plan)
-    manifest_path = output_root / "study_manifest.json"
+    manifest_path = results_root / "study_manifest.json"
     if manifest_path.exists():
         manifest = load_json(manifest_path)
         if manifest.get("study_fingerprint") != fingerprint:
@@ -358,7 +382,7 @@ def prepare_manifest(
         return manifest
 
     manifest = {
-        "experiment": "Exp 04-C",
+        "experiment": "Exp 04-B",
         "design": "one-stage full-data HPO",
         "status": "planned",
         "created_at_utc": utc_now(),
@@ -369,24 +393,38 @@ def prepare_manifest(
         "search_space": SEARCH_SPACE,
         "baseline": BASELINE,
         "plan": plan,
+        "artifact_layout": layout.metadata(),
+        "runtime_environment": runtime_environment(ROOT),
     }
     atomic_write_json(manifest_path, manifest)
     return manifest
 
 
-def trial_paths(output_root: Path, tid: str) -> dict[str, Path]:
-    directory = output_root / "trials" / tid
+def trial_paths(
+    results_root: Path,
+    tid: str,
+    weights_root: Path | None = None,
+) -> dict[str, Path]:
+    if weights_root is None:
+        manifest_path = results_root / "study_manifest.json"
+        manifest = load_json(manifest_path)
+        weights_root = Path(manifest["artifact_layout"]["weights_root"])
+    results = results_root / "trials" / tid
+    weights = weights_root / "trials" / tid
     return {
-        "directory": directory,
-        "params": directory / "params.json",
-        "override": directory / "override.json",
-        "model": directory / "model.pt",
-        "resume": directory / "model.pt.ckpt",
-        "checkpoint_index": directory / "model_checkpoints.json",
-        "result": directory / "result.json",
-        "history": directory / f"history_exp04c_{tid}.json",
-        "trajectory": directory / "epoch_trajectory",
-        "trajectory_log": directory / "trajectory.log",
+        "directory": results,
+        "weights_directory": weights,
+        "params": results / "params.json",
+        "override": results / "override.json",
+        "model": weights / "model.pt",
+        "resume": weights / "model.pt.ckpt",
+        "checkpoint_index": results / "model_checkpoints.json",
+        "result": results / "result.json",
+        "history": results / f"history_exp04b_{tid}.json",
+        "trajectory": results / "epoch_trajectory",
+        "gpt_log": results / "gpt.log",
+        "trajectory_log": results / "trajectory.log",
+        "prepared_cache": weights_root / "shared" / "prepared_eval",
     }
 
 
@@ -444,11 +482,12 @@ def build_train_command(
         "--save_path", str(paths["model"]),
         "--tokenizer_path", str(settings["tokenizer"]["path"]),
         "--epochs", str(settings["epochs"]),
-        "--tag", f"exp04c_{tid}",
+        "--tag", f"exp04b_{tid}",
         "--loss", "ce",
         "--gamma", "0",
-        "--optimizer", "adamw",
+        "--optimizer", "muon",
         "--lr", str(params["lr"]),
+        "--lr_muon", str(params["lr_muon"]),
         "--dropout", str(params["dropout"]),
         "--weight_decay", str(params["weight_decay"]),
         "--fine_weight", str(params["fine_weight"]),
@@ -462,6 +501,7 @@ def build_train_command(
         "--batch_cap", "64",
         "--early_stop_patience", "0",
         "--history_per_epoch",
+        "--metrics_dir", str(paths["directory"]),
         "--constant_accumulation",
         "--controlled_loader_seed",
         str(settings["controlled_loader_seed"]),
@@ -505,13 +545,32 @@ def build_eval_command(
     ]
 
 
-def run_command(command: list[str], env: dict[str, str]) -> None:
-    print("\n$ " + subprocess.list2cmdline(command), flush=True)
+def run_command(
+    command: list[str],
+    env: dict[str, str],
+    *,
+    log_path: Path | None = None,
+    label: str = "Exp 04-B subprocess",
+) -> None:
+    if log_path is not None:
+        AB_COMMON.PIPE.run_command(
+            command,
+            env=env,
+            log_path=log_path,
+            label=label,
+        )
+        return
+    rendered = (
+        subprocess.list2cmdline(command)
+        if os.name == "nt"
+        else shlex.join(command)
+    )
+    print("\n$ " + rendered, flush=True)
     completed = subprocess.run(command, cwd=ROOT, env=env, check=False)
     if completed.returncode:
         raise RuntimeError(
             f"Command failed with exit code {completed.returncode}: "
-            f"{subprocess.list2cmdline(command)}"
+            f"{rendered}"
         )
 
 
@@ -676,13 +735,7 @@ def run_epoch_trajectory(
             "--output_dir",
             str(paths["trajectory"]),
             "--prepared_cache_dir",
-            str(
-                (
-                    paths["directory"].parents[1]
-                    / "shared"
-                    / "prepared_eval"
-                ).resolve()
-            ),
+            str(paths["prepared_cache"].resolve()),
             "--epochs",
             f"1-{settings['epochs']}",
             "--offsets",
@@ -703,13 +756,13 @@ def run_epoch_trajectory(
             str(settings["min_unique_tokens"]),
             "--no_reference_check",
             "--experiment_label",
-            f"Exp 04-C HPO · {tid}",
+            f"Exp 04-B HPO · {tid}",
         ]
         AB_COMMON.PIPE.run_command(
             command,
             env=env,
             log_path=paths["trajectory_log"],
-            label=f"Exp 04-C {tid} epoch trajectory",
+            label=f"Exp 04-B {tid} epoch trajectory",
         )
     if not AB_COMMON.PIPE.trajectory_is_complete(paths, settings["epochs"]):
         raise RuntimeError(f"Trajectory completion check failed for {tid}")
@@ -726,11 +779,16 @@ def run_epoch_trajectory(
 def aggregate_trajectory(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not rows:
         raise ValueError("No trajectory rows")
-    mature, mature_metadata = AB_COMMON.select_mature_window(rows)
-    mature_count = len(mature)
+    # select_mature_window now returns the full epoch trajectory as a single
+    # window, so the aggregates below summarize the whole training run instead
+    # of a narrow mature plateau. Output field names still carry the legacy
+    # "mature_" prefix to avoid breaking downstream consumers, but the values
+    # are full-trajectory statistics.
+    window_rows, window_metadata = AB_COMMON.select_mature_window(rows)
+    epoch_count = len(window_rows)
 
     def median(field: str) -> float:
-        values = sorted(float(row[field]) for row in mature)
+        values = sorted(float(row[field]) for row in window_rows)
         middle = len(values) // 2
         if len(values) % 2:
             return values[middle]
@@ -739,7 +797,7 @@ def aggregate_trajectory(rows: list[dict[str, Any]]) -> dict[str, Any]:
     def optional_median(field: str) -> float | None:
         values = sorted(
             float(row[field])
-            for row in mature
+            for row in window_rows
             if row.get(field) is not None
         )
         if not values:
@@ -752,18 +810,18 @@ def aggregate_trajectory(rows: list[dict[str, Any]]) -> dict[str, Any]:
     best_da = max(rows, key=lambda row: float(row["avg_da_per_date"]))
     best_rankic = max(rows, key=lambda row: float(row["avg_daily_rank_ic"]))
     best_mape = min(rows, key=lambda row: float(row["avg_mape"]))
-    healthy_epochs = sum(bool(row["healthy"]) for row in mature)
+    healthy_epochs = sum(bool(row["healthy"]) for row in window_rows)
     amp_ratio = median("avg_ampratio")
     return {
-        # A legal HPO candidate must remain healthy across the selected stable
-        # mature window; a one-epoch pass is not enough to open the holdout.
-        "healthy": healthy_epochs == mature_count,
+        # A legal HPO candidate must remain healthy across the full trajectory;
+        # a one-epoch pass is not enough to open the holdout.
+        "healthy": healthy_epochs == epoch_count,
         "healthy_epochs_in_mature_window": healthy_epochs,
-        "mature_window_epochs": mature_metadata["window_epochs"],
-        "representative_epoch": int(mature[len(mature) // 2]["epoch"]),
-        "maturity_onset_epoch": mature_metadata["maturity_onset_epoch"],
-        "minimum_val_loss": mature_metadata["minimum_val_loss"],
-        "near_best_loss_ceiling": mature_metadata[
+        "mature_window_epochs": window_metadata["window_epochs"],
+        "representative_epoch": int(window_rows[len(window_rows) // 2]["epoch"]),
+        "maturity_onset_epoch": window_metadata["maturity_onset_epoch"],
+        "minimum_val_loss": window_metadata["minimum_val_loss"],
+        "near_best_loss_ceiling": window_metadata[
             "near_best_loss_ceiling"
         ],
         "avg_da_per_date": median("avg_da_per_date"),
@@ -773,6 +831,7 @@ def aggregate_trajectory(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_baseline_mape": median("avg_baseline_mape"),
         "avg_ampratio": amp_ratio,
         "ampratio_log_error": abs(math.log(amp_ratio)) if amp_ratio > 0 else None,
+        "median_daily_collapse_rate": median("median_daily_collapse_rate"),
         "p90_daily_collapse_rate": median("p90_daily_collapse_rate"),
         "worst_collapse_rate": median("worst_daily_collapse_rate"),
         "median_daily_unique_tokens": median("median_daily_unique_tokens"),
@@ -782,6 +841,9 @@ def aggregate_trajectory(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "p10_daily_codebook_balance_score": optional_median(
             "p10_daily_codebook_balance_score"
+        ),
+        "median_daily_token_support_f1": optional_median(
+            "median_daily_token_support_f1"
         ),
         "median_daily_target_support_recall": optional_median(
             "median_daily_target_support_recall"
@@ -804,23 +866,26 @@ def aggregate_trajectory(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def result_sort_key(result: dict[str, Any]) -> tuple[Any, ...]:
+    # Token-balance-dominant ordering, aligned with Exp 03's selection
+    # philosophy. Downstream DA/RankIC/MAPE/AmpRatio are demoted to
+    # guardrails inspected by the caller, not tie-breakers here.
     aggregate = result["validation"]["aggregate"]
-    amp_error = aggregate.get("ampratio_log_error")
-    codebook_balance = aggregate.get(
-        "median_daily_codebook_balance_score"
-    )
+    codebook_balance = aggregate.get("median_daily_codebook_balance_score")
+    p10_balance = aggregate.get("p10_daily_codebook_balance_score")
+    support_f1 = aggregate.get("median_daily_token_support_f1")
+    token_jsd = aggregate.get("median_daily_token_jsd")
+    effective_alignment = aggregate.get("median_daily_effective_token_alignment")
+    collapse = aggregate.get("median_daily_collapse_rate")
+    unique = aggregate.get("median_daily_unique_tokens")
     return (
-        0 if aggregate.get("healthy", False) else 1,
-        -float(aggregate.get("avg_da_per_date", -math.inf)),
-        -float(aggregate.get("avg_daily_rank_ic", -math.inf)),
-        float(aggregate.get("avg_mape", math.inf)),
-        float(amp_error) if amp_error is not None else math.inf,
-        float(aggregate.get("worst_collapse_rate", math.inf)),
-        (
-            -float(codebook_balance)
-            if codebook_balance is not None
-            else math.inf
-        ),
+        0 if aggregate.get("healthy", False) else 1,  # health gate retained
+        -float(codebook_balance) if codebook_balance is not None else math.inf,
+        -float(p10_balance) if p10_balance is not None else math.inf,
+        -float(support_f1) if support_f1 is not None else math.inf,
+        float(token_jsd) if token_jsd is not None else math.inf,
+        -float(effective_alignment) if effective_alignment is not None else -math.inf,
+        float(collapse) if collapse is not None else math.inf,
+        -float(unique) if unique is not None else -math.inf,
         result["tid"],
     )
 
@@ -892,15 +957,10 @@ def write_leaderboard(output_root: Path) -> dict[str, Any]:
     leaderboard = {
         "updated_at_utc": utc_now(),
         "selection_rule": [
-            "select each trial's stable 5-epoch window inside the 1%-of-best "
-            "validation-loss basin when possible",
-            "all epochs in that selected window pass the daily health gate",
-            "higher selected-window median daily DA",
-            "higher selected-window median daily RankIC",
-            "lower selected-window median MAPE",
-            "selected-window median AmpRatio closer to 1",
-            "lower selected-window median worst-day collapse",
-            "higher target-relative codebook balance as the final guardrail",
+            "No weighted score. Each trial is summarized over its full epoch trajectory.",
+            "Primary ranking is by target-relative coarse codebook balance (median, p10), token support F1, token JSD, effective token alignment, collapse, and unique tokens.",
+            "Downstream DA/RankIC/MAPE/AmpRatio serve only as guardrails.",
+            "Baseline (Exp 04-A selected optimizer) must not be dominated.",
         ],
         "n_completed": len(rows),
         "rows": rows,
@@ -927,15 +987,18 @@ def write_leaderboard(output_root: Path) -> dict[str, Any]:
 def run_trial(
     *,
     trial: dict[str, Any],
-    output_root: Path,
+    layout: StudyLayout,
     settings: dict[str, Any],
     study_id: str,
     cache_root: Path,
 ) -> dict[str, Any]:
     tid = trial["tid"]
     params = trial["params"]
-    paths = trial_paths(output_root, tid)
+    paths = trial_paths(
+        layout.results_root, tid, layout.weights_root
+    )
     paths["directory"].mkdir(parents=True, exist_ok=True)
+    paths["weights_directory"].mkdir(parents=True, exist_ok=True)
     atomic_write_json(paths["params"], params)
     atomic_write_json(
         paths["override"],
@@ -963,6 +1026,8 @@ def run_trial(
             run_command(
                 build_train_command(params, paths, settings, tid),
                 env,
+                log_path=paths["gpt_log"],
+                label=f"Exp 04-B {tid} GPT",
             )
             if not paths["model"].exists():
                 raise RuntimeError(f"Training did not produce {paths['model']}")
@@ -1025,7 +1090,7 @@ def run_trial(
             "params": params,
             "fixed": {
                 "loss": "ce",
-                "optimizer": "adamw",
+                "optimizer": "muon",
                 "max_stocks": settings["max_stocks"],
                 "max_seq_len": settings["max_seq_len"],
                 "epochs": settings["epochs"],
@@ -1078,17 +1143,18 @@ def run_trial(
 
 
 def run_search(
-    output_root: Path,
+    layout: StudyLayout,
     settings: dict[str, Any],
 ) -> dict[str, Any]:
+    output_root = layout.results_root
     tokenizer = Path(settings["tokenizer"]["path"])
     if not tokenizer.is_file():
         raise FileNotFoundError(f"Tokenizer checkpoint not found: {tokenizer}")
     if not settings["smoke"] and settings["max_stocks"] != 0:
-        raise RuntimeError("Formal Exp 04-C must use all stocks")
+        raise RuntimeError("Formal Exp 04-B must use all stocks")
 
     plan = build_trial_plan(settings["n_trials"])
-    manifest = prepare_manifest(output_root, settings, plan)
+    manifest = prepare_manifest(output_root, settings, plan, layout)
     study_id = manifest["study_fingerprint"]
     manifest["status"] = "running"
     manifest.setdefault("started_at_utc", utc_now())
@@ -1097,7 +1163,7 @@ def run_search(
     atomic_write_json(output_root / "study_manifest.json", manifest)
 
     print("=" * 78)
-    print("Exp 04-C | one-stage full-data HPO")
+    print("Exp 04-B | one-stage full-data HPO")
     print(f"Python: {sys.executable}")
     print(
         f"Trials: {len(plan)} (baseline first), seed={SEED}, "
@@ -1135,10 +1201,10 @@ def run_search(
             )
             run_trial(
                 trial=trial,
-                output_root=output_root,
+                layout=layout,
                 settings=settings,
                 study_id=study_id,
-                cache_root=output_root / "shared",
+                cache_root=layout.weights_root / "shared",
             )
             write_leaderboard(output_root)
     except BaseException as exc:
@@ -1152,7 +1218,9 @@ def run_search(
     manifest["completed_at_utc"] = utc_now()
     manifest.pop("error", None)
     atomic_write_json(output_root / "study_manifest.json", manifest)
-    return write_leaderboard(output_root)
+    leaderboard = write_leaderboard(output_root)
+    write_download_manifest(layout)
+    return leaderboard
 
 
 def percentile(sorted_values: list[float], probability: float) -> float:
@@ -1270,7 +1338,7 @@ def run_holdout(output_root: Path) -> dict[str, Any]:
     )
     comparison = paired_daily_da_comparison(winner_metrics, baseline_metrics)
     result = {
-        "experiment": "Exp 04-C final holdout",
+        "experiment": "Exp 04-B final holdout",
         "evaluated_at_utc": utc_now(),
         "study_fingerprint": manifest["study_fingerprint"],
         "selection_used_only_validation_windows": True,
@@ -1308,8 +1376,12 @@ def run_smoke(
     architecture: dict[str, Any],
     upstream_selections: dict[str, Any],
 ) -> None:
-    with tempfile.TemporaryDirectory(prefix="kronos_exp04c_smoke_") as temp:
-        output_root = Path(temp)
+    with tempfile.TemporaryDirectory(prefix="kronos_exp04b_smoke_") as temp:
+        temporary_root = Path(temp)
+        layout = StudyLayout.create(
+            temporary_root / "weights",
+            temporary_root / "results",
+        )
         settings = study_settings(
             n_trials=1,
             epochs=1,
@@ -1319,6 +1391,7 @@ def run_smoke(
             validation_offsets=(0,),
             eval_days=2,
             batch_tokens=2048,
+            accumulation_steps=args.accumulation_steps,
             eval_batch_size=args.eval_batch_size,
             max_collapse_rate=1.0,
             min_unique_tokens=1,
@@ -1326,12 +1399,14 @@ def run_smoke(
             trial_count_source="smoke",
             smoke=True,
         )
-        leaderboard = run_search(output_root, settings)
+        leaderboard = run_search(layout, settings)
         rows = leaderboard.get("rows", [])
         if len(rows) != 1 or not rows[0]["healthy"]:
             raise RuntimeError("Smoke test did not produce one healthy completed trial")
-        epoch_snapshots = list(output_root.rglob("*_ep*.pt"))
-        checkpoint_indexes = list(output_root.rglob("*_checkpoints.json"))
+        epoch_snapshots = list(layout.weights_root.rglob("*_ep*.pt"))
+        checkpoint_indexes = list(
+            layout.results_root.rglob("*_checkpoints.json")
+        )
         if len(epoch_snapshots) != 1 or len(checkpoint_indexes) != 1:
             raise RuntimeError(
                 "Smoke test did not retain exactly one epoch snapshot and index: "
@@ -1350,12 +1425,14 @@ def run_smoke(
             "\nSMOKE TEST PASSED: train -> checkpoints -> all-epoch shifted "
             "window eval -> mature aggregation -> leaderboard"
         )
-        print(f"Temporary artifacts will now be removed: {output_root}")
+        print(
+            f"Temporary artifacts will now be removed: {temporary_root}"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Exp 04-C one-stage full-data HPO (fixed seed=42)"
+        description="Exp 04-B one-stage full-data HPO (fixed seed=42)"
     )
     parser.add_argument(
         "--n_trials",
@@ -1370,9 +1447,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TIME_BUDGET_HOURS,
         help="Planning budget used when --n_trials is omitted (default: 10)",
     )
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument(
-        "--output_root", type=Path, default=DEFAULT_OUTPUT_ROOT
+        "--weights_root", type=Path, default=DEFAULT_WEIGHTS_ROOT
+    )
+    parser.add_argument(
+        "--results_root", type=Path, default=DEFAULT_RESULTS_ROOT
     )
     parser.add_argument(
         "--tokenizer",
@@ -1383,22 +1463,54 @@ def build_parser() -> argparse.ArgumentParser:
         "--architecture_selection",
         type=Path,
         default=DEFAULT_ARCH_SELECTION,
-        help="Exp 03-Sup selection.json (required before formal Exp 04)",
+        help="Exp 03 selection.json (required before formal Exp 04)",
+    )
+    parser.add_argument(
+        "--portable",
+        action="store_true",
+        help=(
+            "Read the tokenizer, Exp 03 architecture, and Exp 04-A muon "
+            "selection from the portable bundle at --portable_dir instead of "
+            "server_runs/. Use this on servers that carry only the repo + "
+            "dataset. Output still honours KRONOS_WEIGHTS_ROOT/"
+            "KRONOS_RESULTS_ROOT."
+        ),
+    )
+    parser.add_argument(
+        "--portable_dir",
+        type=Path,
+        default=AB_COMMON.PORTABLE_DIR,
+        help="Portable bundle directory (tokenizer.pt + upstream.json)",
     )
     parser.add_argument(
         "--validation_offsets",
         type=parse_offsets,
         default=DEFAULT_VALIDATION_OFFSETS,
-        help="Comma-separated validation offsets (default: 0,100,200,300)",
+        help="Comma-separated validation offsets (default: full-coverage tiling"
+        " 0,20,...,380)",
     )
-    parser.add_argument("--eval_days", type=int, default=20)
+    parser.add_argument("--eval_days", type=int, default=EVAL_DAYS)
     parser.add_argument(
         "--batch_tokens", type=int, default=0,
-        help="0 inherits the selected Exp 03-Sup architecture setting",
+        help="0 inherits the selected Exp 03 architecture setting (6144). "
+        "Raising this improves single-microbatch GPU utilization on larger "
+        "cards; pair with --accumulation_steps so that "
+        "batch_tokens * accumulation_steps stays ~196608 (= 6144 * 32) to "
+        "preserve the Exp 04-A effective batch and optimizer-step count.",
+    )
+    parser.add_argument(
+        "--accumulation_steps", type=int, default=32,
+        help=(
+            "Optimizer steps accumulate this many microbatches per update. "
+            "Default 32 matches Exp 03/04-A. When raising --batch_tokens on a "
+            "large GPU, lower this proportionally (e.g. batch_tokens=24576 "
+            "with accumulation_steps=8) to keep the effective batch token "
+            "budget and step count identical to Exp 04-A."
+        ),
     )
     parser.add_argument(
         "--eval_batch_size", type=int, default=0,
-        help="0 inherits the selected Exp 03-Sup architecture setting",
+        help="0 inherits the selected Exp 03 architecture setting",
     )
     parser.add_argument("--max_collapse_rate", type=float, default=0.35)
     parser.add_argument("--min_unique_tokens", type=int, default=32)
@@ -1433,35 +1545,44 @@ def main() -> None:
     ):
         parser.error("validation windows may not enter the sealed holdout")
     ensure_runtime()
-    output_root = args.output_root.resolve()
+    results_root = args.results_root.expanduser().resolve()
     if args.holdout:
-        run_holdout(output_root)
+        run_holdout(results_root)
         return
 
-    tokenizer = AB_COMMON.resolve_tokenizer(args.tokenizer)
-    architecture = AB_COMMON.resolve_architecture(
-        args.architecture_selection
-    )
-    requirements = {
-        "exp04a_loss": (EXP04A_SELECTION, "ce"),
-        "exp04b_optimizer": (EXP04B_SELECTION, "adamw"),
-    }
-    if args.smoke:
-        existing = {
-            name: requirement
-            for name, requirement in requirements.items()
-            if requirement[0].is_file()
-        }
-        upstream_selections = AB_COMMON.load_required_selections(existing)
-        for name, (path, expected_arm) in requirements.items():
-            if name not in upstream_selections:
-                upstream_selections[name] = {
-                    "source": "smoke_preregistered_stub",
-                    "expected_path": str(path.resolve()),
-                    "expected_arm": expected_arm,
-                }
+    if args.portable:
+        portable = AB_COMMON.load_portable_assets(args.portable_dir)
+        tokenizer = portable["tokenizer"]
+        architecture = portable["architecture"]
+        upstream_selections = portable["upstream_selections"]
+        print(
+            f"Portable mode: upstream assets loaded from "
+            f"{args.portable_dir.resolve()}"
+        )
     else:
-        upstream_selections = AB_COMMON.load_required_selections(requirements)
+        tokenizer = AB_COMMON.resolve_tokenizer(args.tokenizer)
+        architecture = AB_COMMON.resolve_architecture(
+            args.architecture_selection
+        )
+        requirements = {
+            "exp04a_optimizer": (EXP04A_SELECTION, "muon"),
+        }
+        if args.smoke:
+            existing = {
+                name: requirement
+                for name, requirement in requirements.items()
+                if requirement[0].is_file()
+            }
+            upstream_selections = AB_COMMON.load_required_selections(existing)
+            for name, (path, expected_arm) in requirements.items():
+                if name not in upstream_selections:
+                    upstream_selections[name] = {
+                        "source": "smoke_preregistered_stub",
+                        "expected_path": str(path.resolve()),
+                        "expected_arm": expected_arm,
+                    }
+        else:
+            upstream_selections = AB_COMMON.load_required_selections(requirements)
     if args.smoke:
         run_smoke(args, tokenizer, architecture, upstream_selections)
         return
@@ -1480,14 +1601,15 @@ def main() -> None:
         validation_offsets=args.validation_offsets,
         eval_days=args.eval_days,
         batch_tokens=args.batch_tokens,
+        accumulation_steps=args.accumulation_steps,
         eval_batch_size=args.eval_batch_size,
         max_collapse_rate=args.max_collapse_rate,
         min_unique_tokens=args.min_unique_tokens,
         time_budget_hours=args.time_budget_hours,
         trial_count_source=trial_count_source,
     )
-    output_root.mkdir(parents=True, exist_ok=True)
-    free_gib = shutil.disk_usage(output_root.parent).free / (1024**3)
+    layout = StudyLayout.create(args.weights_root, args.results_root)
+    free_gib = shutil.disk_usage(layout.weights_root).free / (1024**3)
     checkpoint_gib = (
         n_trials
         * args.epochs
@@ -1498,10 +1620,10 @@ def main() -> None:
     required_gib = checkpoint_gib + 3.0
     if free_gib < required_gib:
         raise RuntimeError(
-            f"Exp 04-C estimates at least {required_gib:.1f} GiB free is "
+            f"Exp 04-B estimates at least {required_gib:.1f} GiB free is "
             f"needed for checkpoints/caches; only {free_gib:.1f} GiB remains"
         )
-    run_search(output_root, settings)
+    run_search(layout, settings)
 
 
 if __name__ == "__main__":

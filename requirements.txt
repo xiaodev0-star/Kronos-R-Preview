@@ -1,0 +1,9 @@
+# Install the CUDA build of PyTorch appropriate for the server first when the
+# default PyPI wheel is not suitable.
+torch>=2.5
+numpy>=1.26,<3
+pandas>=2.1,<3
+scipy>=1.11,<2
+tqdm>=4.66,<5
+matplotlib>=3.8,<4
+psutil>=5.9,<7

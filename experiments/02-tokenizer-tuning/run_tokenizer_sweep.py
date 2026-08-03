@@ -1,13 +1,25 @@
 """Run the current tokenizer-architecture sweep with epoch-wise GPT evaluation.
 
 This is the canonical Exp 02 entry point.  It consumes the bit-width decision
-from the completed Exp 01 rerun, trains six tokenizer architectures, then
-trains and evaluates one 50-epoch CE+AdamW GPT for every tokenizer.  Every GPT
-epoch is retained and evaluated on the same four pre-holdout windows used by
-Exp 01.
+from the completed Exp 01 sweep, trains one tokenizer per encoder/decoder
+capacity point, then trains and evaluates one 50-epoch CE+AdamW GPT for every
+tokenizer.  Every GPT epoch is retained and evaluated on the same four
+pre-holdout windows used by Exp 01.
 
-The historical ``sweep_tokenizer*.py`` outputs are never reused or overwritten.
-All current outputs live under ``rerun_seed42`` and every stage is resumable.
+What Exp 01 taught this stage
+-----------------------------
+Exp 01 varied the nominal codebook size, so raw daily Collapse and raw daily
+Unique-token counts were not comparable across arms: a larger codebook slices
+the data more finely, which mechanically lowers Collapse and raises Unique
+without proving that the GPT can exploit the extra classes.  Measured against
+the target distribution instead, support/effective-code/collapse alignment fell
+as the codebook grew, and the predictive information the GPT extracted saturated
+near ~1.3 bits per token from 2^12 to 2^18 joint codes.  Exp 02 therefore
+carries the per-layer codebook diagnostics (coarse/fine utilization, effective
+codes, collapse) into the combined summary so the architecture decision is made
+on capacity-normalized evidence rather than on raw behaviour counts.
+
+Checkpoints/caches and downloadable diagnostics use separate resumable roots.
 """
 
 from __future__ import annotations
@@ -16,6 +28,7 @@ import argparse
 import csv
 import importlib.util
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -29,10 +42,20 @@ from typing import Any
 SCRIPT_PATH = Path(__file__).resolve()
 EXPERIMENT_DIR = SCRIPT_PATH.parent
 ROOT = EXPERIMENT_DIR.parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from experiment_io import (
+    StudyLayout,
+    default_study_roots,
+    runtime_environment,
+    write_download_manifest,
+)
+
 EXP01_DIR = ROOT / "experiments" / "01-bitsweep"
-EXP01_ROOT = EXP01_DIR / "rerun_seed42"
+_, EXP01_ROOT = default_study_roots("01-bitsweep", seed=42)
 EXP01_SELECTION = EXP01_ROOT / "selection.json"
-EXP01_PIPELINE_PATH = EXP01_DIR / "rerun_bits_epochwise.py"
+EXP01_PIPELINE_PATH = EXP01_DIR / "run_bitsweep.py"
 TOKENIZER_SCRIPT = ROOT / "train_tokenizer.py"
 GPT_SCRIPT = ROOT / "train_base.py"
 TOKENIZER_EVAL_SCRIPT = EXP01_DIR / "evaluate_tokenizer.py"
@@ -40,9 +63,18 @@ TRAJECTORY_SCRIPT = (
     ROOT / "experiments" / "04" / "c-hpo" / "evaluate_epoch_trajectory.py"
 )
 ANALYSIS_SCRIPT = EXPERIMENT_DIR / "analyze_tokenizer_epochwise.py"
-DEFAULT_OUTPUT_ROOT = EXPERIMENT_DIR / "rerun_seed42"
+DEFAULT_WEIGHTS_ROOT, DEFAULT_RESULTS_ROOT = default_study_roots(
+    "02-tokenizer-tuning", seed=42
+)
 
 SEED = 42
+# (embedding_dim, hidden_dim).  The first six points are the original grid.
+# The last three extend the encoder/decoder capacity axis because Exp 01 showed
+# that the binding constraint at fixed bits is codebook utilization, not the
+# nominal vocabulary: at embedding_dim=64/hidden_dim=192 the coarse layer of the
+# selected bit split used only a fraction of its nominal codes, so the sweep has
+# to reach far enough to tell "the encoder is too small" from "the codebook is
+# intrinsically hard to fill".
 DEFAULT_CONFIGS = (
     (48, 192),
     (48, 256),
@@ -50,9 +82,18 @@ DEFAULT_CONFIGS = (
     (64, 256),
     (96, 192),
     (96, 256),
+    (96, 384),
+    (128, 256),
+    (128, 384),
 )
-VALIDATION_OFFSETS = (0, 100, 200, 300)
 HOLDOUT_OFFSET = 400
+EVAL_DAYS = 1
+# Full-coverage, single-day-resolution evaluation. The pre-holdout region
+# [0, HOLDOUT_OFFSET) is tiled with contiguous EVAL_DAYS-day windows (offsets
+# 0, 1, ..., 399), so every pre-holdout trading day is scored as its own window
+# for the finest robustness granularity. Offset HOLDOUT_OFFSET and beyond remain
+# the sealed holdout.
+VALIDATION_OFFSETS = tuple(range(0, HOLDOUT_OFFSET, EVAL_DAYS))
 
 
 def _load_exp01_pipeline():
@@ -75,6 +116,15 @@ def utc_now() -> str:
 
 def config_key(embedding_dim: int, hidden_dim: int) -> str:
     return f"{embedding_dim}x{hidden_dim}"
+
+
+def json_safe_float(value: Any) -> float | None:
+    """Return a JSON-writable float; the study writers reject NaN/Inf."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def config_directory_name(embedding_dim: int, hidden_dim: int) -> str:
@@ -115,9 +165,16 @@ def resolve_bits(raw: str) -> tuple[int, int, dict[str, Any]]:
     if not EXP01_SELECTION.is_file():
         raise RuntimeError(
             f"Exp 01 selection is missing: {EXP01_SELECTION}. "
-            "Complete and analyze Exp 01 first, or pass --bits L1+L2."
+            "Record the reviewed bit split on the server with "
+            "experiments/01-bitsweep/narrate_bitsweep.py "
+            "--select_config L1+L2 --rationale '...', or pass --bits L1+L2."
         )
     payload = PIPE.load_json(EXP01_SELECTION)
+    if not payload.get("upstream_eligible", False):
+        raise RuntimeError(
+            f"Exp 01 selection has not been recorded after review: "
+            f"{EXP01_SELECTION}"
+        )
     selected = payload.get("selected", payload)
     l1 = int(selected["bits_l1"])
     l2 = int(selected["bits_l2"])
@@ -130,29 +187,38 @@ def resolve_bits(raw: str) -> tuple[int, int, dict[str, Any]]:
 
 
 def config_paths(
-    output_root: Path, embedding_dim: int, hidden_dim: int
+    weights_root: Path,
+    results_root: Path,
+    embedding_dim: int,
+    hidden_dim: int,
 ) -> dict[str, Path]:
-    directory = (
-        output_root
-        / "configs"
-        / config_directory_name(embedding_dim, hidden_dim)
-    )
+    name = config_directory_name(embedding_dim, hidden_dim)
+    weights = weights_root / "configs" / name
+    results = results_root / "configs" / name
     return {
-        "directory": directory,
-        "override": directory / "override.json",
-        "run": directory / "run.json",
-        "tokenizer": directory / "tokenizer.pt",
-        "tokenizer_resume": directory / "tokenizer.pt.ckpt",
-        "tokenizer_metrics": directory / "tokenizer_metrics.json",
-        "model": directory / "model.pt",
-        "model_resume": directory / "model.pt.ckpt",
-        "checkpoint_index": directory / "model_checkpoints.json",
-        "trajectory": directory / "epoch_trajectory",
-        "logs": directory / "logs",
-        "tokenizer_log": directory / "logs" / "tokenizer.log",
-        "tokenizer_eval_log": directory / "logs" / "tokenizer_eval.log",
-        "gpt_log": directory / "logs" / "gpt.log",
-        "trajectory_log": directory / "logs" / "trajectory.log",
+        "directory": results,
+        "weights_directory": weights,
+        "override": results / "override.json",
+        "run": results / "run.json",
+        "tokenizer": weights / "tokenizer.pt",
+        "tokenizer_resume": weights / "tokenizer.pt.ckpt",
+        "tokenizer_metrics": results / "tokenizer_metrics.json",
+        "tokenizer_history": results / "tokenizer_training_history.json",
+        "tokenizer_distributions": results / "tokenizer_distributions.npz",
+        "model": weights / "model.pt",
+        "model_resume": weights / "model.pt.ckpt",
+        "checkpoint_index": results / "model_checkpoints.json",
+        "history": (
+            results
+            / f"history_toksweep_{embedding_dim}_{hidden_dim}.json"
+        ),
+        "trajectory": results / "epoch_trajectory",
+        "cache": weights / "cache",
+        "logs": results / "logs",
+        "tokenizer_log": results / "logs" / "tokenizer.log",
+        "tokenizer_eval_log": results / "logs" / "tokenizer_eval.log",
+        "gpt_log": results / "logs" / "gpt.log",
+        "trajectory_log": results / "logs" / "trajectory.log",
     }
 
 
@@ -201,6 +267,9 @@ def build_settings(
             "max_seq_len": 256 if smoke else 0,
             "batch_tokens": 2048 if smoke else batch_tokens,
             "batch_cap": 64,
+            "accumulation_steps": 8 if smoke else 32,
+            "controlled_loader_seed": SEED,
+            "exact_accumulation_boundaries": True,
             "curriculum": False,
             "early_stop_patience": 0,
             "retain_every_epoch": True,
@@ -218,8 +287,24 @@ def build_settings(
             "holdout_offset": HOLDOUT_OFFSET,
             "holdout_used": False,
             "selection_policy": (
-                "No weighted score. Tokenizer reconstruction, prediction "
-                "quality, and prediction behaviour remain separate."
+                "No weighted score. Read three separate groups: (1) "
+                "codebook-size-invariant quality (DA, daily RankIC, MAPE) "
+                "including the per-window floors min_window_da and "
+                "min_window_daily_rank_ic; (2) capacity-normalized behaviour "
+                "(collapse/unique/effective/distribution alignment against the "
+                "same-day target distribution, and the codebook balance "
+                "score) instead of raw Collapse and raw Unique counts; (3) "
+                "tokenizer sufficiency (reconstruction MAE plus per-layer "
+                "code utilization and effective code counts)."
+            ),
+            "exp01_measurement_lesson": (
+                "Raw daily Collapse and raw daily Unique-token counts scale "
+                "with the nominal codebook and are only comparable when the "
+                "bit split is held fixed, as it is inside Exp 02. They still "
+                "move with how much of the codebook each architecture "
+                "actually fills, so alignment-against-target metrics and the "
+                "per-layer utilization diagnostics remain the primary "
+                "behaviour evidence here."
             ),
         },
         "smoke": smoke,
@@ -228,6 +313,7 @@ def build_settings(
 
 def source_hashes() -> dict[str, str]:
     files = (
+        "experiment_io.py",
         "config.py",
         "data_processor.py",
         "training_utils.py",
@@ -238,8 +324,8 @@ def source_hashes() -> dict[str, str]:
         "model/kronos_preview.py",
         "model/layers.py",
         "experiments/01-bitsweep/evaluate_tokenizer.py",
-        "experiments/01-bitsweep/rerun_bits_epochwise.py",
-        "experiments/02-tokenizer-tuning/rerun_tokenizer_epochwise.py",
+        "experiments/01-bitsweep/run_bitsweep.py",
+        "experiments/02-tokenizer-tuning/run_tokenizer_sweep.py",
         "experiments/02-tokenizer-tuning/analyze_tokenizer_epochwise.py",
         "experiments/04/c-hpo/evaluate_epoch_trajectory.py",
     )
@@ -251,7 +337,9 @@ def source_hashes() -> dict[str, str]:
 
 
 def prepare_manifest(
-    output_root: Path, settings: dict[str, Any]
+    results_root: Path,
+    settings: dict[str, Any],
+    layout: StudyLayout,
 ) -> dict[str, Any]:
     implementation = source_hashes()
     dataset = PIPE.dataset_signature()
@@ -262,7 +350,7 @@ def prepare_manifest(
             "dataset": dataset,
         }
     )
-    path = output_root / "study_manifest.json"
+    path = results_root / "study_manifest.json"
     if path.exists():
         payload = PIPE.load_json(path)
         if payload.get("study_fingerprint") != fingerprint:
@@ -272,7 +360,7 @@ def prepare_manifest(
             )
         return payload
     payload = {
-        "experiment": "Exp 02 Tokenizer architecture rerun",
+        "experiment": "Exp 02 Tokenizer architecture sweep",
         "design": "full-data tokenizer grid plus epoch-wise downstream GPT",
         "status": "planned",
         "created_at_utc": utc_now(),
@@ -282,14 +370,16 @@ def prepare_manifest(
         "settings": settings,
         "implementation_sha256": implementation,
         "dataset": dataset,
-        "historical_outputs_overwritten": False,
+        "artifact_layout": layout.metadata(),
+        "runtime_environment": runtime_environment(ROOT),
+        "clean_results_root": True,
     }
     PIPE.atomic_write_json(path, payload)
     return payload
 
 
-def update_manifest(output_root: Path, **updates: Any) -> dict[str, Any]:
-    path = output_root / "study_manifest.json"
+def update_manifest(results_root: Path, **updates: Any) -> dict[str, Any]:
+    path = results_root / "study_manifest.json"
     payload = PIPE.load_json(path)
     payload.update(updates)
     PIPE.atomic_write_json(path, payload)
@@ -321,7 +411,7 @@ def update_config_run(
 
 def write_override(
     path: Path,
-    directory: Path,
+    cache_directory: Path,
     embedding_dim: int,
     hidden_dim: int,
     settings: dict[str, Any],
@@ -343,8 +433,8 @@ def write_override(
             "random_seed": SEED,
             "warmup_ratio": settings["gpt"]["warmup_ratio"],
             "batch_size": 1,
-            "accumulation_steps": 32,
-            "save_dir": str((directory / "cache").resolve()),
+            "accumulation_steps": settings["gpt"]["accumulation_steps"],
+            "save_dir": str(cache_directory.resolve()),
         },
     }
     if path.exists() and PIPE.load_json(path) != payload:
@@ -354,18 +444,25 @@ def write_override(
 
 
 def run_one_config(
-    output_root: Path,
+    layout: StudyLayout,
     feature_cache: Path,
+    eval_cache: Path,
     settings: dict[str, Any],
     embedding_dim: int,
     hidden_dim: int,
 ) -> None:
-    paths = config_paths(output_root, embedding_dim, hidden_dim)
+    paths = config_paths(
+        layout.weights_root,
+        layout.results_root,
+        embedding_dim,
+        hidden_dim,
+    )
     paths["directory"].mkdir(parents=True, exist_ok=True)
+    paths["weights_directory"].mkdir(parents=True, exist_ok=True)
     paths["logs"].mkdir(parents=True, exist_ok=True)
     write_override(
         paths["override"],
-        paths["directory"],
+        paths["cache"],
         embedding_dim,
         hidden_dim,
         settings,
@@ -399,6 +496,8 @@ def run_one_config(
             str(TOKENIZER_SCRIPT),
             "--save_path",
             str(paths["tokenizer"]),
+            "--metrics_path",
+            str(paths["tokenizer_history"]),
             "--bits_l1",
             str(settings["bits_l1"]),
             "--bits_l2",
@@ -460,6 +559,8 @@ def run_one_config(
                 str(validation_features),
                 "--output",
                 str(paths["tokenizer_metrics"]),
+                "--distribution_output",
+                str(paths["tokenizer_distributions"]),
                 "--seed",
                 str(SEED),
                 "--chunk_size",
@@ -525,9 +626,14 @@ def run_one_config(
             str(settings["gpt"]["batch_tokens"]),
             "--batch_cap",
             str(settings["gpt"]["batch_cap"]),
+            "--controlled_loader_seed",
+            str(settings["gpt"]["controlled_loader_seed"]),
+            "--exact_accumulation_boundaries",
             "--early_stop_patience",
             "0",
             "--history_per_epoch",
+            "--metrics_dir",
+            str(paths["directory"]),
         ]
         PIPE.run_command(
             command,
@@ -567,6 +673,8 @@ def run_one_config(
             str(paths["tokenizer"]),
             "--output_dir",
             str(paths["trajectory"]),
+            "--prepared_cache_dir",
+            str(eval_cache),
             "--epochs",
             f"1-{settings['gpt']['epochs']}",
             "--offsets",
@@ -620,15 +728,42 @@ def run_one_config(
 
 
 def write_combined_summary(
-    output_root: Path, configs: list[tuple[int, int]], settings: dict[str, Any]
+    layout: StudyLayout,
+    configs: list[tuple[int, int]],
+    settings: dict[str, Any],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    bits_l1 = int(settings["bits_l1"])
+    bits_l2 = int(settings["bits_l2"])
     for embedding_dim, hidden_dim in configs:
-        paths = config_paths(output_root, embedding_dim, hidden_dim)
+        paths = config_paths(
+            layout.weights_root,
+            layout.results_root,
+            embedding_dim,
+            hidden_dim,
+        )
         summary_path = paths["trajectory"] / "epoch_summary.json"
         if not summary_path.is_file() or not paths["tokenizer_metrics"].is_file():
             continue
         tokenizer = PIPE.load_json(paths["tokenizer_metrics"])
+        # Exp 01 could not see that one bit split had a badly under-filled
+        # coarse layer, because only the joint-code aggregate reached the
+        # combined summary. Exp 02 tunes exactly the module that decides code
+        # occupancy, so every level is exported per config-epoch row.
+        codebook: dict[str, Any] = {}
+        for level in ("coarse", "fine", "joint"):
+            metrics = tokenizer[f"{level}_codes"]
+            codebook.update(
+                {
+                    f"tokenizer_{level}_unique": metrics["n_unique"],
+                    f"tokenizer_{level}_entropy_bits": metrics["entropy_bits"],
+                    f"tokenizer_{level}_effective_codes": metrics[
+                        "effective_codes"
+                    ],
+                    f"tokenizer_{level}_utilization": metrics["utilization"],
+                    f"tokenizer_{level}_collapse": metrics["collapse_rate"],
+                }
+            )
         for item in PIPE.load_json(summary_path):
             row = dict(item)
             row.update(
@@ -636,24 +771,21 @@ def write_combined_summary(
                     "config": config_key(embedding_dim, hidden_dim),
                     "embedding_dim": embedding_dim,
                     "hidden_dim": hidden_dim,
-                    "bits_l1": settings["bits_l1"],
-                    "bits_l2": settings["bits_l2"],
-                    "joint_vocab": 2
-                    ** (settings["bits_l1"] + settings["bits_l2"]),
+                    "bits_l1": bits_l1,
+                    "bits_l2": bits_l2,
+                    "theoretical_bits": bits_l1 + bits_l2,
+                    "coarse_vocab": 2 ** bits_l1,
+                    "fine_vocab": 2 ** bits_l2,
+                    "joint_vocab": 2 ** (bits_l1 + bits_l2),
                     "tokenizer_mae": tokenizer["mae"],
                     "tokenizer_rmse": tokenizer["rmse"],
-                    "tokenizer_joint_unique": tokenizer["joint_codes"][
-                        "n_unique"
+                    "tokenizer_best_val_loss": json_safe_float(
+                        tokenizer["checkpoint_best_val_loss"]
+                    ),
+                    "tokenizer_best_epoch": tokenizer[
+                        "checkpoint_best_epoch"
                     ],
-                    "tokenizer_joint_entropy_bits": tokenizer["joint_codes"][
-                        "entropy_bits"
-                    ],
-                    "tokenizer_joint_utilization": tokenizer["joint_codes"][
-                        "utilization"
-                    ],
-                    "tokenizer_joint_collapse": tokenizer["joint_codes"][
-                        "collapse_rate"
-                    ],
+                    **codebook,
                 }
             )
             rows.append(row)
@@ -664,19 +796,23 @@ def write_combined_summary(
             row["epoch"],
         )
     )
-    PIPE.atomic_write_json(output_root / "combined_epoch_summary.json", rows)
+    PIPE.atomic_write_json(
+        layout.results_root / "combined_epoch_summary.json", rows
+    )
     if rows:
         fields: list[str] = []
         for row in rows:
             for key in row:
                 if key not in fields:
                     fields.append(key)
-        temporary = output_root / "combined_epoch_summary.csv.tmp"
+        temporary = layout.results_root / "combined_epoch_summary.csv.tmp"
         with temporary.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)
-        os.replace(temporary, output_root / "combined_epoch_summary.csv")
+        os.replace(
+            temporary, layout.results_root / "combined_epoch_summary.csv"
+        )
     return rows
 
 
@@ -684,22 +820,51 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the current epoch-wise tokenizer architecture sweep"
     )
-    parser.add_argument("--output_root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument("--configs", default="")
+    parser.add_argument(
+        "--weights_root", type=Path, default=DEFAULT_WEIGHTS_ROOT
+    )
+    parser.add_argument(
+        "--results_root", type=Path, default=DEFAULT_RESULTS_ROOT
+    )
+    parser.add_argument(
+        "--configs",
+        default="",
+        help=(
+            "Comma-separated execution subset of the preregistered grid: "
+            + ",".join(config_key(*value) for value in DEFAULT_CONFIGS)
+        ),
+    )
     parser.add_argument(
         "--bits",
         default="",
-        help="L1+L2; default reads Exp 01 rerun selection.json",
+        help="L1+L2; default reads Exp 01 selection.json",
     )
     parser.add_argument("--tok_epochs", type=int, default=100)
     parser.add_argument("--gpt_epochs", type=int, default=50)
-    parser.add_argument("--batch_tokens", type=int, default=12288)
+    parser.add_argument(
+        "--batch_tokens",
+        type=int,
+        default=65536,
+        help=(
+            "Adaptive GPT microbatch token budget. The 65536 default targets "
+            "24 GiB RTX 4090-class GPUs while preserving the fixed "
+            "sequence-level accumulation schedule."
+        ),
+    )
     parser.add_argument(
         "--eval_offsets",
         default=",".join(str(value) for value in VALIDATION_OFFSETS),
     )
-    parser.add_argument("--eval_days", type=int, default=20)
-    parser.add_argument("--eval_batch_size", type=int, default=4)
+    parser.add_argument("--eval_days", type=int, default=EVAL_DAYS)
+    parser.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=32,
+        help=(
+            "Length-bucketed inference batch size. Evaluation automatically "
+            "halves this value and retries if CUDA memory is exhausted."
+        ),
+    )
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
 
@@ -726,16 +891,16 @@ def main() -> int:
         temporary_root = Path(
             tempfile.mkdtemp(prefix="kronos_exp02_smoke_")
         ).resolve()
-        output_root = temporary_root
+        layout = StudyLayout.create(
+            temporary_root / "weights", temporary_root / "results"
+        )
     else:
-        output_root = args.output_root.resolve()
-        free_gb = shutil.disk_usage(output_root.parent).free / (1024**3)
+        layout = StudyLayout.create(args.weights_root, args.results_root)
+        free_gb = shutil.disk_usage(layout.weights_root).free / (1024**3)
         if free_gb < 10:
             raise RuntimeError(
                 f"At least 10 GiB free is required; {free_gb:.1f} GiB remains"
             )
-    output_root.mkdir(parents=True, exist_ok=True)
-
     settings = build_settings(
         configs=configs,
         bits_l1=bits_l1,
@@ -749,17 +914,26 @@ def main() -> int:
         eval_batch_size=args.eval_batch_size,
         smoke=args.smoke,
     )
-    prepare_manifest(output_root, settings)
+    prepare_manifest(layout.results_root, settings, layout)
     update_manifest(
-        output_root,
+        layout.results_root,
         status="running",
         started_at_utc=utc_now(),
         completed_configs=[],
     )
-    feature_cache = output_root / "shared" / "tokenizer_features"
+    feature_cache = layout.weights_root / "shared" / "tokenizer_features"
+    eval_cache = layout.weights_root / "shared" / "eval_cache"
     feature_cache.mkdir(parents=True, exist_ok=True)
-    print(f"Output: {output_root}", flush=True)
-    print(f"Bits from Exp 01: {bits_l1}+{bits_l2}", flush=True)
+    eval_cache.mkdir(parents=True, exist_ok=True)
+    print(f"Weights/cache: {layout.weights_root}", flush=True)
+    print(f"Downloadable results: {layout.results_root}", flush=True)
+    print(
+        f"Bits from Exp 01: {bits_l1}+{bits_l2} "
+        f"(coarse={2 ** bits_l1}, fine={2 ** bits_l2}, "
+        f"joint={2 ** (bits_l1 + bits_l2)}); source="
+        f"{dependency['source']}",
+        flush=True,
+    )
     print(
         f"Tokenizer configs: {[config_key(*value) for value in configs]}",
         flush=True,
@@ -777,16 +951,17 @@ def main() -> int:
                 flush=True,
             )
             run_one_config(
-                output_root,
+                layout,
                 feature_cache,
+                eval_cache,
                 settings,
                 embedding_dim,
                 hidden_dim,
             )
             completed.append(config_key(embedding_dim, hidden_dim))
-            rows = write_combined_summary(output_root, configs, settings)
+            rows = write_combined_summary(layout, configs, settings)
             update_manifest(
-                output_root,
+                layout.results_root,
                 status="running",
                 completed_configs=completed,
                 combined_rows=len(rows),
@@ -800,27 +975,32 @@ def main() -> int:
                     sys.executable,
                     str(ANALYSIS_SCRIPT),
                     "--root",
-                    str(output_root),
+                    str(layout.results_root),
                 ],
                 env=analysis_env,
-                log_path=output_root / "analysis.log",
+                log_path=layout.results_root / "analysis.log",
                 label="Exp 02 analysis",
             )
         update_manifest(
-            output_root,
+            layout.results_root,
             status="completed",
             completed_at_utc=utc_now(),
             completed_configs=completed,
             combined_rows=len(
-                PIPE.load_json(output_root / "combined_epoch_summary.json")
+                PIPE.load_json(
+                    layout.results_root / "combined_epoch_summary.json"
+                )
             ),
         )
+        write_download_manifest(layout)
         succeeded = True
-        print(f"Completed Exp 02: {output_root}", flush=True)
+        print(
+            f"Completed Exp 02: {layout.results_root}", flush=True
+        )
         return 0
     except BaseException as exc:
         update_manifest(
-            output_root,
+            layout.results_root,
             status="failed",
             failed_at_utc=utc_now(),
             error=f"{type(exc).__name__}: {exc}",

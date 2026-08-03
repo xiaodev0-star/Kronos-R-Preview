@@ -1,10 +1,6 @@
-"""Exp 03-Sup: controlled GPT capacity interpolation around deep/xlarge.
+"""Exp 03: controlled GPT capacity interpolation around deep/xlarge.
 
-The completed Exp 03 mixed width, depth, and KV-head changes between its
-``deep`` and ``xlarge`` endpoints.  It also unintentionally produced different
-optimizer-step counts across architectures because adaptive batches crossed
-accumulation boundaries.  This supplement retrains both endpoints and adds two
-clean one-factor lines:
+The formal grid contains two clean one-factor lines:
 
 * depth line: deep (256x4) -> depth6 -> depth8, with dim/heads/kv_heads fixed;
 * width line: deep (256) -> width384 -> width512, with depth/kv_heads fixed.
@@ -35,27 +31,35 @@ EXPERIMENT_DIR = SCRIPT_PATH.parent
 ROOT = EXPERIMENT_DIR.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from experiment_io import (
+    StudyLayout,
+    default_study_roots,
+    runtime_environment,
+    write_download_manifest,
+)
 
 PARENT_SCRIPT = (
-    ROOT / "experiments" / "03-gpt-scaling" / "gpt_scaling_epochwise.py"
-)
-PARENT_RUN_ROOT = (
-    ROOT / "experiments" / "03-gpt-scaling" / "run_seed42"
+    ROOT / "experiments" / "03-gpt-scaling" / "_pipeline.py"
 )
 TRAJECTORY_SCRIPT = (
     ROOT / "experiments" / "04" / "c-hpo" / "evaluate_epoch_trajectory.py"
 )
-ANALYSIS_SCRIPT = EXPERIMENT_DIR / "analyze_gpt_capacity_sup.py"
-DEFAULT_OUTPUT_ROOT = EXPERIMENT_DIR / "run_seed42"
+ANALYSIS_SCRIPT = EXPERIMENT_DIR / "analyze_gpt_capacity.py"
+DEFAULT_WEIGHTS_ROOT, DEFAULT_RESULTS_ROOT = default_study_roots(
+    "03-gpt-scaling", seed=42
+)
 
 SEED = 42
 EPOCHS = 50
-VALIDATION_OFFSETS = (0, 100, 200, 300)
-EVAL_DAYS = 20
+EVAL_DAYS = 1
 HOLDOUT_OFFSET = 400
-PARENT_ENDPOINT_NAMES = ("deep", "xlarge")
+# Full-coverage, single-day-resolution evaluation. The pre-holdout region
+# [0, HOLDOUT_OFFSET) is tiled with contiguous EVAL_DAYS-day windows (offsets
+# 0, 1, ..., 399), so every pre-holdout trading day is scored as its own window.
+# Offset HOLDOUT_OFFSET and beyond remain the sealed holdout.
+VALIDATION_OFFSETS = tuple(range(0, HOLDOUT_OFFSET, EVAL_DAYS))
 
-SUP_CONFIGS = (
+CAPACITY_CONFIGS = (
     {
         "name": "deep",
         "axis": "common_origin",
@@ -147,7 +151,7 @@ SUP_CONFIGS = (
         ),
     },
 )
-CONFIG_MAP = {item["name"]: item for item in SUP_CONFIGS}
+CONFIG_MAP = {item["name"]: item for item in CAPACITY_CONFIGS}
 
 
 def _load_parent():
@@ -192,123 +196,20 @@ def atomic_write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def parse_configs(raw: str) -> list[dict[str, Any]]:
     if not raw.strip():
-        return [dict(item) for item in SUP_CONFIGS]
+        return [dict(item) for item in CAPACITY_CONFIGS]
     names = [item.strip() for item in raw.split(",") if item.strip()]
     unknown = [name for name in names if name not in CONFIG_MAP]
     if unknown:
-        raise ValueError(f"Unknown Sup configs: {unknown}")
+        raise ValueError(f"Unknown Exp 03 configs: {unknown}")
     return [dict(CONFIG_MAP[name]) for name in names]
-
-
-def validate_parent(
-    tokenizer: dict[str, Any],
-) -> dict[str, Any]:
-    import torch
-
-    manifest_path = PARENT_RUN_ROOT / "study_manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(
-            f"Completed Exp 03 parent manifest is missing: {manifest_path}"
-        )
-    manifest = PIPE.load_json(manifest_path)
-    if manifest.get("status") != "completed":
-        raise RuntimeError("Exp 03 parent run is not marked completed")
-    settings = manifest["settings"]
-    parent_tokenizer = settings["exp02_dependency"]
-    checks = {
-        "seed": settings.get("seed") == SEED,
-        "tokenizer_sha256": parent_tokenizer.get("sha256")
-        == tokenizer.get("sha256"),
-        "epochs": settings["gpt"].get("epochs") == EPOCHS,
-        "loss": settings["gpt"].get("loss") == "ce",
-        "optimizer": settings["gpt"].get("optimizer") == "adamw",
-        "full_sequences": settings["gpt"].get(
-            "full_sequences_for_all_architectures"
-        )
-        is True,
-        "offsets": tuple(settings["evaluation"].get("offsets", ()))
-        == VALIDATION_OFFSETS,
-        "days": settings["evaluation"].get("days_per_window") == EVAL_DAYS,
-        "holdout_sealed": settings["evaluation"].get("holdout_used") is False,
-    }
-    failed = [name for name, passed in checks.items() if not passed]
-    if failed:
-        raise RuntimeError(
-            "Parent Exp 03 protocol is incompatible with Sup: "
-            + ", ".join(failed)
-        )
-
-    endpoints: dict[str, Any] = {}
-    for name in PARENT_ENDPOINT_NAMES:
-        trial_dir = PARENT_RUN_ROOT / "configs" / name
-        index_path = trial_dir / "model_checkpoints.json"
-        override_path = trial_dir / "override.json"
-        if not index_path.is_file() or not override_path.is_file():
-            raise FileNotFoundError(f"Incomplete parent endpoint: {trial_dir}")
-        index = PIPE.load_json(index_path)
-        if len(index.get("checkpoints", [])) != EPOCHS:
-            raise RuntimeError(
-                f"Parent endpoint {name} does not have {EPOCHS} checkpoints"
-            )
-        final_log = trial_dir / "logs" / "gpt.log"
-        endpoints[name] = {
-            "trial_dir": str(trial_dir.resolve()),
-            "checkpoint_index": str(index_path.resolve()),
-            "checkpoint_index_sha256": PIPE.file_sha256(index_path),
-            "override_sha256": PIPE.file_sha256(override_path),
-            "architecture": dict(PARENT.CONFIG_MAP[name]),
-            "historical_log": str(final_log.resolve()),
-        }
-
-    historical_steps: dict[str, int] = {}
-    for config in PARENT.ARCH_CONFIGS:
-        name = str(config["name"])
-        resume_path = (
-            PARENT_RUN_ROOT / "configs" / name / "model.pt.ckpt"
-        )
-        if not resume_path.is_file():
-            raise FileNotFoundError(
-                f"Missing parent resume checkpoint for step audit: {resume_path}"
-            )
-        checkpoint = torch.load(
-            resume_path,
-            map_location="cpu",
-            weights_only=False,
-            mmap=True,
-        )
-        historical_steps[name] = int(checkpoint["global_step"])
-        del checkpoint
-    return {
-        "manifest_path": str(manifest_path.resolve()),
-        "manifest_sha256": PIPE.file_sha256(manifest_path),
-        "study_fingerprint": manifest.get("study_fingerprint"),
-        "protocol_checks": checks,
-        "historical_endpoints": endpoints,
-        "historical_optimizer_step_audit": {
-            "scheduler_budget": 4160,
-            "actual_global_steps": historical_steps,
-            "architectures_comparable_by_step": (
-                len(set(historical_steps.values())) == 1
-            ),
-            "cause": (
-                "adaptive microbatches crossed accumulation boundaries; "
-                "loader shuffle also consumed architecture-dependent global RNG"
-            ),
-        },
-        "reuse_policy": (
-            "architecture definitions only; checkpoints are not reused because "
-            "the historical optimizer-step/data schedule was not controlled"
-        ),
-    }
 
 
 def build_settings(
     tokenizer: dict[str, Any],
-    parent_dependency: dict[str, Any],
     *,
     smoke: bool,
 ) -> dict[str, Any]:
-    configs = [dict(item) for item in SUP_CONFIGS]
+    configs = [dict(item) for item in CAPACITY_CONFIGS]
     settings = PARENT.build_settings(
         configs=configs,
         tokenizer=tokenizer,
@@ -323,8 +224,7 @@ def build_settings(
         config["eval_batch_size"] = 1
     settings.update(
         {
-            "experiment": "Exp 03-Sup controlled GPT capacity interpolation",
-            "parent_exp03": parent_dependency,
+            "experiment": "Exp 03 controlled GPT capacity interpolation",
             "single_seed_stage": True,
             "axis_design": {
                 "depth": ["deep", "depth6", "depth8"],
@@ -340,7 +240,14 @@ def build_settings(
                 ),
             },
             "protocol_invariants": {
-                "tokenizer": "Exp 02 64x192 @ bits 9+7",
+                # Derived from the resolved Exp 02 dependency instead of a
+                # literal, so a re-reviewed upstream selection can never leave
+                # a stale tokenizer claim in the manifest.
+                "tokenizer": (
+                    f"Exp 02 {tokenizer['embedding_dim']}x"
+                    f"{tokenizer['hidden_dim']} @ bits "
+                    f"{tokenizer['bits_l1']}+{tokenizer['bits_l2']}"
+                ),
                 "seed": SEED,
                 "epochs": EPOCHS,
                 "optimizer_step_policy": (
@@ -353,22 +260,26 @@ def build_settings(
                     "epoch-addressable sequence order for all six retrains"
                 ),
                 "full_sequences": True,
+                "rope_angles": (
+                    "fp32 with autocast disabled; cast to Q/K dtype only when "
+                    "the rotary transform is applied"
+                ),
                 "evaluation_offsets": list(VALIDATION_OFFSETS),
                 "days_per_window": EVAL_DAYS,
                 "holdout_offset": HOLDOUT_OFFSET,
                 "holdout_used": False,
             },
-            "known_limitations": {
-                "fine_conditioning_alignment": (
-                    "Inherited recipe trains fine target t while teacher-"
-                    "conditioning on coarse t-1, but inference conditions on "
-                    "predicted coarse t. Preserve for six-way comparability; "
-                    "fine/joint metrics are audit-only in this study."
+            "hierarchical_head_invariant": {
+                "training": (
+                    "fine target t is teacher-conditioned on current coarse "
+                    "target t"
                 ),
-                "fix_scope": (
-                    "A correction would require a separate quality experiment "
-                    "and retraining deep/xlarge plus every Sup point."
+                "inference": (
+                    "fine prediction t is conditioned on current predicted "
+                    "coarse token t"
                 ),
+                "fine_ignore_index": -100,
+                "valid_fine_code_zero_is_trained": True,
             },
         }
     )
@@ -377,8 +288,8 @@ def build_settings(
             "selection_policy": (
                 "Rank stable mature five-epoch windows by target-relative "
                 "coarse-codebook balance and its components. DA, daily RankIC, "
-                "MAPE, and AmpRatio are guardrails; fine/joint distributions "
-                "are mandatory audit tracks and never enter that score."
+                "MAPE, AmpRatio, and the now-aligned fine/joint distributions "
+                "are mandatory secondary diagnostics."
             ),
             "recorded_code_levels": ["coarse", "fine", "joint"],
             "full_distribution_sidecars": True,
@@ -411,6 +322,7 @@ def source_hashes() -> dict[str, str]:
         PARENT_SCRIPT,
         TRAJECTORY_SCRIPT,
         ROOT / "eval_helpers.py",
+        ROOT / "experiment_io.py",
         ROOT / "train_base.py",
         ROOT / "data_processor.py",
         ROOT / "model" / "kronos_preview.py",
@@ -425,8 +337,9 @@ def source_hashes() -> dict[str, str]:
 
 
 def prepare_manifest(
-    output_root: Path,
+    results_root: Path,
     settings: dict[str, Any],
+    layout: StudyLayout,
 ) -> dict[str, Any]:
     implementation = source_hashes()
     dataset = PIPE.dataset_signature()
@@ -437,7 +350,7 @@ def prepare_manifest(
             "dataset": dataset,
         }
     )
-    path = output_root / "study_manifest.json"
+    path = results_root / "study_manifest.json"
     if path.exists():
         payload = PIPE.load_json(path)
         if payload.get("study_fingerprint") != fingerprint:
@@ -447,8 +360,8 @@ def prepare_manifest(
             )
         return payload
     payload = {
-        "experiment": "Exp 03-Sup controlled GPT capacity interpolation",
-        "design": "single-seed two-axis one-factor capacity supplement",
+        "experiment": "Exp 03 controlled GPT capacity interpolation",
+        "design": "single-seed controlled two-axis capacity grid",
         "status": "planned",
         "created_at_utc": utc_now(),
         "python_executable": str(Path(sys.executable).resolve()),
@@ -457,13 +370,15 @@ def prepare_manifest(
         "settings": settings,
         "implementation_sha256": implementation,
         "dataset": dataset,
+        "artifact_layout": layout.metadata(),
+        "runtime_environment": runtime_environment(ROOT),
     }
     atomic_write_json(path, payload)
     return payload
 
 
-def update_manifest(output_root: Path, **updates: Any) -> dict[str, Any]:
-    path = output_root / "study_manifest.json"
+def update_manifest(results_root: Path, **updates: Any) -> dict[str, Any]:
+    path = results_root / "study_manifest.json"
     payload = PIPE.load_json(path)
     payload.update(updates)
     atomic_write_json(path, payload)
@@ -478,6 +393,8 @@ def trajectory_ready(path: Path, epochs: int) -> bool:
         return False
     return (
         len(list(path.glob("token_distributions_epoch_*.npz"))) == epochs
+        and len(list(path.glob("prediction_records_epoch_*.npz")))
+        == epochs
     )
 
 
@@ -544,19 +461,21 @@ def add_architecture_fields(
 
 
 def write_combined_summary(
-    output_root: Path,
+    layout: StudyLayout,
     tokenizer: dict[str, Any],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for config in SUP_CONFIGS:
-        paths = PARENT.config_paths(output_root, config["name"])
+    for config in CAPACITY_CONFIGS:
+        paths = PARENT.config_paths(
+            layout.weights_root, layout.results_root, config["name"]
+        )
         summary = paths["trajectory"] / "epoch_summary.json"
         if not summary.is_file() or not paths["model"].is_file():
             continue
         count = PARENT.parameter_count(paths["model"])
         for item in PIPE.load_json(summary):
             row = add_architecture_fields(
-                item, dict(config), count, source="exp03_sup_controlled_retrain"
+                item, dict(config), count, source="exp03_controlled_retrain"
             )
             row["tokenizer_sha256"] = tokenizer["sha256"]
             rows.append(row)
@@ -575,21 +494,30 @@ def write_combined_summary(
         )
     }
     rows.sort(key=lambda row: (order[row["config"]], int(row["epoch"])))
-    atomic_write_json(output_root / "combined_epoch_summary.json", rows)
-    atomic_write_csv(output_root / "combined_epoch_summary.csv", rows)
+    atomic_write_json(
+        layout.results_root / "combined_epoch_summary.json", rows
+    )
+    atomic_write_csv(
+        layout.results_root / "combined_epoch_summary.csv", rows
+    )
     return rows
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Exp 03-Sup controlled GPT capacity interpolation"
+        description="Run Exp 03 controlled GPT capacity interpolation"
     )
-    parser.add_argument("--output_root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--weights_root", type=Path, default=DEFAULT_WEIGHTS_ROOT
+    )
+    parser.add_argument(
+        "--results_root", type=Path, default=DEFAULT_RESULTS_ROOT
+    )
     parser.add_argument(
         "--configs",
         default="",
         help="Comma-separated execution subset: "
-        + ",".join(item["name"] for item in SUP_CONFIGS),
+        + ",".join(item["name"] for item in CAPACITY_CONFIGS),
     )
     parser.add_argument(
         "--tokenizer",
@@ -607,44 +535,42 @@ def main() -> int:
     PIPE.verify_runtime()
     requested_configs = parse_configs(args.configs)
     tokenizer = PARENT.resolve_tokenizer(args.tokenizer)
-    parent_dependency = validate_parent(tokenizer)
-    settings = build_settings(
-        tokenizer, parent_dependency, smoke=args.smoke
-    )
+    settings = build_settings(tokenizer, smoke=args.smoke)
 
     temporary_root: Path | None = None
     if args.smoke:
         if args.analysis_only:
             raise ValueError("--analysis_only cannot be combined with --smoke")
         temporary_root = Path(
-            tempfile.mkdtemp(prefix="kronos_exp03_sup_smoke_")
+            tempfile.mkdtemp(prefix="kronos_exp03_smoke_")
         ).resolve()
-        output_root = temporary_root
+        layout = StudyLayout.create(
+            temporary_root / "weights", temporary_root / "results"
+        )
     else:
-        output_root = args.output_root.resolve()
-        free_gb = shutil.disk_usage(output_root.parent).free / (1024**3)
+        layout = StudyLayout.create(args.weights_root, args.results_root)
+        free_gb = shutil.disk_usage(layout.weights_root).free / (1024**3)
         if not args.analysis_only and free_gb < 18:
             raise RuntimeError(
                 f"At least 18 GiB free is required; {free_gb:.1f} GiB remains"
             )
-    output_root.mkdir(parents=True, exist_ok=True)
     settings["evaluation"]["prepared_cache_dir"] = str(
-        (output_root / "shared" / "eval_cache").resolve()
+        (layout.weights_root / "shared" / "eval_cache").resolve()
     )
-    prepare_manifest(output_root, settings)
+    prepare_manifest(layout.results_root, settings, layout)
 
     succeeded = False
     try:
         if not args.analysis_only:
             update_manifest(
-                output_root,
+                layout.results_root,
                 status="running",
                 started_at_utc=utc_now(),
                 requested_configs=[
                     config["name"] for config in requested_configs
                 ],
             )
-            shared_cache_root = output_root / "shared"
+            shared_cache_root = layout.weights_root / "shared"
             schedule_validations: dict[str, Any] = {}
             for index, config in enumerate(requested_configs, start=1):
                 print(
@@ -653,18 +579,20 @@ def main() -> int:
                     flush=True,
                 )
                 PARENT.run_one_config(
-                    output_root, shared_cache_root, settings, config
+                    layout, shared_cache_root, settings, config
                 )
                 schedule_validations[config["name"]] = (
                     validate_optimizer_schedule(
                         PARENT.config_paths(
-                            output_root, config["name"]
+                            layout.weights_root,
+                            layout.results_root,
+                            config["name"],
                         )["directory"],
                         smoke=args.smoke,
                     )
                 )
             update_manifest(
-                output_root,
+                layout.results_root,
                 optimizer_schedule_validation=schedule_validations,
             )
 
@@ -672,7 +600,9 @@ def main() -> int:
             expected = 1
             for config in requested_configs:
                 trajectory = PARENT.config_paths(
-                    output_root, config["name"]
+                    layout.weights_root,
+                    layout.results_root,
+                    config["name"],
                 )["trajectory"]
                 if not trajectory_ready(trajectory, expected):
                     raise RuntimeError(
@@ -680,31 +610,37 @@ def main() -> int:
                     )
                 validate_optimizer_schedule(
                     PARENT.config_paths(
-                        output_root, config["name"]
+                        layout.weights_root,
+                        layout.results_root,
+                        config["name"],
                     )["directory"],
                     smoke=True,
                 )
             update_manifest(
-                output_root,
+                layout.results_root,
                 status="smoke_completed",
                 completed_at_utc=utc_now(),
             )
             succeeded = True
-            print("Exp 03-Sup smoke completed.", flush=True)
+            print("Exp 03 smoke completed.", flush=True)
             return 0
 
-        rows = write_combined_summary(output_root, tokenizer)
+        rows = write_combined_summary(layout, tokenizer)
         schedule_validations = {}
         completed_names = []
-        for config in SUP_CONFIGS:
-            paths = PARENT.config_paths(output_root, config["name"])
+        for config in CAPACITY_CONFIGS:
+            paths = PARENT.config_paths(
+                layout.weights_root,
+                layout.results_root,
+                config["name"],
+            )
             if not trajectory_ready(paths["trajectory"], EPOCHS):
                 continue
             schedule_validations[config["name"]] = (
                 validate_optimizer_schedule(paths["directory"], smoke=False)
             )
             completed_names.append(config["name"])
-        complete = len(completed_names) == len(SUP_CONFIGS)
+        complete = len(completed_names) == len(CAPACITY_CONFIGS)
         if complete and not args.no_analysis:
             env = os.environ.copy()
             env.pop("KRONOS_PREVIEW_OVERRIDE_JSON", None)
@@ -713,14 +649,14 @@ def main() -> int:
                     sys.executable,
                     str(ANALYSIS_SCRIPT),
                     "--root",
-                    str(output_root),
+                    str(layout.results_root),
                 ],
                 env=env,
-                log_path=output_root / "analysis.log",
-                label="Exp 03-Sup mature target-relative codebook analysis",
+                log_path=layout.results_root / "analysis.log",
+                label="Exp 03 mature target-relative codebook analysis",
             )
         update_manifest(
-            output_root,
+            layout.results_root,
             status="completed" if complete else "partial",
             completed_at_utc=utc_now() if complete else None,
             combined_rows=len(rows),
@@ -729,19 +665,22 @@ def main() -> int:
             optimizer_schedule_validation=schedule_validations,
             holdout_used=False,
         )
+        write_download_manifest(layout)
         succeeded = True
         if complete:
-            print(f"Completed Exp 03-Sup: {output_root}", flush=True)
+            print(
+                f"Completed Exp 03: {layout.results_root}", flush=True
+            )
         else:
             print(
-                "Partial Exp 03-Sup run; selection was not finalized. "
-                f"Output: {output_root}",
+                "Partial Exp 03 run; selection was not finalized. "
+                f"Output: {layout.results_root}",
                 flush=True,
             )
         return 0
     except BaseException as exc:
         update_manifest(
-            output_root,
+            layout.results_root,
             status="failed",
             failed_at_utc=utc_now(),
             error=f"{type(exc).__name__}: {exc}",

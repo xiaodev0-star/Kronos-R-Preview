@@ -1,6 +1,6 @@
-"""Exp 04-B refresh: epoch-wise AdamW versus Muon+AdamW.
+"""Exp 04-A: epoch-wise AdamW versus Muon+AdamW.
 
-The experiment requires the refreshed Exp 04-A selection to remain CE.  Both
+Cross-entropy is fixed (decided without a separate loss ablation).  Both
 optimizer arms inherit the Exp 02 tokenizer and Exp 03 architecture, and differ
 only in optimizer family plus Muon's optimizer-specific learning rate.
 """
@@ -16,7 +16,12 @@ EXP04_DIR = SCRIPT_PATH.parents[1]
 if str(EXP04_DIR) not in sys.path:
     sys.path.insert(0, str(EXP04_DIR))
 
-from ablation_common import run_ablation
+from ablation_common import default_study_roots, run_ablation
+
+
+DEFAULT_WEIGHTS_ROOT, DEFAULT_RESULTS_ROOT = default_study_roots(
+    "04a-optimizer-ablation", seed=42
+)
 
 
 ARMS = [
@@ -47,28 +52,29 @@ FIXED_RECIPE = {
     "warmup_ratio": 0.05,
 }
 
-EXP04A_SELECTION = (
-    SCRIPT_PATH.parents[1] / "a-loss-ablation" / "run_seed42" / "selection.json"
-)
-
 
 def main() -> int:
     return run_ablation(
         wrapper_path=SCRIPT_PATH,
-        experiment_key="exp04b",
-        experiment_label="Exp 04-B optimizer ablation",
+        experiment_key="exp04a",
+        experiment_label="Exp 04-A optimizer ablation",
         arm_definitions=ARMS,
         fixed_recipe=FIXED_RECIPE,
-        default_output_root=SCRIPT_PATH.parent / "run_seed42",
-        selected_arm="adamw",
+        default_weights_root=DEFAULT_WEIGHTS_ROOT,
+        default_results_root=DEFAULT_RESULTS_ROOT,
+        selected_arm="muon",
         selection_rationale=(
-            "AdamW is the preregistered downstream working arm: the historical "
-            "controlled comparison found substantially healthier predictions "
-            "than Muon(lr=0.02). This refresh tests the same optimizer contrast "
-            "under the new upstream dependencies and epoch-wise protocol."
+            "Pending Muon arm execution. Selection is decided by the "
+            "token-balance ranking (coarse codebook balance, support F1, "
+            "token JSD, effective token alignment, collapse, unique tokens) "
+            "under downstream guardrails; DA/RankIC/MAPE/AmpRatio only gate, "
+            "never rank. AdamW arm reuses the Exp 03 depth6 trajectory "
+            "(50 epochs, same recipe). Muon arm must run 50 epochs for a "
+            "like-for-like paired comparison; the pre-registered muon "
+            "preference stands only if it leads on token-balance and clears "
+            "guardrails against the AdamW reference."
         ),
-        required_selections={"exp04a_loss": (EXP04A_SELECTION, "ce")},
-        default_epochs=30,
+        default_epochs=50,
     )
 
 
