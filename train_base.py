@@ -7,6 +7,7 @@ import os
 import random
 import time
 import json
+from pathlib import Path
 
 if os.name != "nt":
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -316,6 +317,85 @@ def _per_seq_ce(logits, targets, ignore_index=-100, label_smoothing=0.0):
     return (ce * mask).sum(1) / mask.sum(1).clamp(min=1)
 
 
+_TARGET_COARSE_DIST: torch.Tensor | None = None
+
+
+def _load_target_coarse_dist(device) -> torch.Tensor:
+    """Load the training-set coarse-token marginal distribution (Branch A).
+
+    Branch A's L_dm aligns the model's predicted token histogram with the
+    empirical target marginal distribution over the same codebook.  The target
+    reference is the training-split coarse distribution from the tokenization
+    diagnostics (dataset_token_summary.json).  Falls back to a uniform prior if
+    unavailable (uniform KL still discourages collapse).
+    """
+    global _TARGET_COARSE_DIST
+    if _TARGET_COARSE_DIST is not None:
+        return _TARGET_COARSE_DIST
+    counts = None
+    summary_path = Path("checkpoints/dataset_token_summary.json")
+    sidecar_path = Path("checkpoints/dataset_token_distributions.npz")
+    if summary_path.exists():
+        try:
+            import json as _json
+            summary = _json.loads(summary_path.read_text(encoding="utf-8"))
+            train = summary.get("splits", {}).get("train", {}).get("coarse", {})
+            n_unique = int(train.get("n_unique", 0))
+            if n_unique > 0:
+                counts = torch.ones(n_unique, dtype=torch.float32)
+        except Exception:
+            counts = None
+    if counts is None and sidecar_path.exists():
+        try:
+            import numpy as _np
+            data = _np.load(sidecar_path)
+            train_counts = data["train_coarse_counts"]
+            counts = torch.from_numpy(train_counts.sum(axis=0).astype(np.float32))
+        except Exception:
+            counts = None
+    if counts is None:
+        counts = torch.ones(128, dtype=torch.float32)
+    # Pad to the full coarse vocabulary (ModelConfig.vocab_size) so the
+    # distribution matches logits width; unused codes get zero probability.
+    vocab = int(ModelConfig.vocab_size)
+    full = torch.zeros(vocab, dtype=torch.float32)
+    n = min(len(counts), vocab)
+    full[:n] = counts[:n]
+    dist = full / full.sum().clamp(min=1e-8)
+    _TARGET_COARSE_DIST = dist.to(device)
+    return _TARGET_COARSE_DIST
+
+
+def distribution_match_loss(coarse_logits, targets, target_dist, ignore_index=-100):
+    """Branch A: symmetric KL between predicted soft-histogram and target marginal.
+
+    ``coarse_logits`` [B, T, V], ``targets`` [B, T] (positions, -100 ignored).
+    Builds the model's empirical prediction distribution over valid positions
+    (softmax per position, mean over positions) and computes
+    symmetric KL(target_dist || pred_dist) + KL(pred_dist || target_dist).
+    The detached reference target distribution makes this a true distributional
+    regularizer rather than a soft label loss.
+    """
+    B, T, V = coarse_logits.shape
+    # The coarse head may output vocab + 2 (BOS/EOS); clip to the codebook.
+    V_code = min(V, int(target_dist.shape[0]))
+    coarse_logits = coarse_logits[..., :V_code]
+    V = V_code
+    valid = targets != ignore_index
+    if not valid.any():
+        return torch.zeros((), device=coarse_logits.device)
+    probs = torch.softmax(coarse_logits.float(), dim=-1)  # [B, T, V]
+    pred_dist = probs[valid].mean(dim=0)                  # [V]
+    pred_dist = pred_dist.clamp(min=1e-8)
+    pred_dist = pred_dist / pred_dist.sum()
+    tgt = target_dist.float().to(coarse_logits.device).clamp(min=1e-8)
+    tgt = tgt / tgt.sum()
+    kl = (tgt * (tgt.log() - pred_dist.log())).sum() + (
+        pred_dist * (pred_dist.log() - tgt.log())
+    ).sum()
+    return 0.5 * kl
+
+
 def _per_seq_het(reg_pred, reg_targets_shifted, ignore_val=-999.0):
     """Row-wise heteroscedastic NLL. reg_pred [B,T,2] (float), targets [B,T] -> [B].
 
@@ -367,11 +447,27 @@ def compute_batched_loss(coarse_logits, target, fine_logits, fine_target,
     if reg_pred is not None and args.heteroscedastic:
         het = _per_seq_het(reg_pred, reg_target[:, 1:])
         total = total + args.het_weight * het
+    dm = torch.zeros_like(coarse)
+    if getattr(args, "dm_weight", 0.0) > 0:
+        target_dist = _load_target_coarse_dist(coarse_logits.device)
+        dm_loss = distribution_match_loss(
+            shift_coarse, target, target_dist, ignore_index=-100
+        )
+        dm = dm_loss.expand_as(coarse).detach() if dm_loss.dim() == 0 else dm_loss
+        if dm_loss.dim() == 0:
+            total = total + args.dm_weight * dm_loss
+        else:
+            total = total + args.dm_weight * dm_loss
     components = {
         "coarse": coarse.sum().detach(),
         "fine": fine.sum().detach(),
         "heteroscedastic": het.sum().detach(),
     }
+    if getattr(args, "dm_weight", 0.0) > 0:
+        components["distribution_match"] = (
+            dm_loss.detach() if isinstance(dm_loss, torch.Tensor) and dm_loss.dim() == 0
+            else dm.sum().detach()
+        )
     return total.sum(), components, total.shape[0]
 
 
@@ -815,16 +911,16 @@ def main(args):
                     deterministic=getattr(args, "deterministic", False))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # GPT standard architecture (HPO 2026-06-18 best: phase3_t000, DA 48.12% with V2).
+    # GPT architecture: Exp 03 reviewed selection (depth6, 256d/6L/4h/GQA-1).
     # Explicit CLI overrides are required by the architecture-scaling experiment;
-    # otherwise retain the production baseline so prior in-process mutations cannot
+    # otherwise retain the reviewed baseline so prior in-process mutations cannot
     # leak into an ordinary run.
-    ModelConfig.dim = args.dim or 256
-    ModelConfig.depth = args.depth or 2
-    ModelConfig.heads = args.heads or 4
-    ModelConfig.num_kv_heads = args.num_kv_heads or 1
+    ModelConfig.dim = args.dim or ModelConfig.dim
+    ModelConfig.depth = args.depth or ModelConfig.depth
+    ModelConfig.heads = args.heads or ModelConfig.heads
+    ModelConfig.num_kv_heads = args.num_kv_heads or ModelConfig.num_kv_heads
     ModelConfig.dropout = args.dropout
-    ModelConfig.ffn_multiplier = args.ffn_multiplier or 4
+    ModelConfig.ffn_multiplier = args.ffn_multiplier or ModelConfig.ffn_multiplier
     ModelConfig.position_encoding = "rope"
     ModelConfig.rope_base = 10000.0
     ModelConfig.vocab_size = 1024
@@ -1002,6 +1098,11 @@ def main(args):
             print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
     else:
         model = KronosPreview().to(device)
+        if args.base_checkpoint and os.path.exists(args.base_checkpoint):
+            base_ckpt = torch.load(args.base_checkpoint, map_location="cpu", weights_only=False)
+            model.load_state_dict(base_ckpt["model_state_dict"])
+            print(f"  Loaded base checkpoint: {args.base_checkpoint} "
+                  f"(val_loss={base_ckpt.get('val_loss', 'N/A')})")
         print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
 
     if TrainingConfig.use_gradient_checkpointing:
@@ -1822,6 +1923,12 @@ Examples:
                         help="Weight for heteroscedastic NLL loss")
     parser.add_argument("--fine_weight", type=float, default=0.3,
                         help="Weight for fine-token auxiliary loss in dual-head prediction")
+    # Branch A: daily marginal distribution matching (SFT).  Default 0.0 keeps
+    # the production CPT recipe unchanged; Branch A passes --dm_weight > 0.
+    parser.add_argument("--dm_weight", type=float, default=0.0,
+                        help="Branch A: weight for symmetric-KL distribution-matching "
+                             "loss aligning predicted vs target coarse-token histogram "
+                             "(0.0 = disabled, keeps reviewed CPT recipe)")
     # Reasoning
     parser.add_argument("--reasoning", action="store_true")
     parser.add_argument("--reasoning_frozen", action="store_true")
@@ -1860,22 +1967,26 @@ Examples:
     parser.add_argument("--early_stop_patience", type=int, default=0,
                         help="Early stopping patience (0=disabled, recommended 3-5 for GPT)")
     # ── Speed: token-budget batching (right-pad + is_causal, math-identical to bs=1) ──
-    parser.add_argument("--batch_tokens", type=int, default=12288,
+    # Exp 03/04-A/04-B controlled schedule uses 6144 tokens per microbatch
+    # with accumulation_steps=32 for an effective batch of ~196k tokens.
+    parser.add_argument("--batch_tokens", type=int, default=6144,
                         help="Max tokens per batch (B*max_len). Adaptive batching for "
-                             "~1.7x faster GPT training. 0 = legacy single-seq (bs=1).")
+                             "GPU occupancy. 0 = legacy single-seq (bs=1).")
     parser.add_argument("--batch_cap", type=int, default=64,
                         help="Hard cap on sequences per batch (safety for very short stocks)")
+    # Exp 03/04-A/04-B use a fixed architecture-independent loader seed so
+    # data order is identical across arms and reproducible across reruns.
     parser.add_argument(
         "--controlled_loader_seed",
         type=int,
-        default=-1,
+        default=42,
         help="Architecture-independent token-loader seed (-1 uses the "
              "process-global RNG).",
     )
     parser.add_argument(
         "--exact_accumulation_boundaries",
         action="store_true",
-        default=False,
+        default=True,
         help="Partition token-budget batches into deterministic blocks that "
              "end exactly at each optimizer update. Requires "
              "--controlled_loader_seed >= 0.",
@@ -1885,10 +1996,12 @@ Examples:
                              "workspace pinning. Costs ~4%% and does NOT make this "
                              "trainer reproducible (SDPA backward stays "
                              "non-deterministic); kept for debugging only.")
+    # Exp 04-A/04-B audit showed the historical epoch-15 doubling removes
+    # optimizer steps without reducing forward/backward work; keep constant.
     parser.add_argument(
         "--constant_accumulation",
         action="store_true",
-        default=False,
+        default=True,
         help="Keep TrainingConfig.accumulation_steps for every epoch instead of "
              "doubling it at absolute epoch 15.",
     )

@@ -47,12 +47,14 @@ DataConfig.feature_cols = [
 
 class TokenizerConfig:
     input_dim: int = 4           # v2: OHLC only (was 6 with VA)
+    # Exp 02 reviewed selection: 64x192 encoder/decoder for 7+7 bit codebooks.
     hidden_dim: int = 192
-    embedding_dim: int = 48
+    embedding_dim: int = 64
     num_quantizers: int = 2
-    bits_per_quantizer: int = 10  # single int → all layers same; list → per-layer
-    bits_l1: int = 0              # >0 overrides coarse layer bits
-    bits_l2: int = 0              # >0 overrides fine layer bits
+    # Exp 01 reviewed selection: 7+7 bits (coarse/fine).
+    bits_per_quantizer: int = 0   # 0 → use per-layer bits_l1/bits_l2 below
+    bits_l1: int = 7              # coarse layer bits
+    bits_l2: int = 7              # fine layer bits
     bsq_commitment_cost: float = 0.194
     bsq_entropy_weight: float = 0.01
     epochs: int = 100
@@ -65,8 +67,9 @@ class TokenizerConfig:
 
 
 class ModelConfig:
+    # Exp 03 reviewed selection: depth6 (256d/6L/4h/GQA-1).
     dim: int = 256
-    depth: int = 2
+    depth: int = 6
     heads: int = 4
     num_kv_heads: int = 1
     position_encoding: str = "rope"
@@ -79,7 +82,9 @@ class ModelConfig:
 
 
 class TrainingConfig:
-    epochs: int = 10
+    # T1 (ContinuePreTrain): full 100-epoch retrain from scratch using the
+    # reviewed Exp 04-B recipe (muon, lr_muon=0.005, lr=3e-4, ...).
+    epochs: int = 100
     batch_size: int = 1             # single-seq fastest for variable-length stocks
     accumulation_steps: int = 32    # effective batch = 32
     num_workers: int = 2            # parallel data loading
@@ -87,16 +92,15 @@ class TrainingConfig:
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     warmup_ratio: float = 0.05
-    use_gradient_checkpointing: bool = False  # minimal benefit for 2 layers
+    # Exp 03 depth6 selection runs with activation checkpointing enabled.
+    use_gradient_checkpointing: bool = True
     random_seed: int = 42
     max_train_updates: int = 0
     save_dir: str = "checkpoints"
     tokenizer_path: str = "checkpoints/tokenizer_v2_ohlc.pt"
-    # Production GPT checkpoint. HPO 2026-06-18 best (phase3_t000, DA 48.12% with V2
-    # calibration) trains with focal γ=4 + heteroscedastic=ON, 10 epochs. The old
-    # expA_v2.pt (γ=6, ls=0.05) is kept for backward compatibility but is no longer
-    # the recommended baseline.
-    base_model_path: str = "checkpoints/expA_v2_hpo.pt"
+    # Production GPT checkpoint target. Updated to the Exp 04-B reviewed baseline
+    # (trial_4c721141ab: muon, lr_muon=0.005, CE, heteroscedastic, 50 epochs).
+    base_model_path: str = "checkpoints/exp04b_best.pt"
     token_cache_dir: str = "checkpoints/token_cache"  # NEW: pre-tokenize cache
 
 
