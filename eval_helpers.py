@@ -19,11 +19,13 @@ from model.kronos_preview import KronosPreview
 # Model loading
 # ============================================================================
 
-def load_gpt(path, device, tokenizer=None):
-    """Load a KronosPreview GPT model for evaluation, restoring config from checkpoint."""
+def _apply_ckpt_config(ckpt, tokenizer=None):
+    """Mutate ModelConfig from a checkpoint's ``config`` dict (in place).
+
+    Shared by ``load_gpt`` and ``load_gpt_lora`` so both restore the exact same
+    architecture knobs from the checkpoint before constructing the model.
+    """
     from config import ModelConfig
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    # Restore config from checkpoint
     cfg = ckpt.get("config", {})
     if "vocab_size" in cfg:
         ModelConfig.vocab_size = cfg["vocab_size"]
@@ -42,7 +44,60 @@ def load_gpt(path, device, tokenizer=None):
         ModelConfig.num_kv_heads = cfg["num_kv_heads"]
     if "ffn_multiplier" in cfg:
         ModelConfig.ffn_multiplier = cfg["ffn_multiplier"]
+
+
+def load_gpt(path, device, tokenizer=None):
+    """Load a KronosPreview GPT model for evaluation, restoring config from checkpoint."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    _apply_ckpt_config(ckpt, tokenizer=tokenizer)
     model = KronosPreview().to(device)
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    model.eval()
+    return model
+
+
+def load_gpt_lora(path, device, tokenizer=None, lora_r=None, lora_alpha=None,
+                  n_regimes=3):
+    """Load a Branch F KronosPreview with per-regime LoRA adapters.
+
+    Reads ``lora_r`` / ``lora_alpha`` / ``n_regimes`` from the checkpoint's
+    ``config`` dict (or top-level checkpoint keys) unless explicitly passed, so
+    Branch F checkpoints self-describe their adapter geometry.  ``attach_lora``
+    is called BEFORE ``load_state_dict(strict=False)`` so the trained A/B
+    matrices land on the adapter parameters (the frozen backbone keys load as
+    usual).  Returns the model in eval mode.
+
+    Args:
+        path: checkpoint path (expected to carry a trained LoRA state).
+        device: torch device.
+        tokenizer: optional tokenizer used to infer vocab_fine when the
+            checkpoint config omits it.
+        lora_r: override rank; falls back to checkpoint config when None.
+        lora_alpha: override alpha; falls back to checkpoint config when None.
+        n_regimes: number of per-regime adapters (default 3 = low/med/high).
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    _apply_ckpt_config(ckpt, tokenizer=tokenizer)
+    cfg = ckpt.get("config", {})
+    if lora_r is None:
+        lora_r = cfg.get("lora_r", ckpt.get("lora_r"))
+    if lora_alpha is None:
+        lora_alpha = cfg.get("lora_alpha", ckpt.get("lora_alpha"))
+    if "n_regimes" in cfg:
+        n_regimes = int(cfg["n_regimes"])
+    elif ckpt.get("n_regimes") is not None:
+        n_regimes = int(ckpt["n_regimes"])
+    if lora_r is None or lora_alpha is None:
+        raise ValueError(
+            "checkpoint has no lora_r/lora_alpha config; pass them explicitly "
+            "or load with load_gpt for a dense checkpoint"
+        )
+    # attach_lora BEFORE .to(device) so the adapter A/B matrices land on the
+    # same device as the frozen backbone (a CUDA eval would otherwise run the
+    # LoRA matmuls on CPU while the backbone is on GPU).
+    model = KronosPreview()
+    model.attach_lora(int(lora_r), float(lora_alpha), n_regimes=n_regimes)
+    model.to(device)
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
     return model
@@ -270,28 +325,37 @@ def gather_prediction_ids(
 
 @torch.no_grad()
 def predict_selected_ids(model, input_ids, time_ids, position_ids, va_values,
-                         row_indices, positions, tokenizer, device):
+                         row_indices, positions, tokenizer, device,
+                         regime_ids=None):
     """Coarse/fine IDs at selected positions, without projecting every position.
 
     Same contract and the same outputs as running the full forward and calling
     ``gather_prediction_ids`` on it, including the rule that a position with no
     fine logit (the last one) yields fine ID zero.  Models without a selective
     forward fall back to the full path automatically.
+
+    ``regime_ids`` (optional ``[B, N]`` int64) drives Branch F's per-token hard
+    LoRA routing.  When ``None`` the dense path runs unchanged, so existing
+    callers are byte-for-byte unaffected.
     """
     rows = torch.as_tensor(row_indices, dtype=torch.long)
     pos = torch.as_tensor(positions, dtype=torch.long)
+    if regime_ids is not None:
+        regime_ids = regime_ids.to(device)
     selective = getattr(model, "forward_selected", None)
     if selective is None:
         with torch.amp.autocast("cuda", dtype=AMP_DTYPE,
                                 enabled=device.type == "cuda"):
             coarse_logits, fine_logits = model(
-                input_ids, time_ids, position_ids, None, va_values=va_values)
+                input_ids, time_ids, position_ids, None, va_values=va_values,
+                regime_ids=regime_ids)
         return gather_prediction_ids(
             coarse_logits, fine_logits, rows, pos, tokenizer, device)
 
     with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=device.type == "cuda"):
         coarse_logits, fine_logits = selective(
-            input_ids, time_ids, position_ids, rows, pos, va_values=va_values)
+            input_ids, time_ids, position_ids, rows, pos, va_values=va_values,
+            regime_ids=regime_ids)
     coarse_ids = coarse_logits[:, : tokenizer.vocab_coarse].float().argmax(dim=-1)
     # The full forward's fine head spans N-1 positions; the final position has no
     # fine logit and historically resolves to ID zero.

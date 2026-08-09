@@ -104,6 +104,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_collapse_rate", type=float, default=0.35)
     parser.add_argument("--min_unique_tokens", type=int, default=32)
     parser.add_argument(
+        "--regime_window",
+        type=int,
+        default=0,
+        help="Branch F: trailing-day window for per-day realized-vol regime "
+        "labels. 0 (default) disables regime mode entirely (byte-identical "
+        "legacy behaviour).",
+    )
+    parser.add_argument(
+        "--regime_quantiles",
+        type=str,
+        default="0.333,0.667",
+        help="Two cross-sectional tercile cutoffs for regime bucketing, e.g. "
+        "0.333,0.667.",
+    )
+    parser.add_argument(
+        "--lora",
+        action="store_true",
+        help="Load checkpoints with load_gpt_lora (Branch F per-regime LoRA) "
+        "instead of the dense load_gpt.",
+    )
+    parser.add_argument(
         "--reference_epoch",
         type=int,
         default=0,
@@ -196,7 +217,7 @@ def make_settings(
     offsets: list[int],
 ) -> dict[str, Any]:
     override_path = (trial_dir / "override.json").resolve()
-    return {
+    settings: dict[str, Any] = {
         "trial_dir": str(trial_dir),
         "tokenizer": str(tokenizer_path),
         "tokenizer_sha256": file_sha256(tokenizer_path),
@@ -215,6 +236,19 @@ def make_settings(
         "prediction_record_schema": PREDICTION_RECORD_SCHEMA,
         "holdout_used": False,
     }
+    # Branch F / regime-mode keys are ONLY added when active so legacy runs stay
+    # byte-identical (settings dict, epoch JSON, and cache digests all unchanged
+    # when --regime_window is 0 and --lora is off).
+    if args.lora:
+        settings["lora"] = True
+    if args.regime_window > 0:
+        settings["regime_window"] = int(args.regime_window)
+        settings["regime_quantiles"] = [
+            float(value)
+            for value in args.regime_quantiles.split(",")
+            if value.strip()
+        ]
+    return settings
 
 
 def cache_matches(
@@ -257,6 +291,8 @@ def prepare_stocks(
     offsets: list[int],
     n_days: int,
     batch_size: int,
+    regime_window: int = 0,
+    regime_thresholds: tuple | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     import numpy as np
     import torch
@@ -267,6 +303,10 @@ def prepare_stocks(
         _prepare_stocks_batch,
         attach_close_prices,
     )
+    if regime_window > 0:
+        from regime import label_regime, trailing_realized_vol
+    else:
+        label_regime, trailing_realized_vol = None, None
 
     # Smoke evaluations request the shortest few stocks only to exercise the
     # pipeline. Loading and parsing all 4695 CSVs first adds several minutes
@@ -343,6 +383,17 @@ def prepare_stocks(
         time_ids[:, 2] = torch.as_tensor(
             stock["year"][:required_length], dtype=torch.long
         )
+        # Branch F regime labels: input position p predicts day p, so it may
+        # only use information through day p-1 -> regime_ids[p] = label(rv[p-1]).
+        # p == 0 (BOS) and positions whose trailing window is incomplete are -1.
+        regime_ids = None
+        if regime_window > 0 and regime_thresholds is not None:
+            rv = trailing_realized_vol(
+                features[:, 0].astype(np.float64), regime_window)
+            labels = label_regime(rv, regime_thresholds)
+            regime_ids = np.full(required_length, -1, dtype=np.int64)
+            if required_length >= 2:
+                regime_ids[1:required_length] = labels[0:required_length - 1]
         valid.append(
             {
                 "symbol": stock["symbol"],
@@ -384,6 +435,7 @@ def prepare_stocks(
                     [float(closes[position]) for position in positions],
                     dtype=torch.float64,
                 ),
+                "regime_ids": regime_ids,
             }
         )
 
@@ -404,6 +456,14 @@ def prepare_stocks(
             )
             va_values = torch.zeros(
                 batch_count, max_len, 2, dtype=torch.float32
+            )
+            has_regime = regime_window > 0 and any(
+                stock.get("regime_ids") is not None for stock in stocks_batch
+            )
+            regime_ids = (
+                torch.full((batch_count, max_len), -1, dtype=torch.long)
+                if has_regime
+                else None
             )
             lengths = torch.empty(batch_count, dtype=torch.long)
             selection_ptr = [0]
@@ -426,6 +486,10 @@ def prepare_stocks(
                 input_ids[row, :length] = stock["input_ids"]
                 time_ids[row, :length] = stock["time_ids"]
                 va_values[row, :length] = stock["va_values"]
+                if regime_ids is not None and stock.get("regime_ids") is not None:
+                    regime_ids[row, :length] = torch.as_tensor(
+                        stock["regime_ids"][:length], dtype=torch.long
+                    )
                 count = len(stock["selection_positions"])
                 selection_rows.append(
                     torch.full((count,), row, dtype=torch.long)
@@ -472,6 +536,7 @@ def prepare_stocks(
                     "true_fine_ids": torch.cat(true_fine_ids),
                     "base_closes": torch.cat(base_closes),
                     "true_closes": torch.cat(true_closes),
+                    "regime_ids": regime_ids,
                 }
             )
     return packed_batches, len(test_sample), len(valid)
@@ -497,7 +562,7 @@ def prepared_cache_metadata(
         section: override.get(section, {})
         for section in ("DataConfig", "NormConfig", "TokenizerConfig")
     }
-    return {
+    metadata = {
         "schema": PREPARED_CACHE_SCHEMA,
         "tokenizer_sha256": settings["tokenizer_sha256"],
         "input_override": input_override,
@@ -520,6 +585,16 @@ def prepared_cache_metadata(
             else None
         ),
     }
+    # Branch F: the regime block changes the cache digest so the ~500 MiB
+    # prepared cache is rebuilt whenever the regime definition changes.  Dense
+    # and Branch F evals sharing regime params share one cache.
+    if settings.get("regime_window", 0) > 0:
+        metadata["regime"] = {
+            "window": int(settings["regime_window"]),
+            "quantiles": settings["regime_quantiles"],
+            "regime_schema": 1,
+        }
+    return metadata
 
 
 def prepared_cache_path(
@@ -900,6 +975,7 @@ def _flush_pending_ids(
         true_logrets = item["true_logrets"]
         base_closes = item["base_closes"]
         true_closes = item["true_closes"]
+        regimes = item.get("regimes")
         true_coarse_ids = item.get("true_coarse_ids")
         true_fine_ids = item.get("true_fine_ids")
         for offset in range(count):
@@ -917,6 +993,8 @@ def _flush_pending_ids(
                 "base_close": float(base_closes[offset]),
                 "true_close": float(true_closes[offset]),
             }
+            if regimes is not None:
+                prediction["regime"] = int(regimes[offset])
             if true_coarse_ids is not None:
                 true_coarse_id = int(true_coarse_ids[offset])
                 if true_coarse_id >= 0:
@@ -961,6 +1039,7 @@ def evaluate_prepared(
 
     with torch.inference_mode():
         for prepared in prepared_batches:
+            prepared_regime = prepared.get("regime_ids")
             row_start = 0
             total_rows = prepared["input_ids"].shape[0]
             selection_ptr = prepared["selection_ptr"]
@@ -996,6 +1075,11 @@ def evaluate_prepared(
                     selected_positions = prepared[
                         "selection_positions"
                     ][selection_start:selection_end]
+                    regime_ids_batch = None
+                    if prepared_regime is not None:
+                        regime_ids_batch = prepared_regime[
+                            row_start:row_end, :max_len
+                        ].to(device)
                     # Only the selected positions are ever read, so the vocabulary
                     # heads run on those rows instead of every position.  Identical
                     # IDs to the full projection; see predict_selected_ids.
@@ -1009,6 +1093,7 @@ def evaluate_prepared(
                         selected_positions,
                         tokenizer,
                         device,
+                        regime_ids=regime_ids_batch,
                     )
                     n_forward += 1
 
@@ -1051,6 +1136,14 @@ def evaluate_prepared(
                                 "true_logrets": prepared["true_logrets"][span].numpy(),
                                 "base_closes": prepared["base_closes"][span].numpy(),
                                 "true_closes": prepared["true_closes"][span].numpy(),
+                                "regimes": (
+                                    prepared_regime[
+                                        original_row,
+                                        prepared["selection_positions"][span],
+                                    ].numpy()
+                                    if prepared_regime is not None
+                                    else None
+                                ),
                             }
                         )
                         pending_rows += stop - begin
@@ -1627,6 +1720,39 @@ def make_plots(
     plt.close(figure)
 
 
+def compute_per_regime(
+    raw_predictions: dict[int, list[dict[str, Any]]],
+    offsets: list[int],
+    n_regimes: int = 3,
+    min_date_coverage_ratio: float = 0.30,
+) -> dict[str, dict[str, Any]]:
+    """Slice raw predictions by their Branch F regime tag and score each slice.
+
+    Every prediction carries a ``regime`` field (0/1/2; set only in regime mode).
+    A per-regime coverage ratio below the dense default (0.30 vs 0.80) is used
+    because each regime holds only ~1/3 of the market cross-section; the paired
+    bootstrap later filters by its own ``--min_cross_section``.
+    """
+    from eval_helpers import compute_windowed_metrics
+
+    per_regime: dict[str, dict[str, Any]] = {}
+    for regime_id in range(n_regimes):
+        predictions = [
+            prediction
+            for offset in offsets
+            for prediction in raw_predictions[offset]
+            if prediction.get("regime") == regime_id
+        ]
+        metrics = compute_windowed_metrics(
+            predictions, min_date_coverage_ratio=min_date_coverage_ratio
+        )
+        if predictions:
+            augment_per_date_metrics(predictions, metrics)
+        metrics["n_regime_predictions"] = len(predictions)
+        per_regime[str(regime_id)] = metrics
+    return per_regime
+
+
 def main() -> int:
     args = parse_args()
     trial_dir = resolve_trial_dir(args)
@@ -1671,13 +1797,50 @@ def main() -> int:
     import torch
 
     from config import ModelConfig, set_global_seed
-    from eval_helpers import compute_windowed_metrics, load_gpt, load_tokenizer
+    from eval_helpers import (
+        compute_windowed_metrics,
+        load_gpt,
+        load_gpt_lora,
+        load_tokenizer,
+    )
 
     set_global_seed(args.seed, deterministic=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     settings = make_settings(
         args, trial_dir, tokenizer_path, offsets
     )
+    # Branch F: cross-sectional realized-vol tercile cutoffs over the TRAIN
+    # split, identical to the training-side regime definition.
+    regime_thresholds = None
+    if args.regime_window > 0:
+        from config import DataConfig
+        from data_processor import _stock_cutoff_idx, load_stocks, split_stocks
+        from regime import compute_regime_thresholds
+
+        quantiles = tuple(
+            float(value)
+            for value in args.regime_quantiles.split(",")
+            if value.strip()
+        )
+        stocks_all = load_stocks(max_stocks=0)
+        train_s, _, _ = split_stocks(stocks_all)
+        train_logrets = [
+            s["features_raw"][
+                : _stock_cutoff_idx(s, DataConfig.cutoff_date), 0
+            ]
+            for s in train_s
+        ]
+        regime_thresholds = compute_regime_thresholds(
+            train_logrets,
+            window=args.regime_window,
+            quantiles=quantiles,
+        )
+        print(
+            f"Regime thresholds (w={args.regime_window}, "
+            f"q={args.regime_quantiles}): "
+            f"{[float(v) for v in regime_thresholds]}",
+            flush=True,
+        )
     missing_epochs = [epoch for epoch in epochs if epoch not in checkpoint_rows]
     if missing_epochs:
         raise RuntimeError(f"Checkpoint index is missing epochs: {missing_epochs}")
@@ -1721,6 +1884,8 @@ def main() -> int:
             offsets=offsets,
             n_days=args.n_days,
             batch_size=args.batch_size,
+            regime_window=args.regime_window,
+            regime_thresholds=regime_thresholds,
         )
         save_prepared_cache(
             input_cache_path,
@@ -1778,7 +1943,8 @@ def main() -> int:
             flush=True,
         )
         if model is None:
-            model = load_gpt(str(checkpoint), device, tokenizer=tokenizer)
+            loader = load_gpt_lora if args.lora else load_gpt
+            model = loader(str(checkpoint), device, tokenizer=tokenizer)
         else:
             checkpoint_payload = torch.load(
                 checkpoint, map_location="cpu", weights_only=False
@@ -1809,6 +1975,9 @@ def main() -> int:
             max_collapse_rate=args.max_collapse_rate,
             min_unique_tokens=args.min_unique_tokens,
         )
+        per_regime = None
+        if args.regime_window > 0:
+            per_regime = compute_per_regime(raw_predictions, offsets)
         distribution_metadata = write_token_distributions(
             token_distribution_path(output_dir, epoch),
             raw_predictions,
@@ -1897,6 +2066,14 @@ def main() -> int:
             "n_forward_passes": n_forward,
             "elapsed_sec": elapsed_sec,
         }
+        if args.regime_window > 0:
+            payload["regime"] = {
+                "window": int(args.regime_window),
+                "quantiles": settings["regime_quantiles"],
+                "thresholds": [float(v) for v in regime_thresholds],
+                "n_regimes": 3,
+            }
+            payload["per_regime"] = per_regime
         atomic_write_json(output_path, payload)
         completed_results.append(payload)
         write_summary(output_dir, completed_results)

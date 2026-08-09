@@ -43,7 +43,8 @@ class KronosElectraDiscriminator(_BaseTransformer):
     """
     def __init__(self, cfg=None):
         cfg = cfg or ModelConfig
-        super().__init__(cfg, n_special=3)  # BOS + EOS + MASK (use same embed dim as BERT)
+        # causal=False => full bidirectional attention (see KronosBert).
+        super().__init__(cfg, n_special=3, causal=False)  # BOS + EOS + MASK
         self.vocab_base = cfg.vocab_size
         # Binary classification head: 1 output with sigmoid
         # Predicts P(original) ∈ [0,1] for each position
@@ -72,6 +73,8 @@ class KronosElectraDiscriminator(_BaseTransformer):
             input_ids, time_ids, position_ids, attn_mask, **extra)
         va_values = extra["va_values"]
 
+        # Bidirectional default via ``causal=False`` (see KronosBert).
+
         x = self._embed(input_ids, time_ids, va_values)
         sin, cos = self.rotary(position_ids)
         x = self._run_blocks(x, sin, cos, attn_mask)
@@ -87,21 +90,27 @@ class KronosElectraDiscriminator(_BaseTransformer):
 
 
 def make_replaced_batch(input_ids, vocab_base, replace_prob=0.15,
-                        ignore_index=-100, generator=None):
+                        ignore_index=-100, generator=None,
+                        proposal=None, temp=1.0):
     """Build an ELECTRA-style replaced-token detection batch.
 
-    Randomly replaces ~replace_prob of non-special tokens with random alternatives.
-    Produces binary labels: 1=original, 0=replaced.
-
-    This is a SIMPLIFIED version — the original ELECTRA uses a small MLM generator
-    to produce "plausible" replacements. We use uniform random sampling for
-    simplicity (similar to RTS in Liello et al. 2024).
+    Replaces ~replace_prob of non-special tokens.  When ``proposal`` is None the
+    replacement is UNIFORM RANDOM (control arm, original simplified behaviour).
+    When ``proposal`` is a ``[N, vocab_base]`` tensor of GPT coarse log-probs at
+    each position (frozen generator, F3), replacement tokens are SAMPLED from
+    softmax(proposal / temp) — "hard negatives" drawn from the actual generator
+    distribution, so the discriminator learns to catch *implausible continuations*
+    rather than merely out-of-vocabulary anomalies.  Special tokens are never
+    replaced.  Produces binary labels: 1=original, 0=replaced.
 
     Args:
         input_ids: [N] long (original token ids, including BOS/EOS)
         vocab_base: int — tokens >= this are special (BOS/EOS) and never replaced
         replace_prob: fraction of non-special tokens to replace (default 0.15)
         ignore_index: positions with this label are ignored in loss (we don't ignore any: all positions get supervision)
+        generator: optional torch.Generator for reproducible sampling
+        proposal: optional [N, vocab_base] logits (e.g. GPT coarse logits); None → uniform random
+        temp: sampling temperature applied to ``proposal`` (default 1.0)
 
     Returns:
         replaced_ids: [N] long — input with some tokens replaced
@@ -109,19 +118,34 @@ def make_replaced_batch(input_ids, vocab_base, replace_prob=0.15,
     """
     N = input_ids.shape[0]
     device = input_ids.device
-    rand = torch.rand(N, device=device)
+    if generator is not None:
+        rand = torch.rand(N, device=device, generator=generator)
+    else:
+        rand = torch.rand(N, device=device)
 
     # Non-special tokens are candidates for replacement
     is_special = (input_ids >= vocab_base)
     can_replace = (~is_special) & (rand < replace_prob)
 
     replaced_ids = input_ids.clone()
-    # Replace with random token from vocabulary
-    n_replace = can_replace.sum().item()
+    n_replace = int(can_replace.sum().item())
     if n_replace > 0:
-        random_tokens = torch.randint(0, vocab_base, (n_replace,),
-                                       device=device, dtype=torch.long)
-        replaced_ids[can_replace] = random_tokens
+        if proposal is not None:
+            prop = torch.as_tensor(proposal, dtype=torch.float32, device=device)
+            probs = torch.softmax(prop / temp, dim=-1)          # [N, V]
+            flat = probs[can_replace]                            # [n, V]
+            rng = generator if generator is not None else torch.default_generator
+            replacement = torch.multinomial(flat, num_samples=1,
+                                            generator=rng).squeeze(-1)
+        else:
+            if generator is not None:
+                replacement = torch.randint(0, vocab_base, (n_replace,),
+                                            device=device, dtype=torch.long,
+                                            generator=generator)
+            else:
+                replacement = torch.randint(0, vocab_base, (n_replace,),
+                                            device=device, dtype=torch.long)
+        replaced_ids[can_replace] = replacement
 
     # Labels: 1=original, 0=replaced — ALL positions get supervision
     labels = torch.ones(N, dtype=torch.float32, device=device)

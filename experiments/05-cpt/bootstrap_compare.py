@@ -21,11 +21,22 @@ from pathlib import Path
 import numpy as np
 
 
-def load_per_date(path: Path, key: str) -> dict[str, float]:
-    """Extract per-date values for a balance/distribution key."""
+def load_per_date(path: Path, key: str, offset_min: int | None = None,
+                  offset_max: int | None = None) -> dict[str, float]:
+    """Extract per-date values for a balance/distribution key.
+
+    ``offset_min``/``offset_max`` restrict the windows to offsets in
+    ``[offset_min, offset_max]`` (Branch C near/far slices, e.g. 300-399 vs
+    0-299), avoiding separate evaluation runs for each slice.
+    """
     payload = json.load(open(path))
     out = {}
     for offset, window in payload.get("windows", {}).items():
+        o = int(offset)
+        if offset_min is not None and o < offset_min:
+            continue
+        if offset_max is not None and o > offset_max:
+            continue
         for date, metrics in window.get("per_date", {}).items():
             if key in metrics and metrics[key] is not None:
                 out[date] = float(metrics[key])
@@ -40,10 +51,18 @@ def main() -> int:
                         default="codebook_balance_score")
     parser.add_argument("--bootstrap", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--offset_min", type=int, default=None,
+                        help="Restrict to windows with offset >= this "
+                             "(e.g. 300 for the near 300-399 slice)")
+    parser.add_argument("--offset_max", type=int, default=None,
+                        help="Restrict to windows with offset <= this "
+                             "(e.g. 299 for the far 0-299 slice)")
     args = parser.parse_args()
 
-    cand = load_per_date(args.candidate, args.key)
-    ref = load_per_date(args.reference, args.key)
+    cand = load_per_date(args.candidate, args.key,
+                         offset_min=args.offset_min, offset_max=args.offset_max)
+    ref = load_per_date(args.reference, args.key,
+                        offset_min=args.offset_min, offset_max=args.offset_max)
     common = sorted(set(cand) & set(ref))
     if not common:
         raise RuntimeError("No overlapping dates between candidate and reference")

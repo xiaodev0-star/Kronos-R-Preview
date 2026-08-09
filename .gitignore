@@ -5,7 +5,9 @@ venv/
 .idea/
 .claude/
 .qoder/
-
+*.png
+*.json
+*.md
 # Python caches and tooling
 __pycache__/
 *.py[cod]

@@ -1,0 +1,97 @@
+{"ts": "2026-08-05T11:00:38.922173+00:00", "stage": "pt03", "arm": "P1_linear_return", "recipe": {"hp": {"head": {}, "lr": 0.001, "epochs": 6, "batch_size": 4096}, "fold_val_loss": {"R0": 0.0007607387378811836, "R1": 0.0005777784636638199, "R2": 0.0003659922351491534}, "mean_val_loss": 0.0005681698122313857}}
+{"ts": "2026-08-05T11:00:57.564241+00:00", "stage": "pt03", "arm": "P2_mlp_return", "recipe": {"hp": {"head": {}, "lr": 0.0003, "epochs": 6, "batch_size": 4096}, "fold_val_loss": {"R0": 0.00042903602614229464, "R1": 0.00041522705354369606, "R2": 0.0003194516159257748}, "mean_val_loss": 0.00038790489853725513}}
+{"ts": "2026-08-05T11:02:01.342943+00:00", "stage": "pt03", "arm": "P1_linear_return", "recipe": {"hp": {"head": {}, "lr": 0.001, "epochs": 6, "batch_size": 4096}, "fold_val_loss": {"R0": 0.0007607387378811836, "R1": 0.0005777784636638199, "R2": 0.0003659922351491534}, "mean_val_loss": 0.0005681698122313857}}
+{"ts": "2026-08-05T11:02:20.125112+00:00", "stage": "pt03", "arm": "P2_mlp_return", "recipe": {"hp": {"head": {}, "lr": 0.0003, "epochs": 6, "batch_size": 4096}, "fold_val_loss": {"R0": 0.00042903602614229464, "R1": 0.00041522705354369606, "R2": 0.0003194516159257748}, "mean_val_loss": 0.00038790489853725513}}
+{"ts": "2026-08-05T11:02:37.990766+00:00", "stage": "pt03", "arm": "P3_linear_direction", "recipe": {"hp": {"head": {}, "lr": 0.001, "epochs": 6, "batch_size": 4096}, "fold_val_loss": {"R0": 0.4659527099650839, "R1": 0.4765065896969575, "R2": 0.413378557673207}, "mean_val_loss": 0.45194595244508284}}
+{"ts": "2026-08-05T11:02:55.424448+00:00", "stage": "pt03", "arm": "P4_mlp_direction", "recipe": {"hp": {"head": {}, "lr": 0.001, "epochs": 6, "batch_size": 4096}, "fold_val_loss": {"R0": 0.4615017681018166, "R1": 0.47220874635072857, "R2": 0.4032970567544301}, "mean_val_loss": 0.4456691904023251}}
+{"ts": "2026-08-05T11:08:45.684975+00:00", "stage": "pt03", "arm": "P5_linear_rank_pairwise", "recipe": {"hp": {"head": {}, "lr": 0.0003, "epochs": 6, "batch_size": 4096}, "fold_val_loss": {"R0": 0.5964885958534504, "R1": 0.5781686841702658, "R2": 0.561426556509409}, "mean_val_loss": 0.5786946121777083}}
+{"ts": "2026-08-05T11:14:44.455621+00:00", "stage": "pt03", "arm": "P6_mlp_rank_spearman", "recipe": {"hp": {"head": {}, "lr": 0.001, "epochs": 6, "batch_size": 4096}, "fold_val_loss": {"R0": 0.45231606265311297, "R1": 0.40023202098105565, "R2": 0.3539951161859424}, "mean_val_loss": 0.40218106660670366}}
+{"ts": "2026-08-05T11:20:35.619555+00:00", "stage": "pt03", "arm": "P7_mlp_rank_pairwise", "recipe": {"hp": {"head": {}, "lr": 0.001, "epochs": 6, "batch_size": 4096}, "fold_val_loss": {"R0": 0.5767251076968575, "R1": 0.5522869288428756, "R2": 0.5269668047398204}, "mean_val_loss": 0.5519929470931845}}
+{"ts": "2026-08-05T11:20:50.648509+00:00", "stage": "pt03", "arm": "C1_feature_only", "recipe": {"hp": {"head": {}, "lr": 0.0003, "epochs": 6, "batch_size": 4096}, "fold_val_loss": {"R0": 0.0006278918425896732, "R1": 0.0005146572321581726, "R2": 0.0004802592997697906}, "mean_val_loss": 0.0005409361248392121}}
+{"ts": "2026-08-05T11:33:01.853650+00:00", "stage": "pt90_confirm", "arm": "P6_mlp_rank_spearman", "seed": 43, "recipe": {"hp": {"head": {}, "lr": 0.001, "epochs": 6, "batch_size": 4096}, "fold_val_loss": {"R0": 0.45231606265311297, "R1": 0.40023202098105565, "R2": 0.3539951161859424}, "mean_val_loss": 0.40218106660670366}, "rank_ic": 0.04650024060863103}
+{"ts": "2026-08-05T11:34:22.615071+00:00", "stage": "pt90_confirm", "arm": "P6_mlp_rank_spearman", "seed": 44, "recipe": {"hp": {"head": {}, "lr": 0.001, "epochs": 6, "batch_size": 4096}, "fold_val_loss": {"R0": 0.45231606265311297, "R1": 0.40023202098105565, "R2": 0.3539951161859424}, "mean_val_loss": 0.40218106660670366}, "rank_ic": 0.03728885618319542}
+{"ts": "2026-08-05T11:36:46.743879+00:00", "stage": "pt04", "arm": "S1_independent_mlp", "recipe": {"lr": 0.001, "epochs": 4, "batch_size": 0}}
+{"ts": "2026-08-05T11:38:39.262255+00:00", "stage": "pt04", "arm": "S2_deepsets", "recipe": {"lr": 0.001, "epochs": 4, "batch_size": 0}}
+{"ts": "2026-08-05T11:41:32.240976+00:00", "stage": "pt04", "arm": "S1_independent_mlp", "recipe": {"lr": 0.001, "epochs": 4, "batch_size": 0}}
+{"ts": "2026-08-05T11:43:23.086975+00:00", "stage": "pt04", "arm": "S2_deepsets", "recipe": {"lr": 0.001, "epochs": 4, "batch_size": 0}}
+{"ts": "2026-08-05T11:50:20.976420+00:00", "stage": "pt04", "arm": "S3_isab", "recipe": {"lr": 0.0003, "epochs": 4, "batch_size": 0}}
+{"ts": "2026-08-05T12:48:50.334084+00:00", "event": "build_candidates", "k": 8, "out": "D:\\Kronos-R-Preview\\server_runs\\weights\\07-bert-critic\\seed42\\candidates_eval_K8.npz", "status": "ok"}
+{"ts": "2026-08-05T13:36:00.935637+00:00", "event": "controls", "n": 50282, "status": "ok", "c_a_pass": true}
+{"ts": "2026-08-05T13:53:30.869023+00:00", "event": "score_bert", "region": "eval", "stride": 10, "n_rows": 179890, "status": "ok"}
+{"ts": "2026-08-05T13:57:42.343002+00:00", "event": "score_bert", "region": "calib", "stride": 500, "n_rows": 283, "status": "ok"}
+{"ts": "2026-08-05T13:59:46.231759+00:00", "event": "controls_cb_diagnostic", "status": "ok", "finding": "scrambled-cal discrimination survives (rank 3.32 vs 3.26 baseline); C-b not collapsing traced to history-content (bag) signal, not calendar/va side channel", "c_a_pass": true}
+{"ts": "2026-08-05T14:30:02.610528+00:00", "event": "score_bert", "region": "eval", "stride": 1, "n_rows": 1798899, "status": "ok"}
+{"ts": "2026-08-05T14:30:24.064989+00:00", "event": "build_candidates", "region": "calib", "k": 8, "status": "ok"}
+{"ts": "2026-08-05T14:32:39.316118+00:00", "event": "score_bert", "region": "calib", "stride": 1, "n_rows": 141364, "status": "ok"}
+{"ts": "2026-08-05T14:32:47.594818+00:00", "event": "fint", "chosen_lambda": 0.0, "status": "ok"}
+{"ts": "2026-08-05T14:35:03.561978+00:00", "event": "build_candidates", "region": "calib", "k": 8, "status": "ok"}
+{"ts": "2026-08-05T14:37:19.312951+00:00", "event": "fstk", "status": "ok", "n_calib": 141364}
+{"ts": "2026-08-05T14:40:06.955272+00:00", "event": "critic_final_verdict", "status": "negative", "finding": "BERT critic: C-a PASS but no cross-sectional ranking value. B1=0.0130, B2_fint=0.0052(-0.0483 vs B0), B3_fstk=0.0534(-0.0002 vs B0). decorrelation rho=0.246. verdict: 判负 (score objective misalignment: token-likelihood vs return-ranking). Stage 2a not run (futility).", "arms": {"B0_p6": 0.0535, "B1_bert": 0.013, "B2_fint": 0.0052, "B3_fstk": 0.0534}}
+{"ts": "2026-08-05T15:22:46.066042+00:00", "event": "build_gpt_full_q", "n_rows": 1798899, "status": "ok"}
+{"ts": "2026-08-05T15:30:02.519391+00:00", "event": "t3_calibration", "status": "ok", "T_b": 9.999952673287032}
+{"ts": "2026-08-05T15:36:07.993229+00:00", "event": "cache_bert_hidden", "region": "fit", "n_rows": 101, "status": "ok"}
+{"ts": "2026-08-05T15:42:23.182021+00:00", "event": "r1", "status": "ok"}
+{"ts": "2026-08-05T15:43:16.719667+00:00", "event": "r3_bert", "status": "ok"}
+{"ts": "2026-08-05T15:43:44.752054+00:00", "event": "r_series_r4", "status": "failed", "error": "Unable to allocate 878. MiB for an array with shape (1798899, 128) and data type float32"}
+{"ts": "2026-08-05T15:43:56.106471+00:00", "event": "r_series_r5", "status": "failed", "error": "Unable to allocate 878. MiB for an array with shape (1798899, 128) and data type float32"}
+{"ts": "2026-08-05T15:44:25.920677+00:00", "event": "r_series_r2", "status": "failed", "error": "Unable to allocate 878. MiB for an array with shape (1798899, 128) and data type float32"}
+{"ts": "2026-08-05T15:44:36.936391+00:00", "event": "r_series_r3_poe", "status": "failed", "error": "Unable to allocate 878. MiB for an array with shape (1798899, 128) and data type float32"}
+{"ts": "2026-08-05T15:44:37.171934+00:00", "event": "r_series_all", "status": "ok"}
+{"ts": "2026-08-05T15:55:07.120447+00:00", "event": "r5", "status": "ok", "w": 1.0}
+{"ts": "2026-08-05T15:57:50.708751+00:00", "event": "r2", "status": "ok", "lam": 0.0}
+{"ts": "2026-08-05T16:01:54.419520+00:00", "event": "r4", "status": "ok"}
+{"ts": "2026-08-05T16:03:06.094103+00:00", "event": "r3_poe", "status": "ok", "lam": 0.5}
+{"ts": "2026-08-05T16:23:29.667854+00:00", "event": "controls", "n": 50282, "status": "ok", "c_a_pass": true}
+{"ts": "2026-08-05T16:57:36.227242+00:00", "event": "score_bert", "region": "eval", "stride": 1, "n_rows": 1798899, "status": "ok"}
+{"ts": "2026-08-05T17:00:32.242560+00:00", "event": "r1", "status": "ok"}
+{"ts": "2026-08-05T17:03:12.891111+00:00", "event": "cache_gpt_proposals", "which": "ep100", "n_seqs": 4108, "status": "ok"}
+{"ts": "2026-08-05T17:21:25.732559+00:00", "event": "controls", "n": 50282, "status": "ok", "c_a_pass": true}
+{"ts": "2026-08-05T17:40:51.785686+00:00", "event": "cache_bert_hidden", "region": "fit", "n_rows": 905072, "status": "ok"}
+{"ts": "2026-08-05T18:23:47.543442+00:00", "event": "t5_head_train", "seed": 42, "status": "ok"}
+{"ts": "2026-08-05T18:59:15.669308+00:00", "event": "cache_bert_hidden", "region": "eval", "n_rows": 1798899, "status": "ok"}
+{"ts": "2026-08-05T19:03:02.097776+00:00", "event": "t5_head_apply", "status": "ok", "seed": 42}
+{"ts": "2026-08-05T19:40:29.445061+00:00", "event": "t5_head_apply", "status": "ok", "seed": 42}
+{"ts": "2026-08-05T23:39:49.751921+00:00", "event": "f1_score_fusion", "status": "ok", "tag": "t5"}
+{"ts": "2026-08-05T23:54:42.021188+00:00", "event": "cache_bert_hidden", "region": "calib", "n_rows": 141364, "status": "ok"}
+{"ts": "2026-08-05T23:56:59.188891+00:00", "event": "f5_calib_fit", "status": "ok", "mode": "blend", "tag": ""}
+{"ts": "2026-08-05T23:58:23.660128+00:00", "event": "f2_concat_head_apply", "status": "ok", "seed": 42, "tag": "concat"}
+{"ts": "2026-08-06T00:02:20.323226+00:00", "event": "f5_calib_fit", "status": "ok", "mode": "all", "tag": ""}
+{"ts": "2026-08-06T00:04:09.748265+00:00", "event": "f5_calib_fit", "status": "ok", "mode": "abstain", "tag": ""}
+{"ts": "2026-08-06T00:12:06.116566+00:00", "event": "f3_multiseed_t5", "status": "ok"}
+{"ts": "2026-08-06T00:25:04.134386+00:00", "event": "f6_ensemble_eval", "status": "ok", "n_heads": 7}
+{"ts": "2026-08-06T00:28:13.428105+00:00", "event": "f7_abstain_strong", "status": "ok", "score": "F_z_STRONG"}
+{"ts": "2026-08-06T00:29:34.597465+00:00", "event": "f8_devconf_abstain", "status": "ok", "signal": "c_dis"}
+{"ts": "2026-08-06T00:38:56.676575+00:00", "event": "f9_ens6_composite", "status": "ok"}
+{"ts": "2026-08-06T00:43:55.046434+00:00", "event": "f10_head_capacity", "status": "ok", "variant": "W128"}
+{"ts": "2026-08-06T00:47:43.977019+00:00", "event": "f11_pipeline", "status": "ok"}
+{"ts": "2026-08-06T01:02:54.842877+00:00", "event": "f12_ens_diversity", "status": "ok"}
+{"ts": "2026-08-06T01:07:23.228967+00:00", "event": "f13_aug_return", "status": "ok", "seed": 54}
+{"ts": "2026-08-06T01:10:07.565556+00:00", "event": "f15_final_pipeline", "status": "ok"}
+{"ts": "2026-08-06T01:13:47.528038+00:00", "event": "f17_conf_signals", "status": "ok"}
+{"ts": "2026-08-06T01:15:32.609578+00:00", "event": "f18_final_cmag", "status": "ok"}
+{"ts": "2026-08-06T01:16:33.088330+00:00", "event": "cache_bert_hidden", "region": "fit", "n_rows": 150000, "status": "ok"}
+{"ts": "2026-08-06T01:19:03.875522+00:00", "event": "cache_bert_hidden", "region": "eval", "n_rows": 300000, "status": "ok"}
+{"ts": "2026-08-06T01:27:30.878028+00:00", "event": "f19_gpt_head_strong", "status": "ok"}
+{"ts": "2026-08-06T01:28:43.394187+00:00", "event": "f20_t1_t2_compare", "status": "ok"}
+{"ts": "2026-08-06T02:13:11.710514+00:00", "event": "cache_bert_hidden", "region": "fit", "n_rows": 150000, "status": "ok"}
+{"ts": "2026-08-06T02:18:24.917618+00:00", "event": "f24_consolidate", "status": "ok"}
+{"ts": "2026-08-06T02:32:08.337841+00:00", "event": "f3_multiseed_t5", "status": "ok"}
+{"ts": "2026-08-06T02:33:10.635691+00:00", "event": "f25_seed_confirm", "status": "ok", "tag": "confirm"}
+{"ts": "2026-08-06T02:35:16.920919+00:00", "event": "cache_bert_hidden", "region": "eval", "n_rows": 100000, "status": "ok"}
+{"ts": "2026-08-06T02:37:19.690384+00:00", "event": "f26_rankft_compare", "status": "ok"}
+{"ts": "2026-08-06T02:39:10.409825+00:00", "event": "f27_magnitude", "status": "ok"}
+{"ts": "2026-08-06T02:41:23.217552+00:00", "event": "f28_final_variants", "status": "ok"}
+{"ts": "2026-08-06T02:45:32.753637+00:00", "event": "f29_quantile", "status": "ok", "seed": 110}
+{"ts": "2026-08-06T03:07:34.536843+00:00", "event": "f30_multihorizon", "status": "ok", "seed": 120}
+{"ts": "2026-08-06T03:08:38.196363+00:00", "event": "f31_bert_gpt_agreement", "status": "ok"}
+{"ts": "2026-08-06T03:09:47.175563+00:00", "event": "f32_robust_ensemble", "status": "ok"}
+{"ts": "2026-08-06T03:11:06.542221+00:00", "event": "f33_propose_validate", "status": "ok"}
+{"ts": "2026-08-06T03:12:27.145223+00:00", "event": "f34_direction", "status": "ok"}
+{"ts": "2026-08-06T13:05:13.571208+00:00", "event": "f35_bert_gptstats_head_apply", "status": "ok", "seed": 140}
+{"ts": "2026-08-06T13:51:39.735983+00:00", "event": "f36_ensemble_xgb", "status": "ok"}
+{"ts": "2026-08-06T13:52:57.853074+00:00", "event": "f37_ensemble_verify", "status": "ok"}
+{"ts": "2026-08-06T14:12:35.770743+00:00", "event": "f38_overfit_check", "status": "ok"}
+{"ts": "2026-08-06T14:18:02.257063+00:00", "event": "f39_fusion_generalize", "status": "ok"}
+{"ts": "2026-08-06T14:24:40.584552+00:00", "event": "f40_bert_cs_head", "status": "ok", "seed": 150}
+{"ts": "2026-08-06T14:45:56.383891+00:00", "event": "f42_t1t2_probe", "status": "ok", "seed": 170}
+{"ts": "2026-08-06T15:13:32.147686+00:00", "event": "f44_regularized_xgb", "status": "ok", "seed": 42}

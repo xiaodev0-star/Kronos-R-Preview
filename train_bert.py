@@ -71,7 +71,16 @@ def main(args):
           f"dropout={ModelConfig.dropout}")
 
     tokenizer = load_tokenizer(tok_path, device)
-    print("Tokenizer loaded.")
+    # F1 (BERT-Critic-Rerank-Plan §6.0): wire vocab from the tokenizer, mirroring
+    # train_base.py:1704.  The BERT head must be built over the tokenizer's coarse
+    # vocab (128), NOT the ModelConfig default (1024), or it will be misaligned with
+    # the GPT vocab convention, the checkpoint config, and downstream coarse-dist
+    # consumers (e.g. _load_target_coarse_dist / critic scoring).
+    ModelConfig.vocab_size = tokenizer.vocab_coarse
+    ModelConfig.vocab_fine = tokenizer.bsq_fine.vocab_size
+    print(f"Tokenizer loaded. vocab_coarse={ModelConfig.vocab_size}, "
+          f"vocab_fine={ModelConfig.vocab_fine} "
+          f"(bits: L1={tokenizer.bits_l1}, L2={tokenizer.bits_l2})")
 
     stocks = load_stocks(max_stocks=DataConfig.max_stocks)
     train_s, val_s, _ = split_stocks(stocks)
@@ -152,7 +161,7 @@ def main(args):
         pbar = tqdm(train_loader, desc=f"[{args.tag}] Epoch {epoch+1}/{epochs}")
         for bi, batch in enumerate(pbar):
             # dataloader returns 7-tuple (input_ids, targets, time_ids, pos, mask, va, reg_targets)
-            input_ids, _, _, time_id, pos_id, _, va_val, _ = batch
+            input_ids, _, _, time_id, pos_id, _, va_val, _, _, _ = batch
             input_ids = input_ids.to(device, non_blocking=True)
             time_id = time_id.to(device, non_blocking=True)
             pos_id = pos_id.to(device, non_blocking=True)
@@ -217,7 +226,7 @@ def main(args):
         vaccs = []
         with torch.inference_mode():
             for batch in val_loader:
-                input_ids, _, _, time_id, pos_id, _, va_val, _ = batch
+                input_ids, _, _, time_id, pos_id, _, va_val, _, _, _ = batch
                 input_ids = input_ids.to(device)
                 time_id = time_id.to(device)
                 pos_id = pos_id.to(device)
@@ -270,6 +279,8 @@ def main(args):
                 "config": {"dim": ModelConfig.dim, "depth": ModelConfig.depth,
                            "heads": ModelConfig.heads, "num_kv_heads": ModelConfig.num_kv_heads,
                            "vocab_size": ModelConfig.vocab_size,
+                           "vocab_fine": ModelConfig.vocab_fine,
+                           "mask_id": mask_id,
                            "arch": "kronos_bert"},
                 "val_loss": best_val,
                 "mlm_acc": avg_val_acc,

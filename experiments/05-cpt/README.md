@@ -1,7 +1,7 @@
 # Exp 05: Continue PreTrain (CPT) 阶段收官报告
 
-> 执行周期：2026-08-04。依据 `ContinuePreTrain-ToDo.md` 公共 Trunk T1/T2/T3/T5
-> 与 Branch 选取。全程无人值守完成。
+> 执行周期：2026-08-04 ~ 2026-08-05。依据 `ContinuePreTrain-ToDo.md` 公共 Trunk
+> T1/T2/T3/T5 与全 Branch（A-G）。全程无人值守完成。
 
 ## 任务清单与结果
 
@@ -11,52 +11,57 @@
 | **T2** 模型汤 | ⚠️ 判负（barrier 存在即弃）；8ceb ep100 成新最佳单 | `T2_MODEL_SOUP.md` |
 | **T3** 采样自洽推理 | ✅ 完成，mean 采样 IC 显著 | `T3_SELF_CONSISTENCY.md` |
 | **T5** 数据扩容评估 | ✅ 完成，判负（不可行） | `T5_data_expansion.md` |
-| **Branch 选取** | ✅ Branch A（分布匹配）通过 | `BRANCH_A.md` |
+| **Branch A** 日级边际分布匹配 | ✅ **通过**（基于 8ceb 复跑） | `BRANCH_A.md` |
+| **Branch B** 横截面排序（ListNet）| ⚠️ 判负（token 坍缩破红线）| `BRANCH_B.md` |
+| **Branch C** 非平稳适应 | ⚠️ 判负（recency MAPE 恶化/regime 无改善）| `BRANCH_C.md` |
+| **Branch D** 多 token 预测头（MTP）| ⚠️ 判负（一致性过滤恶化）| `BRANCH_D.md` |
+| **Branch E** 市场反馈偏好（DPO）| ⚠️ 判负（红线破位）| `BRANCH_E.md` |
+| **Branch F** LoRA-per-regime | ⚠️ 判负（条件化无收益）→ **G 冻结** | `BRANCH_F.md` |
 
 ## 核心产物
 
-- **CPT 正式 checkpoint**：`checkpoints/exp04b_best_ep100.pt`
-  - balance 0.576, JSD 0.319, collapse 42.2%, support F1 0.797, unique 63
-  - recipe：muon, lr_muon=0.005, lr=3e-4, dropout=0.1, wd=0.01, fine_w=0.3,
+- **CPT 新基线**：`checkpoints/exp04b_8ceb_ep100.pt`（lr_muon=0.01）
+  - balance 0.581, JSD 0.308, collapse 42.8%, unique 61, DA 49.6%
+  - recipe：muon, lr_muon=0.01, lr=3e-4, dropout=0.1, wd=0.01, fine_w=0.3,
     het_w=0.1, warmup=0.05, CE；accumulation 32；5% warmup + cosine to 0
-- **T2 补训 8ceb leg**：`checkpoints/exp04b_8ceb_ep100.pt`（lr_muon=0.01，
-  其余 recipe 相同）——**新的最佳单 checkpoint**：balance 0.581, JSD 0.308,
-  collapse 42.8%, unique 61, DA 49.6%
-- **Branch A 产出**：`checkpoints/branchA_dm030_ep6.pt`（基于 4c72 ep100 起步）
-  - balance **0.710**（+0.134），collapse **24.4%**（-17.8pp），JSD 0.316
-  - 400 窗协议 + paired bootstrap 验收通过（CI [+0.088, +0.117]）
+- **Branch A 产出**：`checkpoints/branchA_dm030_8ceb_ep5.pt`（基于 8ceb ep100）
+  - balance **0.698**（+0.117 vs 8ceb 基线），collapse **25.6%**（-17.2pp），unique 78
+  - 400 窗 + paired bootstrap 通过（CI [+0.095, +0.120]）；DA 持平、MAPE 改善
+- **全分支裁定汇总**：`server_runs/results/04b-cpt/seed42/trials/selection.json`
 
 ## 关键决策记录
 
-1. **CPT recipe 锁定**：100-epoch from-scratch 达成 token 质量目标，
-   ep100 平衡饱和，无需续训。ToDo §1.3 确认——raw val_loss 被坍塌污染，
-   禁用；token 质量全程单调改善。
-2. **T2 模型汤**：补训 8ceb leg（lr_muon=0.01，3.55h）后完整执行原始
-   跨轨迹 soup——**判负**：连线中点（soup）balance −0.065/JSD +0.062
-   （bootstrap CI 均显著），插值剖面中部凹陷、JSD 破红线，barrier 存在
-   即弃（ToDo）。**附带发现：8ceb ep100 为新的最佳单 checkpoint**（token
-   质量全面反超 4c72 ep100），CPT 起点候选建议切换（Branch A 是否重训待确认）。
-3. **T3 mean-采样**：RankIC +0.0129 显著（CI 不含零），成为默认推理配置；
-   vote 策略不显著弃用。DA 单 seed 为 coin-flip 已知限制。
-4. **T5 判负**：数据扩容在本项目约束下不可行（历史用尽、cutoff 后受
-   验证协议约束、跨市场不可得）。1.5 tokens/param 数据受限留待后续。
-5. **Branch A 通过**：直接针对 CPT 确认缺口（unique 保守、collapse 高），
-   分布匹配 loss 显著改善 token 质量且过 CI。下游不劣化。
+1. **CPT recipe 锁定**：100-epoch from-scratch；T2 附带发现 lr_muon=0.01（8ceb）反超
+   4c72（balance 0.581 vs 0.576），CPT 新基线切 8ceb ep100（用户确认）。
+2. **Branch A 通过**：分布匹配（λ=0.3）显著改善 token 质量（balance +0.117,
+   collapse -17.2pp），下游不劣化。E 的 π_ref 用此产出。
+3. **B/C/D/E/F 全部判负**（机制各不同）：
+   - **B（ListNet）**：直接优化横截面排序 → coarse token 坍缩（balance -0.27, JSD 破
+     红线 0.366, unique 61→23），RankIC 无改善。
+   - **C（recency/regime）**：从收敛终态微调时重采样影响极小；C2 MAPE 显著恶化、
+     C3 近端不显著。
+   - **D（MTP）**：主头红线不破（balance 0.590 略升），但一致性过滤 acted DA 显著
+     恶化（-0.63pp）——未来头无有效一致性信号。
+   - **E（DPO）**：β=0.1 第一个快照红线破位（balance 0.646、collapse 35.1%）——
+     偏好目标与 token 质量红线根本冲突。
+   - **F（LoRA-per-regime）**：冻结 backbone 只训 0.79M LoRA 几乎无效果（learned≈0.003
+     bit、ΔW≈0）；条件化判负，**G 永久冻结**。
+4. **symbol 冲突已知限制**：4 组指数/ETF 与股票同名 symbol（1/688/852/905），评估
+   数据里 4 只股票被指数覆盖（<0.1% 影响）。用户判定不影响，暂不修（见 memory）。
+5. **训练-评估数据一致性核查**：cache（2013 起长历史）与当前 CSV（2019 起）起点差异
+   是 symbol 冲突的次生表现；其余 4687 只股票训练/评估数据一致。
 
 ## 诊断/脚本
 
-- `analyze_cpt_100ep.py` — CPT 曲线诊断（loss + token 质量 + H-CE）
-- `t2_checkpoint_soup.py` — checkpoint soup + barrier 检查
-- `t3_sampling_self_consistency.py` — K=8 采样自洽推理
-- `eval_branchA.py` — Branch A 400 窗评估
-- `bootstrap_compare.py` — paired bootstrap 验收
-- 分析输出：`server_runs/results/04b-cpt/seed42/trials/local_cpt/diagnostics/`
+- `analyze_cpt_100ep.py` / `t2_cross_config_soup.py` / `t3_sampling_self_consistency.py`
+- `eval_branchA/B/C/D/F.py`、`bootstrap_compare.py`、`bootstrap_regime_compare.py`
+- `d_consistency_filter.py`（D）、`e_build_pairs.py`/`e_train_dpo.py`/`e_branchE_driver.py`（E）、
+  `eval_branchF_specialization.py`（F/G 门槛）
+- Branch B/C/D/F 的模型/训练代码已合入 train_base.py / data_processor.py / model/（默认关闭）
 
 ## 未决事项（留待后续）
 
-- **是否以 8ceb ep100 为新 CPT 基线重训 Branch A**（现 branchA 基于 4c72 ep100；
-  8ceb 基线可能进一步抬升 token 质量起点，需用户确认）
-- λ ∈ {0.05, 0.3} 补扫（λ=0.3 验证中）
-- Branch B（横截面排序）未执行（A 已显著改善 token 质量）
-- 多 seed 复核（DA coin-flip 已知限制）
-- holdout 400 全程未触碰——留待显式最终命令（ToDo §1.4）
+- **holdout 400 全程未触碰**——留待显式最终命令（ToDo §1.4）
+- multi-seed 复核（DA/IC 单 seed coin-flip 已知限制；token 质量单 seed 可判）
+- symbol 冲突彻底修复（load_stocks 用文件名做 symbol）——影响 <0.1%，用户判定暂不修
+- λ 敏感性（Branch A 未测 0.05）等次要项

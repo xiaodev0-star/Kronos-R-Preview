@@ -57,7 +57,7 @@ def _apply_rope(q, k, sin, cos):
 
 class Attention(nn.Module):
     """Multi-head attention with GQA support. Causal mask is optional."""
-    def __init__(self, dim, heads, num_kv_heads, dropout=0.0):
+    def __init__(self, dim, heads, num_kv_heads, dropout=0.0, causal=True):
         super().__init__()
         self.heads = heads
         self.num_kv_heads = num_kv_heads
@@ -68,18 +68,35 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, num_kv_heads * self.head_dim, bias=False)
         self.out_proj = nn.Linear(heads * self.head_dim, dim, bias=False)
         self.dropout_p = dropout if dropout > 0.0 else 0.0
+        # ``causal=False`` (KronosBert / KronosElectraDiscriminator) makes the
+        # no-mask path use is_causal=False => FULL bidirectional attention via
+        # SDPA's efficient backend.  An explicit all-True mask forces the slow
+        # math backend and made the 1.8M-row eval scoring intractable.
+        self.causal = causal
 
-    def forward(self, x, sin, cos, attn_mask=None):
+    def forward(self, x, sin, cos, attn_mask=None, regime_ids=None):
         B, N, _ = x.shape
-        # One fused QKV matmul instead of three. Concatenating the weights costs a
-        # sub-megabyte copy and measured 1.024x on the real training step; the
-        # parameters stay separate so existing checkpoints load unchanged.
-        qkv = F.linear(x, torch.cat(
-            (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight), dim=0))
-        q, k, v = qkv.split(
-            (self.heads * self.head_dim,
-             self.num_kv_heads * self.head_dim,
-             self.num_kv_heads * self.head_dim), dim=-1)
+        # Branch F (LoRA-per-regime): when a LoRA adapter is attached to every
+        # QKV projection AND regime_ids is provided, project each of q/k/v with
+        # the base Linear plus a per-token regime-selected low-rank correction.
+        # Otherwise the original fused-QKV path runs untouched, so the dense
+        # model stays bit-exact (attached LoRA params are simply ignored).
+        use_lora = (regime_ids is not None and hasattr(self.q_proj, "lora")
+                    and hasattr(self.k_proj, "lora") and hasattr(self.v_proj, "lora"))
+        if use_lora:
+            q = self.q_proj(x) + self.q_proj.lora(x, regime_ids)
+            k = self.k_proj(x) + self.k_proj.lora(x, regime_ids)
+            v = self.v_proj(x) + self.v_proj.lora(x, regime_ids)
+        else:
+            # One fused QKV matmul instead of three. Concatenating the weights costs a
+            # sub-megabyte copy and measured 1.024x on the real training step; the
+            # parameters stay separate so existing checkpoints load unchanged.
+            qkv = F.linear(x, torch.cat(
+                (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight), dim=0))
+            q, k, v = qkv.split(
+                (self.heads * self.head_dim,
+                 self.num_kv_heads * self.head_dim,
+                 self.num_kv_heads * self.head_dim), dim=-1)
         q = q.view(B, N, self.heads, self.head_dim).transpose(1, 2)
         k = k.view(B, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, N, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -91,13 +108,19 @@ class Attention(nn.Module):
             v = v.repeat_interleave(self.kv_groups, dim=1)
 
         drop_rate = self.dropout_p if self.training else 0.0
-        # Use is_causal=True when no explicit mask is provided — avoids allocating [N,N] mask
+        # Use is_causal=self.causal when no explicit mask is provided — avoids
+        # allocating an [N,N] mask and keeps SDPA on its efficient backend.
         if attn_mask is None:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=drop_rate)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal,
+                                                 dropout_p=drop_rate)
         else:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop_rate)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
+                                                 dropout_p=drop_rate)
         out = out.transpose(1, 2).reshape(B, N, -1)
-        return self.out_proj(out)
+        out = self.out_proj(out)
+        if regime_ids is not None and hasattr(self.out_proj, "lora"):
+            out = out + self.out_proj.lora(out, regime_ids)
+        return out
 
 
 class FeedForward(nn.Module):
@@ -110,22 +133,37 @@ class FeedForward(nn.Module):
         self.down_proj = nn.Linear(hidden, dim, bias=False)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-    def forward(self, x):
-        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+    def forward(self, x, regime_ids=None):
+        # Branch F (LoRA-per-regime): additive low-rank corrections on gate/up
+        # (before the SiLU product) and down (after).  Only active when a LoRA
+        # adapter is attached to every FFN projection AND regime_ids is provided;
+        # otherwise the dense path is byte-for-byte unchanged.
+        use_lora = (regime_ids is not None and hasattr(self.gate_proj, "lora")
+                    and hasattr(self.up_proj, "lora") and hasattr(self.down_proj, "lora"))
+        if use_lora:
+            g = self.gate_proj(x) + self.gate_proj.lora(x, regime_ids)
+            u = self.up_proj(x) + self.up_proj.lora(x, regime_ids)
+            h = F.silu(g) * u
+            y = self.down_proj(h) + self.down_proj.lora(h, regime_ids)
+        else:
+            h = F.silu(self.gate_proj(x)) * self.up_proj(x)
+            y = self.down_proj(h)
+        return self.dropout(y)
 
 
 class TransformerBlock(nn.Module):
     """Pre-norm transformer block (RMSNorm + Attention + FFN)."""
-    def __init__(self, dim, heads, num_kv_heads, ffn_multiplier, dropout):
+    def __init__(self, dim, heads, num_kv_heads, ffn_multiplier, dropout,
+                 causal=True):
         super().__init__()
         self.attn_norm = RMSNorm(dim)
-        self.attn = Attention(dim, heads, num_kv_heads, dropout)
+        self.attn = Attention(dim, heads, num_kv_heads, dropout, causal=causal)
         self.ffn_norm = RMSNorm(dim)
         self.ffn = FeedForward(dim, ffn_multiplier, dropout)
 
-    def forward(self, x, sin, cos, attn_mask=None):
-        x = x + self.attn(self.attn_norm(x), sin, cos, attn_mask)
-        x = x + self.ffn(self.ffn_norm(x))
+    def forward(self, x, sin, cos, attn_mask=None, regime_ids=None):
+        x = x + self.attn(self.attn_norm(x), sin, cos, attn_mask, regime_ids)
+        x = x + self.ffn(self.ffn_norm(x), regime_ids)
         return x
 
 
@@ -135,8 +173,9 @@ class _BaseTransformer(nn.Module):
     Subclasses only need to override `_run_blocks()` to insert extra processing
     (e.g. reasoning blocks) between the transformer stack and the final norm.
     """
-    def __init__(self, cfg, n_special=3):
+    def __init__(self, cfg, n_special=3, causal=True):
         super().__init__()
+        self.causal = causal
         self.token_emb = nn.Embedding(cfg.vocab_size + n_special, cfg.dim)
         self.time_emb_day = nn.Embedding(32, cfg.dim)
         self.time_emb_month = nn.Embedding(13, cfg.dim)
@@ -148,7 +187,7 @@ class _BaseTransformer(nn.Module):
         )
         self.blocks = nn.ModuleList([
             TransformerBlock(cfg.dim, cfg.heads, cfg.num_kv_heads,
-                             cfg.ffn_multiplier, cfg.dropout)
+                             cfg.ffn_multiplier, cfg.dropout, causal=causal)
             for _ in range(cfg.depth)
         ])
         self.norm = RMSNorm(cfg.dim)
@@ -190,14 +229,14 @@ class _BaseTransformer(nn.Module):
             x = x + self.va_proj(va_values)
         return x
 
-    def _run_blocks(self, x, sin, cos, attn_mask=None):
+    def _run_blocks(self, x, sin, cos, attn_mask=None, regime_ids=None):
         """Run the transformer stack. Override in subclasses for extra processing."""
         for block in self.blocks:
             if self._gradient_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(
-                    block, x, sin, cos, attn_mask, use_reentrant=False)
+                    block, x, sin, cos, attn_mask, regime_ids, use_reentrant=False)
             else:
-                x = block(x, sin, cos, attn_mask)
+                x = block(x, sin, cos, attn_mask, regime_ids)
         return x
 
     def forward(self, input_ids, time_ids, position_ids, attn_mask=None, **kwargs):
