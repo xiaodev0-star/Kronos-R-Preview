@@ -18,8 +18,12 @@ Three evidence families are immune to this:
   floors, all defined on returns rather than on token identity;
 * capacity-normalized behaviour - alignment ratios between the prediction and
   its *same-day target* distribution;
-* predictive information - ``H(target) - CE`` in bits, which measures learned
+* predictive information - ``I_learn = nominal_codebook_bits - CE`` in bits, which measures learned
   structure on a scale that does not grow with the vocabulary.
+
+* predictive information - ``I_learn = nominal_codebook_bits - CE`` in bits.
+  This corrected definition replaces the earlier, mathematically invalid
+  ``H(target) - CE`` form (CE is always >= empirical target entropy).
 
 Every figure below isolates one of these, plus one figure that demonstrates the
 confound directly so the reader can see why the naive reading fails.
@@ -208,6 +212,15 @@ def build_records(root: Path) -> list[dict[str, Any]]:
             "fine_mi_bits": fine_h - fine_ce,
             "joint_mi_bits": joint_h - coarse_ce - fine_ce,
             "coarse_mi_fraction": (coarse_h - coarse_ce) / coarse_h,
+              # I_learn = nominal_codebook_bits - CE.  The previous H(target)-CE
+              # form was wrong: CE >= H(target), so that difference is never the
+              # positive learned-information quantity reported in the paper.
+              "coarse_learned_bits": float(bits_l1) - coarse_ce,
+              "fine_learned_bits": float(bits_l2) - fine_ce,
+              "joint_learned_bits": (
+                  float(bits_l1 + bits_l2) - coarse_ce - fine_ce
+              ),
+              "coarse_ce_excess_bits": coarse_ce - coarse_h,
             # --- epoch trajectories, for the stability figure --------------
             "epochs": [int(row["epoch"]) for row in group],
             "da_curve": [float(row["avg_da_per_date"]) for row in group],
@@ -517,6 +530,11 @@ def figure_information(plot_dir: Path, records: list[dict[str, Any]]) -> None:
 
     joint_mi = np.asarray([row["joint_mi_bits"] for row in ordered], float)
     coarse_mi = np.asarray([row["coarse_mi_bits"] for row in ordered], float)
+    # Use the corrected I_learn = nominal_bits - CE fields.  The legacy
+    # *_mi_bits keys are retained for JSON compatibility but are no longer
+    # plotted or interpreted as learned information.
+    joint_mi = np.asarray([row["joint_learned_bits"] for row in ordered], float)
+    coarse_mi = np.asarray([row["coarse_learned_bits"] for row in ordered], float)
     axes[1].axhspan(
         float(joint_mi.mean() - joint_mi.std()),
         float(joint_mi.mean() + joint_mi.std()),
@@ -547,6 +565,13 @@ def figure_information(plot_dir: Path, records: list[dict[str, Any]]) -> None:
     axes[1].legend(fontsize=8, loc="lower left", ncol=2)
 
     fraction = np.asarray([row["coarse_mi_fraction"] for row in ordered], float)
+    # The explanatory plot now uses CE excess over the empirical target
+    # entropy (a non-negative quantity), not the invalid H(target)-CE.
+    fraction = np.asarray(
+        [row["coarse_ce_excess_bits"] / max(row["target_coarse_entropy_bits"], 1e-12)
+         for row in ordered],
+        float,
+    )
     utilization = np.asarray(
         [row["tok_joint_utilization"] * 100 for row in ordered], float
     )

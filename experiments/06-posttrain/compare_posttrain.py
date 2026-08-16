@@ -13,8 +13,19 @@ Procedure for a candidate-vs-reference contrast:
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import numpy as np
 from scipy.stats import spearmanr
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from bootstrap_utils import (  # noqa: E402
+    circular_moving_block_bootstrap as _root_circular_moving_block_bootstrap,
+)
 
 
 def daily_metric_from_rows(rows, metric, dense_min=None):
@@ -94,27 +105,14 @@ def circular_moving_block_bootstrap(
     (start uniformly random, advance with wraparound).  Returns the replicate
     mean distribution.
     """
-    deltas = np.asarray(deltas, dtype=float)
-    n = len(deltas)
-    if n == 0:
-        raise ValueError("empty delta series")
-    rng = np.random.RandomState(seed)
-    block = int(block_length)
-    means = np.empty(n_replicates, dtype=float)
-    # Circular block bootstrap (Politis & Romano): each block's start is drawn
-    # iid uniformly over 0..n-1 (wraparound allowed); blocks are concatenated
-    # and the tail truncated to n samples.
-    for i in range(n_replicates):
-        samples = np.empty(n, dtype=float)
-        filled = 0
-        while filled < n:
-            start = rng.randint(0, n)
-            take = min(block, n - filled)
-            for k in range(take):
-                samples[filled + k] = deltas[(start + k) % n]
-            filled += take
-        means[i] = float(samples.mean())
-    return means
+    # Canonical implementation lives in the root-level bootstrap_utils module
+    # so every experiment package shares the exact same sampler.
+    return _root_circular_moving_block_bootstrap(
+        deltas,
+        block_length=block_length,
+        n_replicates=n_replicates,
+        seed=seed,
+    )
 
 
 def paired_bootstrap_ci(

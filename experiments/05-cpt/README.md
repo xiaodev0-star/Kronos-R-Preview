@@ -1,67 +1,59 @@
-# Exp 05: Continue PreTrain (CPT) 阶段收官报告
+# Exp 05：继续预训练（CPT）
 
-> 执行周期：2026-08-04 ~ 2026-08-05。依据 `ContinuePreTrain-ToDo.md` 公共 Trunk
-> T1/T2/T3/T5 与全 Branch（A-G）。全程无人值守完成。
+## 目标
 
-## 任务清单与结果
+Exp 04-B 的 HPO 定出两个最优配置。因未下载服务器权重，改为从零重训并延长至
+100 epoch，在 400 窗验证协议下逐 epoch 评估，考察两个问题：更长的训练能否继续
+改善 token 质量；下游信号是否随之改善。
 
-| 任务 | 结果 | 详情 |
-|------|------|------|
-| **T1** 续训空间确认 + 超参收尾 | ✅ 完成，锁定 CPT recipe | `CPT_RECIPE.md` |
-| **T2** 模型汤 | ⚠️ 判负（barrier 存在即弃）；8ceb ep100 成新最佳单 | `T2_MODEL_SOUP.md` |
-| **T3** 采样自洽推理 | ✅ 完成，mean 采样 IC 显著 | `T3_SELF_CONSISTENCY.md` |
-| **T5** 数据扩容评估 | ✅ 完成，判负（不可行） | `T5_data_expansion.md` |
-| **Branch A** 日级边际分布匹配 | ✅ **通过**（基于 8ceb 复跑） | `BRANCH_A.md` |
-| **Branch B** 横截面排序（ListNet）| ⚠️ 判负（token 坍缩破红线）| `BRANCH_B.md` |
-| **Branch C** 非平稳适应 | ⚠️ 判负（recency MAPE 恶化/regime 无改善）| `BRANCH_C.md` |
-| **Branch D** 多 token 预测头（MTP）| ⚠️ 判负（一致性过滤恶化）| `BRANCH_D.md` |
-| **Branch E** 市场反馈偏好（DPO）| ⚠️ 判负（红线破位）| `BRANCH_E.md` |
-| **Branch F** LoRA-per-regime | ⚠️ 判负（条件化无收益）→ **G 冻结** | `BRANCH_F.md` |
+## 设定
 
-## 核心产物
+两配置仅 `lr_muon` 不同（0.005 / 0.01），其余一致：Muon+AdamW、lr=3e-4、
+dropout 0.1、wd 0.01、fine_w 0.3、het_w 0.1、5% warmup + cosine to 0、
+accumulation 32、seed 42。模型/词表沿用 `config.py` 默认（dim 256 / depth 6 /
+heads 4 / GQA-1、7+7 位 BSQ 码本 128+128）。400 窗单日预测，4543 只股票、
+约 180 万次预测/epoch，逐 epoch 全量推理。
 
-- **CPT 新基线**：`checkpoints/exp04b_8ceb_ep100.pt`（lr_muon=0.01）
-  - balance 0.581, JSD 0.308, collapse 42.8%, unique 61, DA 49.6%
-  - recipe：muon, lr_muon=0.01, lr=3e-4, dropout=0.1, wd=0.01, fine_w=0.3,
-    het_w=0.1, warmup=0.05, CE；accumulation 32；5% warmup + cosine to 0
-- **Branch A 产出**：`checkpoints/branchA_dm030_8ceb_ep5.pt`（基于 8ceb ep100）
-  - balance **0.698**（+0.117 vs 8ceb 基线），collapse **25.6%**（-17.2pp），unique 78
-  - 400 窗 + paired bootstrap 通过（CI [+0.095, +0.120]）；DA 持平、MAPE 改善
-- **全分支裁定汇总**：`server_runs/results/04b-cpt/seed42/trials/selection.json`
+## 结果
 
-## 关键决策记录
+token 质量全程单调改善：balance 0.19→0.58、collapse 88%→42%、unique 11→63。
 
-1. **CPT recipe 锁定**：100-epoch from-scratch；T2 附带发现 lr_muon=0.01（8ceb）反超
-   4c72（balance 0.581 vs 0.576），CPT 新基线切 8ceb ep100（用户确认）。
-2. **Branch A 通过**：分布匹配（λ=0.3）显著改善 token 质量（balance +0.117,
-   collapse -17.2pp），下游不劣化。E 的 π_ref 用此产出。
-3. **B/C/D/E/F 全部判负**（机制各不同）：
-   - **B（ListNet）**：直接优化横截面排序 → coarse token 坍缩（balance -0.27, JSD 破
-     红线 0.366, unique 61→23），RankIC 无改善。
-   - **C（recency/regime）**：从收敛终态微调时重采样影响极小；C2 MAPE 显著恶化、
-     C3 近端不显著。
-   - **D（MTP）**：主头红线不破（balance 0.590 略升），但一致性过滤 acted DA 显著
-     恶化（-0.63pp）——未来头无有效一致性信号。
-   - **E（DPO）**：β=0.1 第一个快照红线破位（balance 0.646、collapse 35.1%）——
-     偏好目标与 token 质量红线根本冲突。
-   - **F（LoRA-per-regime）**：冻结 backbone 只训 0.79M LoRA 几乎无效果（learned≈0.003
-     bit、ΔW≈0）；条件化判负，**G 永久冻结**。
-4. **symbol 冲突已知限制**：4 组指数/ETF 与股票同名 symbol（1/688/852/905），评估
-   数据里 4 只股票被指数覆盖（<0.1% 影响）。用户判定不影响，暂不修（见 memory）。
-5. **训练-评估数据一致性核查**：cache（2013 起长历史）与当前 CSV（2019 起）起点差异
-   是 symbol 冲突的次生表现；其余 4687 只股票训练/评估数据一致。
+ep100 两配置几乎打平：
 
-## 诊断/脚本
+| 指标 | lr_muon=0.005 | lr_muon=0.01 |
+|---|---|---|
+| coarse balance | 0.576 | 0.581 |
+| JSD | 0.319 | 0.308 |
+| DA | 48.8% | 49.6% |
+| MAPE | 3.358% | 3.366% |
+| RankIC | 0.0311 | 0.0287 |
+| collapse（med/p90） | 42.2/59.3% | 42.8/61.9% |
+| unique tokens | 63 | 61 |
 
-- `analyze_cpt_100ep.py` / `t2_cross_config_soup.py` / `t3_sampling_self_consistency.py`
-- `eval_branchA/B/C/D/F.py`、`bootstrap_compare.py`、`bootstrap_regime_compare.py`
-- `d_consistency_filter.py`（D）、`e_build_pairs.py`/`e_train_dpo.py`/`e_branchE_driver.py`（E）、
-  `eval_branchF_specialization.py`（F/G 门槛）
-- Branch B/C/D/F 的模型/训练代码已合入 train_base.py / data_processor.py / model/（默认关闭）
+- 最佳 balance：0.005@ep93、0.01@ep97；ep85–100 已饱和（仅 +0.004）。
+- val_loss 谷底：0.005@ep13=2.884、0.01@ep20=2.861，之后回升，但 token 质量持续改善。
 
-## 未决事项（留待后续）
+## 分析
 
-- **holdout 400 全程未触碰**——留待显式最终命令（ToDo §1.4）
-- multi-seed 复核（DA/IC 单 seed coin-flip 已知限制；token 质量单 seed 可判）
-- symbol 冲突彻底修复（load_stocks 用文件名做 symbol）——影响 <0.1%，用户判定暂不修
-- λ 敏感性（Branch A 未测 0.05）等次要项
+1. **val_loss 被坍塌污染**：触底后回升与 token 质量单调改善背离，再次确认 raw
+   val_loss 不可作健康指标。
+2. **续训预算已耗尽**：ep85 后 balance 饱和，该 recipe 下 100 epoch 即为上限。
+3. **两配置无实质差异**：balance 差 0.005、JSD 差 0.011，lr_muon 0.005→0.01 处于
+   平坦区；下游 DA/RankIC 为单 seed 观测，不足以区分二者。
+4. **核心缺口依旧**：collapse ~42%（远高于 ~11% 目标）、unique 63（目标 97）、
+   DA ~49%（不高于多数类基线）、RankIC ~0.03。CPT 把 token 分布从极坍缩拉到中等
+   坍缩，但下游读出信号仍弱。
+
+## 对 06 的铺垫
+
+1. **停止 pre-train 尺度的工作**：token 质量已饱和，继续续训无增益。
+2. **瓶颈疑在读出一侧**：token 分布已含结构（unique 63、support F1 ~0.79），但
+   greedy 解码的 DA/RankIC 仍弱——待 06 检验：弱在下游，是表示不足，还是 greedy
+   readout 丢信息。
+3. **06 的切入点**：冻结 CPT backbone，直接测其隐藏表示是否已含可提取的横截面排序
+   信号；若含，则问题在 readout，用 exact posterior / 冻结 rank head 即可提取。
+4. **collapse 与排序分开治理**：降 collapse（token 分布）与提 RankIC（排序）未必
+   同源，06 不应假设前者自动带来后者。
+
+> 注：06 的上游是分布匹配分支（基于 lr_muon=0.01 的 ep100，进一步把 collapse 压到
+> ~25%、balance 提到 ~0.70）；本文的两个权重是它的上游。

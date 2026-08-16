@@ -33,11 +33,13 @@ Exp 04-C HPO
   effective_token,distribution}_alignment`, `median_daily_token_support_f1`, and
   `median_daily_codebook_balance_score` with its `p10_daily_*` worst-decile
   form. These compare a prediction against its **same-day target**.
-- Vocabulary-invariant learning evidence: `H(target) - CE` in bits, from
-  `dataset_token_summary.json` marginals and `val_coarse_loss` /
-  `val_fine_loss`. Exp 01 measured ~1.3 bits/token of joint predictive
-  information across a 64x range of joint vocabularies, so codebook size is not
-  the capacity bottleneck.
+- Learning evidence: `I_learn = nominal_codebook_bits - CE` in bits, computed
+  as `(bits_l1 + bits_l2) - (val_coarse_loss + val_fine_loss)/log(2)`.
+  The old `H(target) - CE` form is invalid because CE >= empirical target
+  entropy. Exp 01 measured ~1.3 bits/token of joint learned information across
+  a 64x range of joint vocabularies, so codebook size is not the capacity
+  bottleneck. The flatness is an empirical saturation finding, not an a-priori
+  vocabulary-invariance property of the metric.
 - `avg_da_above_baseline` compares against a per-day oracle that already knows
   the majority direction. Negative values are expected and are not a failure.
 
@@ -79,6 +81,11 @@ records.
   revert to the old sparse 0/100/200/300 sampling. The window count only sets the
   robustness-stat granularity; per-date records preserve daily detail regardless.
 - Holdout offset 400 stays sealed until the explicit final command.
+- All bootstrap comparisons use root `bootstrap_utils.py`; experiment packages
+  must not duplicate bootstrap code or import it from another experiment.
+- Follow `PROTOCOL_LOCK.md` for validation/holdout use: fit/calib selects, the
+  400-day window validates the final locked model once, and holdout is unsealed
+  exactly once.
 - Controlled comparisons use a local loader seed and exact accumulation
   boundaries.
 - Do not consume a proposal as an upstream decision. Downstream scripts require

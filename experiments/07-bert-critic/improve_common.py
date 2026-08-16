@@ -29,8 +29,10 @@ for _p in (ROOT, SEVEN, SIX):
 from scipy.stats import spearmanr  # noqa: E402
 
 from critic_common import resolve_roots, write_json, append_trial  # noqa: E402
-from compare_posttrain import circular_moving_block_bootstrap  # noqa: E402
 from evaluate_posttrain import arm_metrics  # noqa: E402
+from bootstrap_utils import (  # noqa: E402
+    circular_moving_block_bootstrap as _root_circular_moving_block_bootstrap,
+)
 
 EPS = 1e-12
 
@@ -304,22 +306,18 @@ class DailyIcCache:
 
 
 def circular_block_means(deltas, block_length, n_replicates=10_000, seed=42):
-    """Vectorized circular moving-block bootstrap (Politis & Romano).
+    """Vectorized wrapper around the canonical root-level bootstrap.
 
-    Statistically identical to ``compare_posttrain.circular_moving_block_bootstrap``
-    (iid block starts over 0..n-1 with wraparound, tail truncated to n) but fully
-    vectorized — ~100x faster for the many arm-vs-reference comparisons the
-    R series needs.
+    Kept for backward compatibility with the many R-series callers.  The
+    implementation lives in ``bootstrap_utils.circular_moving_block_bootstrap``;
+    experiment scripts must not duplicate bootstrap logic locally.
     """
-    n = len(deltas)
-    rng = np.random.RandomState(seed)
-    block = max(int(block_length), 1)
-    n_starts = int(np.ceil(n / block))
-    starts = rng.randint(0, n, size=(n_replicates, n_starts))
-    offs = np.arange(block)
-    idx = (starts[:, :, None] + offs[None, None, :]) % n     # [R, n_starts, block]
-    flat = idx.reshape(n_replicates, -1)[:, :n]
-    return deltas[flat].mean(axis=1)
+    return _root_circular_moving_block_bootstrap(
+        deltas,
+        block_length=block_length,
+        n_replicates=n_replicates,
+        seed=seed,
+    )
 
 
 def bootstrap_vs(rec, field, ref_rec, ref_field, dense_min, block_lengths=(5, 10, 20),
