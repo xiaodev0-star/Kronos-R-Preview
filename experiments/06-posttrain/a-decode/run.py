@@ -25,19 +25,19 @@ import numpy as np
 import torch
 
 import sys
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from experiment_io import file_sha256  # noqa: E402
 from eval_helpers import load_gpt  # noqa: E402
 from model import load_tokenizer  # noqa: E402
 
-from posttrain_common import (  # noqa: E402
+from common import (  # noqa: E402
     load_reviewed_selection, upstream_checkpoint_path, resolve_roots,
-    write_json,
+    artifact_paths, write_json,
 )
-from joint_decoder import DecodeTable, decode_joint  # noqa: E402
+from common import DecodeTable, decode_joint  # noqa: E402
 
 
 # ============================================================================
@@ -321,11 +321,13 @@ def main():
     tok = Path(sel["upstream"]["tokenizer"])
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     roots = resolve_roots()
-    out = args.out or (roots.results_root / "pt01_baseline.json")
+    paths = artifact_paths(roots=roots)
+    out = args.out or (roots.results_root / "A-decode" / "decode.json")
     result, rec = run_pt01(args.hidden, ckpt, tok, device, chunk=args.chunk,
                            out_json=Path(out))
     # also write the per-row records to weights root (large artifact)
-    npz_path = roots.weights_root / "pt01_records.npz"
+    npz_path = paths["records"]
+    npz_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(npz_path, **{k: np.asarray(v) for k, v in rec.items()})
     print(f"[pt01] records -> {npz_path}")
     print(json.dumps(result["arms"], indent=2, ensure_ascii=False))

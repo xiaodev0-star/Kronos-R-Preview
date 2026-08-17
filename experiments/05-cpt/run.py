@@ -1,14 +1,14 @@
 """Exp 05 (CPT)：单脚本全流程。
 
-读取 Exp 04-B 的两个最优配置权重（top-2），跑 400 窗逐 epoch 推理，记录各项数据，
-并写成 Parquet：
+读取 Exp 04-B 的两个最优配置权重（top-2）的 ep100 终态，跑 400 窗推理，记录各项
+数据，并写成 Parquet：
 
   cpt_predictions.parquet  每 (weight, epoch, date, symbol) 的预测/真实 token + logret/close
   cpt_daily.parquet        每 (weight, epoch, date) 的逐日指标
   cpt_epochs.parquet       每 (weight, epoch) 的汇总
 
-推理复用 ``experiments/04/b-hpo/evaluate_epoch_trajectory.py``（每次前向一个 epoch，
-输入准备/缓存共享，不触碰 holdout）。写 Parquet 需要 ``pyarrow``。
+推理复用 ``experiments/04/b-hpo/evaluate_epoch_trajectory.py``（输入准备/缓存共享，
+不触碰 holdout）。写 Parquet 需要 ``pyarrow``。逐 epoch 快照已精简删除，仅保留 ep100。
 
 用法：
     python experiments/05-cpt/run.py
@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 EVAL_SCRIPT = ROOT / "experiments" / "04" / "b-hpo" / "evaluate_epoch_trajectory.py"
@@ -43,10 +44,10 @@ OVERRIDE = {
                         "hidden_dim": 192, "random_seed": 42},
 }
 
-# Exp 04-B HPO top-2 -> CPT 100-epoch retrain checkpoint index.
+# Exp 04-B HPO top-2 -> CPT ep100 终态 checkpoint。
 WEIGHTS = {
-    "4c72": ROOT / "checkpoints" / "exp04b_best_checkpoints.json",   # lr_muon=0.005
-    "8ceb": ROOT / "checkpoints" / "exp04b_8ceb_checkpoints.json",   # lr_muon=0.01
+    "4c72": ROOT / "checkpoints" / "exp04b_best_ep100.pt",   # lr_muon=0.005
+    "8ceb": ROOT / "checkpoints" / "exp04b_8ceb_ep100.pt",   # lr_muon=0.01
 }
 
 # 逐股票×逐日的长表（joint token = coarse*128 + fine，不落盘）。
@@ -66,13 +67,34 @@ PRED_SCHEMA = pa.schema([
 ])
 
 
-def run_eval(code: str, index: Path) -> Path:
-    """Build the trial dir and run the 400-window evaluation for one weight."""
+def run_eval(code: str, ckpt: Path) -> Path:
+    """Build a single-ep100 trial dir and run the 400-window evaluation."""
     trial = RESULTS / "trials" / code
     trial.mkdir(parents=True, exist_ok=True)
     (trial / "override.json").write_text(
         json.dumps(OVERRIDE, indent=2), encoding="utf-8")
-    shutil.copy(index, trial / "model_checkpoints.json")
+    payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+    val_loss = payload.get("val_loss")
+    val_loss = float(val_loss) if isinstance(val_loss, (int, float)) else 3.6
+    index = {
+        "tag": code,
+        "save_path": str(ckpt.resolve()),
+        "updated_epoch": 100,
+        "checkpoints": [{
+            "epoch": 100,
+            "path": str(ckpt.resolve()),
+            "size_bytes": ckpt.stat().st_size,
+            "train_loss": val_loss,
+            "val_loss": val_loss,
+            "learning_rate": 0.0,
+            "learning_rate_adam": 0.0,
+            "optimizer_steps_this_epoch": 0,
+            "global_step": 0,
+            "best_so_far": False,
+        }],
+    }
+    (trial / "model_checkpoints.json").write_text(
+        json.dumps(index, indent=2), encoding="utf-8")
     cmd = [
         sys.executable, str(EVAL_SCRIPT),
         "--trial_dir", str(trial),
@@ -169,7 +191,7 @@ def write_predictions(trials: dict[str, Path]) -> None:
                           allow_pickle=True)
             symbol = tgt["symbols"][tgt["symbol_index"]]
             date = tgt["dates"][tgt["date_index"]]
-            for epoch in range(1, 101):
+            for epoch in (100,):
                 preds = np.load(
                     trial / "epoch_trajectory" / f"prediction_records_epoch_{epoch:03d}.npz",
                     allow_pickle=True,
@@ -207,7 +229,7 @@ def write_predictions(trials: dict[str, Path]) -> None:
 
 def main() -> int:
     RESULTS.mkdir(parents=True, exist_ok=True)
-    trials = {code: run_eval(code, index) for code, index in WEIGHTS.items()}
+    trials = {code: run_eval(code, ckpt) for code, ckpt in WEIGHTS.items()}
     write_metrics(trials)
     write_predictions(trials)
     for trial in trials.values():

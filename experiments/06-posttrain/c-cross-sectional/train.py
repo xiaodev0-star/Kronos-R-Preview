@@ -11,15 +11,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from posttrain_common import resolve_roots, write_json, append_trial  # noqa: E402
-from posttrain_heads import ISABSetTransformer  # noqa: E402
-from train_heads import load_rows, fold_split, final_fit_split, \
-    train_rank_per_date  # noqa: E402
-from analyze_pt01 import daily_rank_ic, _contrast  # noqa: E402
+from common import resolve_roots, artifact_paths, write_json  # noqa: E402
+from common import ISABSetTransformer  # noqa: E402
+from common import load_rows, fold_split, final_fit_split, train_rank_per_date  # noqa: E402
+from common import daily_rank_ic, _contrast  # noqa: E402
 
 
 def score_isab_date_aware(head, hidden, dates, device, min_stocks=30):
@@ -40,13 +39,15 @@ def score_isab_date_aware(head, hidden, dates, device, min_stocks=30):
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--training_cache",
-                    default="server_runs/weights/06-posttrain/seed42/training_cache.npz")
-    ap.add_argument("--eval_hidden",
-                    default="server_runs/weights/06-posttrain/seed42/hidden_cache.npz")
+    ap.add_argument("--training_cache", default=None)
+    ap.add_argument("--eval_hidden", default=None)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
-    rows = load_rows(args.training_cache)
+    roots = resolve_roots(seed=args.seed)
+    paths = artifact_paths(roots=roots)
+    training_cache = args.training_cache or str(paths["training"])
+    eval_hidden = args.eval_hidden or str(paths["hidden"])
+    rows = load_rows(training_cache)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # R2 recipe selection
@@ -64,20 +65,19 @@ def main():
     head = ISABSetTransformer().to(device)
     h, _ = train_rank_per_date(head, rows, fit_all, fit_all, "pairwise",
                                lr=recipe["lr"], epochs=recipe["epochs"], seed=args.seed)
-    weights_root = resolve_roots().weights_root
-    art = weights_root / "head_S3_isab.pt"
-    torch.save({"head_state": head.state_dict(), "arm": "S3_isab",
+    art = paths["head_isab"]
+    art.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"head_state": head.state_dict(), "arm": "isab",
                 "recipe": recipe, "seed": args.seed}, art)
     print(f"[isab] trained {art} (recipe {recipe})")
-    append_trial({"stage": "pt04", "arm": "S3_isab", "recipe": recipe})
 
     # date-aware eval
-    d = np.load(args.eval_hidden, allow_pickle=True)
+    d = np.load(eval_hidden, allow_pickle=True)
     hidden = d["hidden"]
     dates = np.asarray(d["date_key"])
     true = d["true_logret"].astype(np.float64)
     offset = np.asarray(d["offset"])
-    pt01 = np.load(str(Path(args.eval_hidden).with_name("pt01_records.npz")),
+    pt01 = np.load(str(paths["records"]),
                    allow_pickle=True)
     score = score_isab_date_aware(head, hidden, dates, device)
     j0 = pt01["greedy_return"]
@@ -93,7 +93,7 @@ def main():
                          "block_robust": c["block_robust"]}
         print(f"[isab] {name}: RankIC={results[name]['rank_ic']:.5f} "
               f"deltaJ0={c['rank_ic_delta_vs_J0']:+.5f} robust={c['block_robust']}")
-    out = resolve_roots().results_root / "pt04_isab_result.json"
+    out = roots.results_root / "C-cross-sectional" / "isab.json"
     write_json(out, {"schema_version": "pt04-isab-v1", "recipe": recipe,
                      "results": results})
     print(f"[isab] wrote {out}")

@@ -3,8 +3,8 @@
 Two dataset families, both point-in-time (no future leakage):
 
   A) Feature rows for XGBoost / MLP
-       fit : c1_feats [905072, 5] + true_logret (06 training_cache)
-       eval: c1_feats [1798899, 5]              (06 eval_c1_feats, eval-row order)
+       fit : c1_feats [905072, 5] + true_logret (06 shared/training-cache)
+       eval: c1_feats [1798899, 5]              (06 B-heads/eval-features, eval-row order)
      c1_feats = [last-return, 5d momentum, 20d momentum, 20d vol, 20d volume].
 
   B) Return-window sequences for Transformer / TimeFM-style
@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-from common import ROOT, W06, W07, CHECKPOINTS, OUTPUTS
+from common import ROOT, W06, W06_B, W07, CHECKPOINTS, OUTPUTS
 
 # make project modules importable
 for _p in (ROOT / "experiments" / "06-posttrain",
@@ -37,14 +37,14 @@ for _p in (ROOT / "experiments" / "06-posttrain",
 # ---------------------------------------------------------------------------
 def load_fit_features():
     """c1_feats + true_logret + date_key + stock_uid for the fit region."""
-    tc = np.load(W06 / "training_cache.npz", allow_pickle=True)
+    tc = np.load(W06 / "training-cache.npz", allow_pickle=True)
     return {"X": tc["c1_feats"], "y": tc["true_logret"].astype(np.float64),
             "date_key": tc["date_key"], "stock_uid": tc["stock_uid"]}
 
 
 def load_eval_features():
     """c1_feats for the eval rows (aligned to candidates_eval order)."""
-    ec = np.load(W06 / "eval_c1_feats.npz", allow_pickle=True)
+    ec = np.load(W06_B / "eval-features.npz", allow_pickle=True)
     return {"X": ec["c1_feats"], "valid": ec["valid"].astype(bool)}
 
 
@@ -53,9 +53,9 @@ def load_eval_features():
 # ---------------------------------------------------------------------------
 def _load_stock_series():
     """per-stock {dates_int, rets} from the prepared feature arrays."""
-    from posttrain_data import load_stocks_uid, attach_close_prices_uid, prepare_stocks_uid
+    from _exp06 import load_stocks_uid, attach_close_prices_uid, prepare_stocks_uid
     from model import load_tokenizer
-    from critic_common import upstream_paths
+    from _exp07 import upstream_paths
     from config import DataConfig
     import torch
     _, tok_path = upstream_paths()
@@ -94,17 +94,17 @@ def build_sequences(region, window, max_rows=0, cache=True):
     print(f"[data] building {region} sequences (w={window})...", flush=True)
     stocks = _load_stock_series()
     if region == "fit":
-        tc = np.load(W06 / "training_cache.npz", allow_pickle=True)
+        tc = np.load(W06 / "training-cache.npz", allow_pickle=True)
         uids = np.asarray([str(u) for u in tc["stock_uid"]])
         dates = np.asarray([str(d)[:10] for d in tc["date_key"]])
         y = tc["true_logret"].astype(np.float64)
     elif region == "calib":
-        c = np.load(W07 / "candidates_calib_K8.npz", allow_pickle=True)
+        c = np.load(W07 / "candidates-calib-k8.npz", allow_pickle=True)
         uids = np.asarray([str(u) for u in c["stock_uid"]])
         dates = np.asarray([str(d)[:10] for d in c["date_key"]])
         y = c["true_logret"].astype(np.float64)
     else:
-        c = np.load(W07 / "candidates_eval_K8.npz", allow_pickle=True)
+        c = np.load(W07 / "candidates-eval-k8.npz", allow_pickle=True)
         uids = np.asarray([str(u) for u in c["stock_uid"]])
         dates = np.asarray([str(d)[:10] for d in c["date_key"]])
         y = c["true_logret"].astype(np.float64)

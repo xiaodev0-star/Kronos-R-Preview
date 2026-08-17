@@ -30,7 +30,7 @@ for _p in (ROOT, SEVEN, EIGHT, ROOT / "experiments" / "06-posttrain"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from improve_common import (  # noqa: E402
+from _exp07 import (  # noqa: E402
     weights_root, results_root, cand_path, write_json_ledger,
 )
 from f48_micro_scan import (  # noqa: E402

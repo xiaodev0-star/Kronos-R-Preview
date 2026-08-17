@@ -34,12 +34,13 @@ for _p in (ROOT, SEVEN, EIGHT, ROOT / "experiments" / "06-posttrain"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from improve_common import (  # noqa: E402
+from _exp07 import (  # noqa: E402
     weights_root, results_root, build_rec, cand_path, _split_points,
-    softmax_rows, decode_coarse, write_json_ledger,
+    softmax_rows, decode_coarse, write_json_ledger, stage_weights,
+    weights_artifact, posttrain_artifacts,
 )
 from f0_scores import rank_pct_per_date, z_per_date  # noqa: E402
-from posttrain_heads import MlpRankHead  # noqa: E402
+from _exp07 import MlpRankHead  # noqa: E402
 from sklearn.isotonic import IsotonicRegression  # noqa: E402
 from scipy.stats import spearmanr  # noqa: E402
 
@@ -189,9 +190,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
-    wr = weights_root()
+    wr = stage_weights("B")
     rr = results_root()
-    sw = ROOT / "server_runs" / "weights" / "06-posttrain" / "seed42"
+    sw = posttrain_artifacts()
 
     cand = np.load(cand_path("eval"), allow_pickle=True)
     rec = build_rec(cand)
@@ -203,11 +204,11 @@ def main():
     print(f"[f48] n={n} dates={len(np.unique(dates))} dense={dense}", flush=True)
 
     # ---- F (ranking source, unchanged from Exp08) ----
-    de = np.load(wr / "bert_hidden_eval_w512_t2.npz", allow_pickle=True)
+    de = np.load(weights_artifact("hidden-eval"), allow_pickle=True)
     H = torch.from_numpy(de["hidden"].astype(np.float32))
     ranks = []
-    for s in range(45, 51):
-        ck = torch.load(str(wr / f"head_BERT_mlp_rank_spearman_seed{s}_3e-4ep16.pt"),
+    for s in (42,):
+        ck = torch.load(str(weights_artifact("bert-head", seed=s)),
                         map_location="cpu", weights_only=False)
         h = MlpRankHead(dim=256, hidden=64, dropout=0.1, loss="soft_spearman")
         h.load_state_dict(ck["head_state"]); h.eval()
@@ -215,12 +216,12 @@ def main():
             ranks.append(rank_pct_per_date(dates, h(H).numpy().astype(np.float64)))
         print(f"[f48] ens seed{s} done", flush=True)
     ens = np.mean(ranks, axis=0)
-    p6 = np.load(wr / "p6_eval_scores.npy").astype(np.float64)
+    p6 = np.load(weights_artifact("p6-scores")).astype(np.float64)
     F = 0.5 * z_per_date(dates, ens) + 0.5 * z_per_date(dates, p6)
     rec["F"] = F
 
     # ---- BERT_E (BERT posterior mean, from cached coarse posterior) ----
-    sb = np.load(wr / "scores_eval_K8_w512_stride1.npz", allow_pickle=True)
+    sb = np.load(weights_artifact("scores-eval"), allow_pickle=True)
     pb = softmax_rows(np.asarray(sb["logp_bert_full"]))
     dec = decode_coarse(pb, centers, cand["p_mean0"], cand["p_std0"], log_space=False)
     BERT_E = dec["e_mean"]
@@ -240,11 +241,11 @@ def main():
 
     # ---- calib isotonic (sign boundary) ----
     ccal = np.load(cand_path("calib"), allow_pickle=True)
-    de_c = np.load(wr / "bert_hidden_calib_w512_t2.npz", allow_pickle=True)
+    de_c = np.load(weights_artifact("hidden-calib"), allow_pickle=True)
     Hc = torch.from_numpy(de_c["hidden"].astype(np.float32))
     ranks_c = []
-    for s in range(45, 51):
-        ck = torch.load(str(wr / f"head_BERT_mlp_rank_spearman_seed{s}_3e-4ep16.pt"),
+    for s in (42,):
+        ck = torch.load(str(weights_artifact("bert-head", seed=s)),
                         map_location="cpu", weights_only=False)
         h = MlpRankHead(dim=256, hidden=64, dropout=0.1, loss="soft_spearman")
         h.load_state_dict(ck["head_state"]); h.eval()
@@ -252,8 +253,8 @@ def main():
             ranks_c.append(rank_pct_per_date(ccal["date_key"],
                                              h(Hc).numpy().astype(np.float64)))
     ens_c = np.mean(ranks_c, axis=0)
-    gh_c = np.load(sw / "calibration_cache.npz", allow_pickle=True)["hidden"]
-    ck6 = torch.load(str(sw / "head_P6_mlp_rank_spearman.pt"), map_location="cpu",
+    gh_c = np.load(sw["calibration"], allow_pickle=True)["hidden"]
+    ck6 = torch.load(str(sw["head_rank_mlp_spearman"]), map_location="cpu",
                      weights_only=False)
     h6 = MlpRankHead(dim=256, hidden=64, dropout=0.0, loss="soft_spearman")
     h6.load_state_dict(ck6["head_state"]); h6.eval()

@@ -65,7 +65,9 @@ All runners use two roots:
 - `KRONOS_RESULTS_ROOT`: downloadable JSON/CSV/NPZ, plots, and logs.
 
 The results tree must never contain `.pt`, `.pth`, `.ckpt`, or prepared-input
-caches. `download_manifest.json` enforces and inventories this boundary.
+caches. Export-oriented runners may write `download_manifest.json` to inventory
+this boundary; local-only Exp 07 runs must enforce the same boundary in memory
+without generating a download manifest.
 
 Every formal run must record source hashes, runtime/GPU/package metadata,
 dataset fingerprint, training history, update schedule, exact dataset target

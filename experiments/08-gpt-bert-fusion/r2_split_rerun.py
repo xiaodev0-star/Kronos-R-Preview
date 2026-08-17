@@ -30,9 +30,12 @@ for _p in (ROOT, SEVEN, EIGHT, ROOT / "experiments" / "06-posttrain"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from improve_common import weights_root, results_root, cand_path, softmax_rows, decode_coarse  # noqa: E402
+from _exp07 import (  # noqa: E402
+    weights_root, results_root, cand_path, softmax_rows, decode_coarse,
+    stage_weights, weights_artifact, posttrain_artifacts,
+)
 from f0_scores import rank_pct_per_date, z_per_date  # noqa: E402
-from posttrain_heads import MlpRankHead  # noqa: E402
+from _exp07 import MlpRankHead  # noqa: E402
 from f48_micro_scan import (  # noqa: E402
     daily_ic, daily_da, daily_mape, mean_ic, ampratio, token_collapse, block_masks,
 )
@@ -49,11 +52,11 @@ def _head(path, dropout):
 
 
 def ens_scores(hidden, dates, wr, device):
-    """6× BERT rank head → per-date rank-percentile → mean (ens)."""
+    """Active BERT rank head → per-date rank-percentile."""
     H = torch.from_numpy(np.asarray(hidden).astype(np.float32)).to(device)
     ranks = []
-    for s in range(45, 51):
-        h = _head(wr / f"head_BERT_mlp_rank_spearman_seed{s}_3e-4ep16.pt", 0.1).to(device)
+    for s in (42,):
+        h = _head(weights_artifact("bert-head", seed=s), 0.1).to(device)
         with torch.no_grad():
             ranks.append(rank_pct_per_date(dates, h(H).cpu().numpy().astype(np.float64)))
     return np.mean(ranks, axis=0)
@@ -105,7 +108,7 @@ def main():
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     dev = torch.device(args.device)
-    wr = weights_root()
+    wr = stage_weights("B")
     rr = results_root()
     sw = ROOT / "server_runs" / "weights" / "06-posttrain" / "seed42"
     centers = np.load(ROOT / "checkpoints" / "coarse_logret_centers.npy")
@@ -117,17 +120,17 @@ def main():
     qc = ccal["quality"].astype(bool)
     ps_c = ccal["post_std"].astype(np.float64)
 
-    Hc_t1 = np.load(wr / "bert_hidden_calib_w512_t1.npz", allow_pickle=True)
-    Hc_t2 = np.load(wr / "bert_hidden_calib_w512_t2.npz", allow_pickle=True)
+    Hc_t1 = np.load(wr / "hidden-calib-t1-w512.npz", allow_pickle=True)
+    Hc_t2 = np.load(wr / "hidden-calib-t2-w512.npz", allow_pickle=True)
     ens_c_t1 = ens_scores(Hc_t1["hidden"], dc, wr, dev)
     ens_c_t2 = ens_scores(Hc_t2["hidden"], dc, wr, dev)
-    gh_c = np.load(sw / "calibration_cache.npz", allow_pickle=True)["hidden"]
-    h6 = _head(sw / "head_P6_mlp_rank_spearman.pt", 0.0).to(dev)
+    gh_c = np.load(posttrain_artifacts()["calibration"], allow_pickle=True)["hidden"]
+    h6 = _head(posttrain_artifacts()["head_rank_mlp_spearman"], 0.0).to(dev)
     with torch.no_grad():
         p6_c = h6(torch.from_numpy(np.asarray(gh_c).astype(np.float32)).to(dev)).cpu().numpy().astype(np.float64)
     F_c_t1 = compute_F(ens_c_t1, p6_c, dc)
     F_c_t2 = compute_F(ens_c_t2, p6_c, dc)
-    BERT_E_c = bert_e(wr / "scores_calib_K8_w512_stride1.npz", ccal, centers, dev)
+    BERT_E_c = bert_e(weights_artifact("scores-calib"), ccal, centers, dev)
 
     # ============ eval ============
     cand = np.load(cand_path("eval"), allow_pickle=True)
@@ -137,14 +140,14 @@ def main():
     ps_e = cand["post_std"].astype(np.float64)
     dense = int(cand["dense_threshold"][0])
 
-    He_t1 = np.load(wr / "bert_hidden_eval_w512_t1_w512_full.npz", allow_pickle=True)
-    He_t2 = np.load(wr / "bert_hidden_eval_w512_t2.npz", allow_pickle=True)
+    He_t1 = np.load(wr / "hidden-eval-t1-w512.npz", allow_pickle=True)
+    He_t2 = np.load(wr / "hidden-eval-t2-w512.npz", allow_pickle=True)
     ens_e_t1 = ens_scores(He_t1["hidden"], de, wr, dev)
     ens_e_t2 = ens_scores(He_t2["hidden"], de, wr, dev)
-    p6_e = np.load(wr / "p6_eval_scores.npy").astype(np.float64)
+    p6_e = np.load(weights_artifact("p6-scores")).astype(np.float64)
     F_e_t1 = compute_F(ens_e_t1, p6_e, de)
     F_e_t2 = compute_F(ens_e_t2, p6_e, de)
-    BERT_E_e = bert_e(wr / "scores_eval_K8_w512_stride1.npz", cand, centers, dev)
+    BERT_E_e = bert_e(weights_artifact("scores-eval"), cand, centers, dev)
 
     # ============ calib 时序劈半 ============
     uniq = np.array(sorted(set(dc)))

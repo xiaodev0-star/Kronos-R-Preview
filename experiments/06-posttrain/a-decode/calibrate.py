@@ -21,17 +21,18 @@ import torch
 import torch.nn.functional as F
 
 import sys
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from eval_helpers import load_gpt  # noqa: E402
 from model import load_tokenizer  # noqa: E402
 
-from posttrain_common import (  # noqa: E402
-    load_reviewed_selection, upstream_checkpoint_path, resolve_roots, write_json,
+from common import (  # noqa: E402
+    load_reviewed_selection, upstream_checkpoint_path, resolve_roots,
+    artifact_paths, write_json,
 )
-from joint_decoder import DecodeTable, decode_joint  # noqa: E402
+from common import DecodeTable, decode_joint  # noqa: E402
 
 LN2 = 0.6931471805599453
 
@@ -143,17 +144,18 @@ def report_calibration(cal_rows_path, model_path, tokenizer_path, device):
 
 def main():
     ap = argparse.ArgumentParser(description="PT-02 T_c/T_f calibration")
-    ap.add_argument("--calibration_cache",
-                    default="server_runs/weights/06-posttrain/seed42/calibration_cache.npz")
+    ap.add_argument("--calibration_cache", default=None)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     sel = load_reviewed_selection()
     ckpt = upstream_checkpoint_path(sel)
     tok = Path(sel["upstream"]["tokenizer"])
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    res = report_calibration(args.calibration_cache, ckpt, tok, device)
     roots = resolve_roots()
-    write_json(roots.results_root / "pt02_calibration.json", res)
+    paths = artifact_paths(roots=roots)
+    calibration_cache = args.calibration_cache or str(paths["calibration"])
+    res = report_calibration(calibration_cache, ckpt, tok, device)
+    write_json(roots.results_root / "A-decode" / "calibration.json", res)
     print(res)
 
 

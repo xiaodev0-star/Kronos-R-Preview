@@ -42,8 +42,10 @@ for _p in (ROOT / "experiments" / "06-posttrain",
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-W07 = ROOT / "server_runs" / "weights" / "07-bert-critic" / "seed42"
-W06 = ROOT / "server_runs" / "weights" / "06-posttrain" / "seed42"
+W07 = ROOT / "server_runs" / "weights" / "07-bert-critic" / "seed42" / "B-score"
+W07_C = ROOT / "server_runs" / "weights" / "07-bert-critic" / "seed42" / "C-fusion"
+W06 = ROOT / "server_runs" / "weights" / "06-posttrain" / "seed42" / "shared"
+W06_B = ROOT / "server_runs" / "weights" / "06-posttrain" / "seed42" / "B-heads"
 
 
 def save_json(path, obj):
@@ -63,7 +65,7 @@ def load_eval_rows():
     arrays plus dense_threshold (int).  All baseline prediction arrays MUST be
     aligned to this row order.
     """
-    c = np.load(W07 / "candidates_eval_K8.npz", allow_pickle=True)
+    c = np.load(W07 / "candidates-eval-k8.npz", allow_pickle=True)
     return {
         "date_key": c["date_key"],
         "stock_uid": c["stock_uid"],
@@ -187,24 +189,23 @@ def compute_reference_F(rows=None):
     so the comparison is self-contained.
     """
     import torch
-    from posttrain_heads import MlpRankHead
+    from _exp07 import MlpRankHead
     from f0_scores import rank_pct_per_date, z_per_date
 
     rows = rows if rows is not None else load_eval_rows()
-    de = np.load(W07 / "bert_hidden_eval_w512_t2.npz", allow_pickle=True)
+    de = np.load(W07 / "hidden-eval-w512.npz", allow_pickle=True)
     H = torch.from_numpy(de["hidden"].astype(np.float32))
     dates = np.asarray(rows["date_key"])
     ranks = []
-    for s in range(45, 51):
-        ck = torch.load(str(W07 / f"head_BERT_mlp_rank_spearman_seed{s}_3e-4ep16.pt"),
-                        map_location="cpu", weights_only=False)
-        h = MlpRankHead(dim=256, hidden=64, dropout=0.1, loss="soft_spearman")
-        h.load_state_dict(ck["head_state"])
-        h.eval()
-        with torch.no_grad():
-            ranks.append(rank_pct_per_date(dates, h(H).numpy().astype(np.float64)))
+    ck = torch.load(str(W07 / "rank-head-seed42.pt"),
+                    map_location="cpu", weights_only=False)
+    h = MlpRankHead(dim=256, hidden=64, dropout=0.1, loss="soft_spearman")
+    h.load_state_dict(ck["head_state"])
+    h.eval()
+    with torch.no_grad():
+        ranks.append(rank_pct_per_date(dates, h(H).numpy().astype(np.float64)))
     ens = np.mean(ranks, axis=0)
-    p6 = np.load(W07 / "p6_eval_scores.npy").astype(np.float64)
+    p6 = np.load(W07_C / "p6-eval-scores.npy").astype(np.float64)
     F = 0.5 * z_per_date(dates, ens) + 0.5 * z_per_date(dates, p6)
     return F
 

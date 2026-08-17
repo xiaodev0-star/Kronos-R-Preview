@@ -412,13 +412,12 @@ def _inventory(
     return rows
 
 
-def write_download_manifest(layout: StudyLayout) -> Path:
-    """Inventory the result bundle and assert that no checkpoint leaked into it."""
-    manifest_name = "download_manifest.json"
+def assert_results_boundary(layout: StudyLayout) -> None:
+    """Fail if checkpoint/cache artifacts leaked into the results tree."""
     result_files = _inventory(
         layout.results_root,
-        hash_files=True,
-        excluded_names=(manifest_name,),
+        hash_files=False,
+        excluded_names=("download_manifest.json",),
     )
     leaked = [
         row["path"]
@@ -430,26 +429,58 @@ def write_download_manifest(layout: StudyLayout) -> Path:
             "Large/checkpoint artifacts leaked into results_root: "
             + ", ".join(leaked)
         )
+
+
+def write_download_manifest(
+    layout: StudyLayout, *, compact: bool = False
+) -> Path:
+    """Inventory results and assert that no checkpoint leaked into them.
+
+    ``compact`` keeps the same boundary check and result-file hashes while
+    omitting repeated layout prose.  It is useful for experiment folders where
+    the manifest is meant to be a small machine-readable index.
+    """
+    manifest_name = "download_manifest.json"
+    result_files = _inventory(
+        layout.results_root,
+        hash_files=True,
+        excluded_names=(manifest_name,),
+    )
+    assert_results_boundary(layout)
     heavy_files = _inventory(layout.weights_root, hash_files=False)
-    payload = {
-        "schema": 1,
-        "created_at_utc": utc_now(),
-        "layout": layout.metadata(),
-        "download_bundle": {
-            "root": str(layout.results_root),
-            "file_count": len(result_files),
-            "total_bytes": sum(row["size_bytes"] for row in result_files),
-            "sha256_included": True,
-            "files": result_files,
-        },
-        "server_only_bundle": {
-            "root": str(layout.weights_root),
-            "file_count": len(heavy_files),
-            "total_bytes": sum(row["size_bytes"] for row in heavy_files),
-            "sha256_included": False,
-            "files": heavy_files,
-        },
+    result_summary = {
+        "root": str(layout.results_root),
+        "file_count": len(result_files),
+        "total_bytes": sum(row["size_bytes"] for row in result_files),
+        "files": result_files,
     }
+    weights_summary = {
+        "root": str(layout.weights_root),
+        "file_count": len(heavy_files),
+        "total_bytes": sum(row["size_bytes"] for row in heavy_files),
+    }
+    if compact:
+        payload = {
+            "schema": 2,
+            "kind": "result-boundary-manifest",
+            "results": result_summary,
+            "weights": weights_summary,
+        }
+    else:
+        payload = {
+            "schema": 1,
+            "created_at_utc": utc_now(),
+            "layout": layout.metadata(),
+            "download_bundle": {
+                **result_summary,
+                "sha256_included": True,
+            },
+            "server_only_bundle": {
+                **weights_summary,
+                "sha256_included": False,
+                "files": heavy_files,
+            },
+        }
     output = layout.results_root / manifest_name
     temporary = output.with_suffix(".json.tmp")
     with temporary.open("w", encoding="utf-8") as handle:

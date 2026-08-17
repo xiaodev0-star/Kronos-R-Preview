@@ -20,12 +20,12 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from posttrain_common import resolve_roots, write_json  # noqa: E402
-from analyze_pt01 import daily_rank_ic  # noqa: E402
+from common import resolve_roots, artifact_paths, write_json  # noqa: E402
+from common import daily_rank_ic  # noqa: E402
 
 COVERAGES = (100, 80, 60, 40, 20)
 
@@ -101,8 +101,8 @@ def ensemble_outputs(records, scores, weights=None, name="ensemble"):
     return z.T @ w
 
 
-def run_abstention(pt01_records_path, dense_min=3634, out_path=None):
-    rec = np.load(pt01_records_path, allow_pickle=True)
+def run_abstention(records_path, dense_min=3634, out_path=None):
+    rec = np.load(records_path, allow_pickle=True)
     conf = confidence_metrics(rec)
     result = {"schema_version": "pt06-v1", "dense_min": dense_min}
     for arm, field in (("J3_median", "post_median"), ("J2_mean", "post_mean"),
@@ -119,12 +119,14 @@ def run_abstention(pt01_records_path, dense_min=3634, out_path=None):
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--records", default="server_runs/weights/06-posttrain/seed42/pt01_records.npz")
+    ap.add_argument("--records", default=None)
     ap.add_argument("--dense_min", type=int, default=3634)
     args = ap.parse_args()
     roots = resolve_roots()
-    out = roots.results_root / "pt06_abstention.json"
-    res = run_abstention(args.records, dense_min=args.dense_min, out_path=out)
+    paths = artifact_paths(roots=roots)
+    records = args.records or str(paths["records"])
+    out = roots.results_root / "B-heads" / "abstention.json"
+    res = run_abstention(records, dense_min=args.dense_min, out_path=out)
     # print a compact summary
     for arm, v in res.items():
         if arm.startswith("J"):

@@ -1,7 +1,7 @@
 """run_ledger.py — Exp08 + Round-2 全量受控消融的统一重跑 + CSV 台账。
 
 协议（全实验统一）：
-  - 训练（同一次）：冻结 backbone = branchA_dm030_8ceb_ep1.pt + BERT critic + 6×BERT head + P6。
+  - 训练（同一次）：冻结 backbone = GPT/BERT critic + active BERT rank head + P6。
   - 拟合（同一批）：calib 前半（front）拟合校准参数（F0 / map / λ / tail）。
   - 验证（同一批）：calib 后半（back）上选冠军 / 报告门禁。
   - 报告：eval（offsets 0..399）只对每个实验报一次。
@@ -27,9 +27,12 @@ for _p in (ROOT, SEVEN, EIGHT, SIX):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from improve_common import weights_root, cand_path, softmax_rows, decode_coarse  # noqa: E402
+from _exp07 import (  # noqa: E402
+    cand_path, softmax_rows, decode_coarse, stage_weights, weights_artifact,
+    posttrain_artifacts,
+)
 from f0_scores import rank_pct_per_date, z_per_date  # noqa: E402
-from posttrain_heads import MlpRankHead  # noqa: E402
+from _exp07 import MlpRankHead  # noqa: E402
 from f48_micro_scan import daily_ic, daily_da, daily_mape, mean_ic, ampratio, token_collapse  # noqa: E402
 from f51_adaptive_dir import date_boundary_qd, distance_quantile_mag  # noqa: E402
 from f83_final_report import per_date_scale  # noqa: E402
@@ -49,11 +52,11 @@ def _head(path, dropout):
 
 
 def _ens_and_heads(hidden, dates, wr, device):
-    """6× BERT head 逐日 rank 分 + 均值；同时返回 6 头逐日 rank 分（供 c_dis 用）。"""
+    """Active BERT rank head 的逐日 rank 分；保留列表形状供下游统计复用。"""
     H = torch.from_numpy(np.asarray(hidden).astype(np.float32)).to(device)
     ranks = []
-    for s in range(45, 51):
-        h = _head(wr / f"head_BERT_mlp_rank_spearman_seed{s}_3e-4ep16.pt", 0.1).to(device)
+    for s in (42,):
+        h = _head(weights_artifact("bert-head", seed=s), 0.1).to(device)
         with torch.no_grad():
             ranks.append(rank_pct_per_date(dates, h(H).cpu().numpy().astype(np.float64)))
     arr = np.stack(ranks, axis=0)
@@ -114,7 +117,7 @@ class Features:
 
 def load_all(device):
     f = Features()
-    wr = weights_root()
+    wr = stage_weights("B")
     sw = ROOT / "server_runs" / "weights" / "06-posttrain" / "seed42"
     f.wr, f.sw = wr, sw
     f.centers = np.load(ROOT / "checkpoints" / "coarse_logret_centers.npy")
@@ -127,17 +130,18 @@ def load_all(device):
     f.ps_c = ccal["post_std"].astype(np.float64)
     f.pm_c = ccal["post_median"].astype(np.float64)
     f.pup_c = ccal["p_up"].astype(np.float64)
-    Hc_t1 = np.load(wr / "bert_hidden_calib_w512_t1.npz", allow_pickle=True)
-    Hc_t2 = np.load(wr / "bert_hidden_calib_w512_t2.npz", allow_pickle=True)
+    Hc_t1 = np.load(wr / "hidden-calib-t1-w512.npz", allow_pickle=True)
+    Hc_t2 = np.load(wr / "hidden-calib-t2-w512.npz", allow_pickle=True)
     f.ens_c_t1, _ = _ens_and_heads(Hc_t1["hidden"], f.dc, wr, device)
     f.ens_c_t2, f.heads_c_t2 = _ens_and_heads(Hc_t2["hidden"], f.dc, wr, device)
-    gh_c = np.load(sw / "calibration_cache.npz", allow_pickle=True)["hidden"]
-    h6 = _head(sw / "head_P6_mlp_rank_spearman.pt", 0.0).to(device)
+    pt06 = posttrain_artifacts()
+    gh_c = np.load(pt06["calibration"], allow_pickle=True)["hidden"]
+    h6 = _head(pt06["head_rank_mlp_spearman"], 0.0).to(device)
     with torch.no_grad():
         f.p6_c = h6(torch.from_numpy(np.asarray(gh_c).astype(np.float32)).to(device)).cpu().numpy().astype(np.float64)
     f.F_c_t1 = compute_F(f.ens_c_t1, f.p6_c, f.dc)
     f.F_c_t2 = compute_F(f.ens_c_t2, f.p6_c, f.dc)
-    f.BERT_E_c = bert_e(wr / "scores_calib_K8_w512_stride1.npz", ccal, f.centers)
+    f.BERT_E_c = bert_e(weights_artifact("scores-calib"), ccal, f.centers)
     f.med3_c = np.load(wr / "med3_calib.npy")
 
     # eval
@@ -149,14 +153,14 @@ def load_all(device):
     f.pm_e = cand["post_median"].astype(np.float64)
     f.pup_e = cand["p_up"].astype(np.float64)
     f.dense = int(cand["dense_threshold"][0])
-    He_t1 = np.load(wr / "bert_hidden_eval_w512_t1_w512_full.npz", allow_pickle=True)
-    He_t2 = np.load(wr / "bert_hidden_eval_w512_t2.npz", allow_pickle=True)
+    He_t1 = np.load(wr / "hidden-eval-t1-w512.npz", allow_pickle=True)
+    He_t2 = np.load(wr / "hidden-eval-t2-w512.npz", allow_pickle=True)
     f.ens_e_t1, _ = _ens_and_heads(He_t1["hidden"], f.de, wr, device)
     f.ens_e_t2, f.heads_e_t2 = _ens_and_heads(He_t2["hidden"], f.de, wr, device)
-    f.p6_e = np.load(wr / "p6_eval_scores.npy").astype(np.float64)
+    f.p6_e = np.load(weights_artifact("p6-scores")).astype(np.float64)
     f.F_e_t1 = compute_F(f.ens_e_t1, f.p6_e, f.de)
     f.F_e_t2 = compute_F(f.ens_e_t2, f.p6_e, f.de)
-    f.BERT_E_e = bert_e(wr / "scores_eval_K8_w512_stride1.npz", cand, f.centers)
+    f.BERT_E_e = bert_e(weights_artifact("scores-eval"), cand, f.centers)
     f.med3_e = np.load(wr / "med3_eval.npy")
 
     # calib 劈半

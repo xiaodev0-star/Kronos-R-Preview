@@ -12,12 +12,12 @@ from pathlib import Path
 import numpy as np
 from scipy.stats import spearmanr
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from posttrain_common import resolve_roots, write_json  # noqa: E402
-from compare_posttrain import circular_moving_block_bootstrap  # noqa: E402
+from common import resolve_roots, artifact_paths, write_json  # noqa: E402
+from common import daily_rank_ic, _contrast  # noqa: E402
 
 ARMS = {
     "J0_greedy": "greedy_return",
@@ -26,50 +26,6 @@ ARMS = {
     "J3_posterior_median": "post_median",
     "J4_p_up": "p_up",
 }
-
-
-def daily_rank_ic(score, true, dates, dense_min):
-    uniq, inv = np.unique(dates, return_inverse=True)
-    n = len(uniq)
-    ic = np.full(n, np.nan)
-    da = np.full(n, np.nan)
-    mae = np.full(n, np.nan)
-    cnt = np.zeros(n, dtype=np.int64)
-    for i in range(n):
-        m = inv == i
-        c = int(m.sum())
-        cnt[i] = c
-        if c < dense_min:
-            continue
-        s = score[m]
-        t = true[m]
-        if c >= 2 and not np.all(s == s[0]):
-            ic[i] = spearmanr(s, t)[0]
-        else:
-            ic[i] = 0.0
-        da[i] = np.mean((np.sign(s) > 0) == (t > 0))
-        mae[i] = np.mean(np.abs(s - t))
-    dense = cnt >= dense_min
-    return ic, da, mae, cnt, dense
-
-
-def _contrast(base_ic, arm_ic, base_mae, arm_mae, n_replicates=10000):
-    common = np.isfinite(base_ic) & np.isfinite(arm_ic)
-    d_ic = arm_ic[common] - base_ic[common]
-    d_mae = arm_mae[common] - base_mae[common]
-    cis = {}
-    for L in (5, 10, 20):
-        b = circular_moving_block_bootstrap(d_ic, block_length=L,
-                                            n_replicates=n_replicates, seed=42)
-        lo, hi = float(np.percentile(b, 2.5)), float(np.percentile(b, 97.5))
-        cis[str(L)] = {"ci_lower": lo, "ci_upper": hi, "significant": lo > 0.0}
-    return {
-        "rank_ic_delta_vs_J0": float(np.nanmean(d_ic)),
-        "mae_delta_vs_J0": float(np.nanmean(d_mae)),
-        "block_cis": cis,
-        "block_robust": all(v["significant"] for v in cis.values()),
-        "n_dates": int(common.sum()),
-    }
 
 
 def analyze(records_path, dense_min=3634, out_path=None):
@@ -158,13 +114,15 @@ def _da_direction(score, true, dates, dense_min):
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--records", default="server_runs/weights/06-posttrain/seed42/pt01_records.npz")
+    ap.add_argument("--records", default=None)
     ap.add_argument("--dense_min", type=int, default=3634)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     roots = resolve_roots()
-    out = args.out or (roots.results_root / "pt01_analysis.json")
-    s = analyze(args.records, dense_min=args.dense_min, out_path=Path(out))
+    paths = artifact_paths(roots=roots)
+    records = args.records or str(paths["records"])
+    out = args.out or (roots.results_root / "A-decode" / "analysis.json")
+    s = analyze(records, dense_min=args.dense_min, out_path=Path(out))
     print("=== PT-01 arms ===")
     for arm, v in s["arms"].items():
         print(f"  {arm}: RankIC={v['avg_daily_rank_ic']:.5f} DA={v['avg_da_per_date']:.5f} MAE={v['avg_mae']:.5f}")

@@ -26,8 +26,10 @@ for _p in (ROOT, SEVEN, EIGHT, ROOT / "experiments" / "06-posttrain"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from improve_common import weights_root, cand_path  # noqa: E402
-from posttrain_heads import MlpRankHead  # noqa: E402
+from _exp07 import (  # noqa: E402
+    cand_path, stage_weights, weights_artifact, posttrain_artifacts,
+)
+from _exp07 import MlpRankHead  # noqa: E402
 
 
 def apply_head(head_path, hidden, dim=256, hidden_dim=64, dropout=0.1):
@@ -85,25 +87,28 @@ def z_per_date(dates, score):
     return out
 
 
-def compute_region(region, wr, six_wr):
+def compute_region(region, wr=None, six_artifacts=None):
+    wr = Path(wr) if wr is not None else stage_weights("B")
+    six_artifacts = six_artifacts or posttrain_artifacts()
     cand = np.load(cand_path(region), allow_pickle=True)
     dates = np.asarray(cand["date_key"])
     n = len(cand["stock_uid"])
 
     out = {}
     # ---- BERT hidden -> T5 head score ----
-    bh = np.load(wr / f"bert_hidden_{region}_w512_t2.npz", allow_pickle=True)
+    hidden_key = "hidden-eval" if region == "eval" else "hidden-calib"
+    bh = np.load(weights_artifact(hidden_key), allow_pickle=True)
     assert len(bh["stock_uid"]) == n
-    out["bert_head"] = apply_head(wr / "head_BERT_mlp_rank_spearman_seed42.pt",
+    out["bert_head"] = apply_head(weights_artifact("bert-head"),
                                   bh["hidden"])
     # ---- GPT hidden -> P6 score ----
     if region == "eval":
-        p6 = np.load(wr / "p6_eval_scores.npy")
+        p6 = np.load(weights_artifact("p6-scores"))
         out["p6_score"] = p6.astype(np.float64)
     else:
-        gh = np.load(six_wr / "calibration_cache.npz", allow_pickle=True)
+        gh = np.load(six_artifacts["calibration"], allow_pickle=True)
         assert len(gh["stock_uid"]) == n
-        out["p6_score"] = apply_head(six_wr / "head_P6_mlp_rank_spearman.pt",
+        out["p6_score"] = apply_head(six_artifacts["head_rank_mlp_spearman"],
                                      gh["hidden"])
 
     # ---- fused arms ----
@@ -129,7 +134,7 @@ def compute_region(region, wr, six_wr):
         _, counts = np.unique(dates, return_counts=True)
         out["dense_threshold"] = np.array([max(5, int(np.ceil(0.8 * int(counts.max()))))])
 
-    path = wr / f"scores_{region}_fused.npz"
+    path = stage_weights("C") / f"scores-{region}-fused.npz"
     np.savez(path, **{k: np.asarray(v) for k, v in out.items()})
     print(f"[f0] wrote {path} rows={n}")
     return out
@@ -139,9 +144,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--region", choices=["eval", "calib"], required=True)
     args = ap.parse_args()
-    wr = weights_root()
-    sw = ROOT / "server_runs" / "weights" / "06-posttrain" / "seed42"
-    compute_region(args.region, wr, sw)
+    compute_region(args.region)
 
 
 if __name__ == "__main__":

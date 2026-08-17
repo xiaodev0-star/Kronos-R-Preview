@@ -27,9 +27,12 @@ for _p in (ROOT, SEVEN, EIGHT, SIX):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from improve_common import weights_root, results_root, cand_path, softmax_rows, decode_coarse  # noqa: E402
+from _exp07 import (  # noqa: E402
+    weights_root, results_root, cand_path, softmax_rows, decode_coarse,
+    stage_weights, weights_artifact, posttrain_artifacts,
+)
 from f0_scores import rank_pct_per_date, z_per_date  # noqa: E402
-from posttrain_heads import MlpRankHead  # noqa: E402
+from _exp07 import MlpRankHead  # noqa: E402
 from f48_micro_scan import daily_ic, daily_da, daily_mape, mean_ic, ampratio, token_collapse, block_masks  # noqa: E402
 from f51_adaptive_dir import date_boundary_qd, distance_quantile_mag  # noqa: E402
 from f83_final_report import per_date_scale  # noqa: E402
@@ -37,8 +40,8 @@ from f55_smooth_mag import dist_rank_u, smooth_monotone_map, apply_map  # noqa: 
 from f97_map_ps_tail import tail_blend_hybrid  # noqa: E402
 from sklearn.isotonic import IsotonicRegression  # noqa: E402
 from eval_helpers import load_gpt  # noqa: E402
-from joint_decoder import DecodeTable  # noqa: E402
-from critic_common import upstream_paths  # noqa: E402
+from _exp06 import DecodeTable  # noqa: E402
+from _exp07 import upstream_paths  # noqa: E402
 from model import load_tokenizer  # noqa: E402
 
 
@@ -53,8 +56,8 @@ def _head(path, dropout):
 def ens_scores(hidden, dates, wr, device):
     H = torch.from_numpy(np.asarray(hidden).astype(np.float32)).to(device)
     ranks = []
-    for s in range(45, 51):
-        h = _head(wr / f"head_BERT_mlp_rank_spearman_seed{s}_3e-4ep16.pt", 0.1).to(device)
+    for s in (42,):
+        h = _head(weights_artifact("bert-head", seed=s), 0.1).to(device)
         with torch.no_grad():
             ranks.append(rank_pct_per_date(dates, h(H).cpu().numpy().astype(np.float64)))
     return np.mean(ranks, axis=0)
@@ -148,7 +151,7 @@ def main():
                     help="若 med3 已缓存则跳过重采样")
     args = ap.parse_args()
     dev = torch.device(args.device)
-    wr = weights_root()
+    wr = stage_weights("B")
     rr = results_root()
     sw = ROOT / "server_runs" / "weights" / "06-posttrain" / "seed42"
     centers = np.load(ROOT / "checkpoints" / "coarse_logret_centers.npy")
@@ -165,14 +168,14 @@ def main():
         print(f"[amp] loaded GPT {ckpt.name}", flush=True)
 
         ccal = np.load(cand_path("calib"), allow_pickle=True)
-        gh_c = np.load(sw / "calibration_cache.npz", allow_pickle=True)
+        gh_c = np.load(posttrain_artifacts()["calibration"], allow_pickle=True)
         print("[amp] computing med3 calib...", flush=True)
         med3_c = compute_med3(gh_c["hidden"], ccal["p_mean0"], ccal["p_std0"],
                               model, dt, tok, dev)
         np.save(med3_path_c, med3_c)
 
         cand = np.load(cand_path("eval"), allow_pickle=True)
-        gh_e = np.load(sw / "hidden_cache.npz", allow_pickle=True)
+        gh_e = np.load(posttrain_artifacts()["hidden"], allow_pickle=True)
         print("[amp] computing med3 eval...", flush=True)
         med3_e = compute_med3(gh_e["hidden"], cand["p_mean0"], cand["p_std0"],
                               model, dt, tok, dev)
@@ -188,17 +191,17 @@ def main():
     yc = ccal["true_logret"].astype(np.float64)
     qc = ccal["quality"].astype(bool)
     ps_c = ccal["post_std"].astype(np.float64)
-    Hc_t1 = np.load(wr / "bert_hidden_calib_w512_t1.npz", allow_pickle=True)
-    Hc_t2 = np.load(wr / "bert_hidden_calib_w512_t2.npz", allow_pickle=True)
+    Hc_t1 = np.load(wr / "hidden-calib-t1-w512.npz", allow_pickle=True)
+    Hc_t2 = np.load(wr / "hidden-calib-t2-w512.npz", allow_pickle=True)
     ens_c_t1 = ens_scores(Hc_t1["hidden"], dc, wr, dev)
     ens_c_t2 = ens_scores(Hc_t2["hidden"], dc, wr, dev)
-    h6 = _head(sw / "head_P6_mlp_rank_spearman.pt", 0.0).to(dev)
-    gh_c = np.load(sw / "calibration_cache.npz", allow_pickle=True)["hidden"]
+    h6 = _head(posttrain_artifacts()["head_rank_mlp_spearman"], 0.0).to(dev)
+    gh_c = np.load(posttrain_artifacts()["calibration"], allow_pickle=True)["hidden"]
     with torch.no_grad():
         p6_c = h6(torch.from_numpy(np.asarray(gh_c).astype(np.float32)).to(dev)).cpu().numpy().astype(np.float64)
     F_c_t1 = compute_F(ens_c_t1, p6_c, dc)
     F_c_t2 = compute_F(ens_c_t2, p6_c, dc)
-    BERT_E_c = bert_e(wr / "scores_calib_K8_w512_stride1.npz", ccal, centers)
+    BERT_E_c = bert_e(weights_artifact("scores-calib"), ccal, centers)
 
     cand = np.load(cand_path("eval"), allow_pickle=True)
     de = np.asarray([str(d) for d in cand["date_key"]])
@@ -206,14 +209,14 @@ def main():
     qe = cand["quality"].astype(bool)
     ps_e = cand["post_std"].astype(np.float64)
     dense = int(cand["dense_threshold"][0])
-    He_t1 = np.load(wr / "bert_hidden_eval_w512_t1_w512_full.npz", allow_pickle=True)
-    He_t2 = np.load(wr / "bert_hidden_eval_w512_t2.npz", allow_pickle=True)
+    He_t1 = np.load(wr / "hidden-eval-t1-w512.npz", allow_pickle=True)
+    He_t2 = np.load(wr / "hidden-eval-t2-w512.npz", allow_pickle=True)
     ens_e_t1 = ens_scores(He_t1["hidden"], de, wr, dev)
     ens_e_t2 = ens_scores(He_t2["hidden"], de, wr, dev)
-    p6_e = np.load(wr / "p6_eval_scores.npy").astype(np.float64)
+    p6_e = np.load(weights_artifact("p6-scores")).astype(np.float64)
     F_e_t1 = compute_F(ens_e_t1, p6_e, de)
     F_e_t2 = compute_F(ens_e_t2, p6_e, de)
-    BERT_E_e = bert_e(wr / "scores_eval_K8_w512_stride1.npz", cand, centers)
+    BERT_E_e = bert_e(weights_artifact("scores-eval"), cand, centers)
 
     # ============ calib 时序劈半 ============
     uniq = np.array(sorted(set(dc)))

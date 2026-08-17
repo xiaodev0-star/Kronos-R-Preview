@@ -25,7 +25,7 @@ import torch.nn as nn
 import common
 import data
 from common import load_eval_rows, full_metrics, save_predictions, save_json, RESULTS
-from posttrain_heads import soft_spearman_loss
+from _exp07 import soft_spearman_loss
 
 
 class SequenceTransformer(nn.Module):
